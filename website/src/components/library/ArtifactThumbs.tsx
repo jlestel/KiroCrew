@@ -10,6 +10,7 @@ import { useAppPreview } from '../WebAppArtifactCard'
 import { buildSrcdoc, readThemeVars } from '../../lib/widgetSrcdoc'
 import MarkdownRenderer from '../MarkdownRenderer'
 import { i18nT } from '../../i18n/t'
+import { stripMd } from '../notifications/notifMeta'
 import { useSandboxDoc } from '../../hooks/useSandboxDoc'
 import { useSilentLoadWatch } from '../../hooks/useSilentLoadWatch'
 import { useNearViewport } from '../../hooks/useNearViewport'
@@ -207,8 +208,47 @@ export function WidgetThumb({ content, slug }: { content: string; slug: string }
 /** Kind-aware preview for non-iframe artifacts: markdown is rendered, SVG is
  * drawn (sanitized), JSON is pretty-printed, everything else is a raw snippet.
  * All paths are height-capped so cards stay tidy. */
-export function ContentThumb({ content, kind }: { content: string; kind: Artifact['kind'] }) {
+export function ContentThumb({ content, kind, mini = false }: {
+  content: string
+  kind: Artifact['kind']
+  mini?: boolean
+}) {
   if (!content.trim()) return <div className="h-[64px] bg-bg-elevated" />
+
+  if (mini && kind === 'markdown') {
+    // stripMd drops heading / emphasis / list markers but keeps table pipes, and
+    // a five-line tile has no room to lay a table out: the delimiter row renders
+    // as literal `|---|---|`. Flatten table rows here, so the tile reads as prose
+    // without changing the shared helper that notification previews and the turn
+    // minimap depend on.
+    const flat = content
+      .replace(/<[^>]+>/g, ' ')
+      .split('\n')
+      .map(line => {
+        if (!line.includes('|')) return line
+        const cells = line.split('|').map(cell => cell.trim()).filter(Boolean)
+        // A delimiter row carries no content of its own: drop it entirely. The
+        // test is per trimmed CELL, against classes that cannot overlap, so a
+        // pathological run of spaces or dashes in unbounded artifact content
+        // cannot backtrack -- a single anchored regex over the whole line
+        // (`\s*` and `[-:| ]+` both matching a space) could.
+        if (cells.length && cells.every(cell => /^:?-+:?$/.test(cell))) return ''
+        // Cells joined by a bare space read as one run-on phrase -- "Build
+        // Passed" for two separate cells. A middot keeps them legible as the
+        // sequence of values they are, in the width a tile actually has.
+        return cells.join(' · ')
+      })
+      .join('\n')
+    const text = stripMd(flat).slice(0, 240)
+    return (
+      <div
+        data-testid="artifact-mini-text"
+        className="h-full px-2 py-1.5 overflow-hidden bg-bg-elevated text-[10px] leading-[1.35] text-muted line-clamp-5 break-words"
+      >
+        {text}
+      </div>
+    )
+  }
 
   if (kind === 'markdown') {
     return (
