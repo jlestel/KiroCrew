@@ -2700,6 +2700,15 @@ class SpawnApprovalCallback(Protocol):
 #: removed by its release, so this is a leak fuse rather than a working limit.
 _MAX_COMPLETION_WAITERS = 64
 
+#: Leak fuse on :attr:`SubagentManager._attachment_generations`. A parent's
+#: entry is dropped by ``session_lifecycle.remove_if_unclaimed`` in the same
+#: lock hold that removes the session, so a full table means entries are
+#: leaking; ``bump_attachment`` sweeps the entries whose parent session is
+#: gone before adding a new one. The fuse never degrades a live parent's
+#: fence: an attachment always records, even past the ceiling, so the table
+#: is then bounded by the number of live parents, not by the constant.
+_MAX_ATTACHMENT_GENERATIONS = 4096
+
 
 # ── Delivery routing state: enumerated from the PRODUCING side ────────────────
 #
@@ -3117,6 +3126,14 @@ class SubagentManager:
         #: dropped by :meth:`release_completion_event`, so the only entries are
         #: the ones a waiter asked for (today: the autopilot stage loop).
         self._completion_waiters: dict[str, asyncio.Event] = {}
+        #: parent session key -> monotonic attachment count. Bumped whenever work
+        #: attaches to a parent (a spawn registers or queues, a store row is
+        #: accepted, a completion delivery begins), and read synchronously by
+        #: ``session_lifecycle.remove_if_unclaimed`` as a fence around its AWAITED
+        #: attachment probe: a removal that re-reads a moved generation keeps the
+        #: parent, because the probe's answer predates that attachment. Both
+        #: directions are loop-safe in-memory dict ops by contract.
+        self._attachment_generations: dict[str, int] = {}
         # Queued spawns store the FULL spawn() kwarg set (not just a 5-tuple), so a
         # drained spawn preserves approval_mode / silent / model / allowed_tools / bare —
         # dropping them made a queued headless/auto spawn hit the deny-by-default gate and
@@ -4491,6 +4508,51 @@ class SubagentManager:
     def running_agents_for(self, parent_key: str) -> list[dict]:
         return self._run_events.running_agents_for_impl(parent_key)
 
+    def bump_attachment(self, parent_session_key: str) -> None:
+        """Record that work just attached to *parent_session_key*.
+
+        Loop-safe and synchronous: ``session_lifecycle.remove_if_unclaimed``
+        fences its awaited attachment probe with this counter, and its recheck
+        runs under the session lock, so it may never touch the task store (see
+        ``dashboard.chat_utils.subagents_attached_async``). A queued spawn is
+        deliberately absent from ``_agents`` and a store-accepted row is not yet
+        in any in-memory registry, so the count is what makes both visible to
+        that recheck.
+
+        A parent's entry leaves the table only in the same lock hold that
+        removes the parent (``forget_attachment_generation``), so a full table
+        means entries are leaking. Before adding a new key past
+        ``_MAX_ATTACHMENT_GENERATIONS`` the stale entries whose parent session
+        is gone are swept; an attachment still records when the sweep frees
+        nothing, because a live parent must never lose its fence.
+        """
+        if not parent_session_key:
+            return
+        if (
+            len(self._attachment_generations) >= _MAX_ATTACHMENT_GENERATIONS
+            and parent_session_key not in self._attachment_generations
+        ):
+            for stale_key in [
+                key for key in self._attachment_generations if not self._sessions.has_session(key)
+            ]:
+                self._attachment_generations.pop(stale_key, None)
+        self._attachment_generations[parent_session_key] = (
+            self._attachment_generations.get(parent_session_key, 0) + 1
+        )
+
+    def forget_attachment_generation(self, parent_session_key: str) -> None:
+        """Drop *parent_session_key*'s attachment generation. Idempotent.
+
+        Called by ``session_lifecycle.remove_if_unclaimed`` in the same lock
+        hold that removes the parent: the removed session can attach nothing
+        more, so its entry is pure table growth past that point.
+        """
+        self._attachment_generations.pop(parent_session_key, None)
+
+    def attachment_generation(self, parent_session_key: str) -> int:
+        """How many attachments *parent_session_key* has accepted so far."""
+        return self._attachment_generations.get(parent_session_key, 0)
+
     def completion_event(self, parent_key: str) -> "asyncio.Event":
         """Event pulsed each time a run belonging to *parent_key* finishes.
 
@@ -4773,6 +4835,13 @@ class SubagentManager:
     ) -> SubagentInfo | None:
         store = self._admission.taskq_store()
         assert store is not None
+        # Attachment fence: acceptance is write-before-ack, and the awaited probe
+        # in ``remove_if_unclaimed`` can answer False before the row exists while
+        # its recheck runs before the re-entry below registers it. Bump FIRST, on
+        # the loop, so a removal racing this acceptance keeps the parent whether
+        # the row lands, is queued, or starts. Over-approximation on a refused
+        # write is the safe direction and self-heals on the next sweep.
+        self.bump_attachment(str(kwargs.get("parent_session_key") or ""))
         store_err = await store.run(self._admission.taskq_accept_record, prepared.record)
         if store_err:
             sel().log_tool_invocation(

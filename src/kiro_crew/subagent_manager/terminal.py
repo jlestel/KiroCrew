@@ -199,6 +199,17 @@ class TerminalCoordinator(ManagerComponent):
         # the paths that reach a terminal without the run loop.
         self._record_crew_log_terminal(info)
         info.done = True
+        # The flip above hides this child from ``running_agents_for`` (it has
+        # left ``_agents``), but its terminal report and result delivery still
+        # depend on the parent session below. The delivery-side bump in the
+        # gateway only lands after ``_fire_event`` and ``_on_done`` have awaited,
+        # so a ``remove_if_unclaimed`` resolving in the window between this flip
+        # and that bump would pass the attachment fence, reap the parent, and
+        # suppress this result. Bump synchronously HERE, before the first await,
+        # so the fence sees the still-owed delivery the instant the child goes
+        # invisible. Loop-safe in-memory dict op; a no-op key is ignored.
+        if info.parent_session_key:
+            self._manager.bump_attachment(info.parent_session_key)
         await self._manager._fire_event(
             "subagent_done",
             info,
