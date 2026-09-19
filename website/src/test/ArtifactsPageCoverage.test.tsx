@@ -357,6 +357,50 @@ describe('ArtifactsPage — folder cards in the gallery', () => {
     expect(elapsed).toBeLessThan(2500)
   })
 
+  it('bounds how much content the tile scans before flattening it', async () => {
+    // The tile shows 240 characters, but every pass that produces them -- the
+    // tag strip, the split, the per-line flatten, stripMd -- ran over the FULL
+    // artifact first, while the sibling non-mini markdown path clamps at 4000.
+    // The library provably holds large markdown (that sibling clamp is the
+    // proof), and the tag-strip regex is quadratic on `<` with no closing `>`,
+    // so an unclamped scan froze the whole folder tile with no recovery but
+    // leaving the page. Clamped, the cost is fixed at 4000 characters whatever
+    // the artifact's size, so the budget below is met with room to spare and
+    // missed by an order of magnitude without the clamp.
+    const wide = '<'.repeat(200000)
+    seed({
+      artifacts: [mkArtifact('long-report', { folder_id: 'ops', kind: 'markdown' })],
+      folders: [mkFolder('ops', 'Ops')],
+      full: { content: `Report opens here\n\n${wide}` },
+    })
+    const started = Date.now()
+    renderWithProviders(<ArtifactsPage />)
+    const folder = await screen.findByRole('button', { name: 'Open folder Ops' })
+    const thumb = await within(folder).findByTestId('artifact-mini-text')
+    const elapsed = Date.now() - started
+
+    expect(thumb).toHaveTextContent('Report opens here')
+    expect(elapsed).toBeLessThan(2500)
+  })
+
+  it('separates flattened table ROWS as strongly as the cells inside them', async () => {
+    // stripMd collapses the row-ending newline to a bare space, so joining rows
+    // with it put the weaker mark at the stronger boundary: the last cell of one
+    // row bound to the first of the next and "Check · Result Build · Passed"
+    // read "Result Build" as a pair. Rows carry the same separator as cells.
+    seed({
+      artifacts: [mkArtifact('long-report', { folder_id: 'ops', kind: 'markdown' })],
+      folders: [mkFolder('ops', 'Ops')],
+      full: { content: '| Check | Result |\n|---|---|\n| Build | Passed |\n' },
+    })
+    renderWithProviders(<ArtifactsPage />)
+    const folder = await screen.findByRole('button', { name: 'Open folder Ops' })
+    const thumb = await within(folder).findByTestId('artifact-mini-text')
+
+    expect(thumb).toHaveTextContent('Check · Result · Build · Passed')
+    expect(thumb.textContent).not.toContain('Result Build')
+  })
+
 
   it('keeps SVG folder tiles on the kind-aware preview path', async () => {
     // The artifact is built inline, as the other seeds in this file do: a
