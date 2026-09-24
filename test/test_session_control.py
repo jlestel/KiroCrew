@@ -2695,22 +2695,255 @@ async def test_the_reply_leg_consults_the_fence_before_publishing(tmp_path):
     ), "a constraint that newly holds since that admission withholds the leg"
 
     src = Path(cr.__file__).read_text(encoding="utf-8")
-    deliver_calls = [
-        line
-        for line in src.splitlines()
-        if "await _deliver_cross_surface_reply(" in line and not line.strip().startswith("#")
-    ]
+    lines = [line for line in src.splitlines() if not line.strip().startswith("#")]
+    # The transport leg is called from exactly ONE place: the fenced publication
+    # helper. Anything else that wants the channel-neutral leg goes through that
+    # helper and inherits the fence, so a new publication cannot skip it.
+    deliver_calls = [line for line in lines if "await _deliver_cross_surface_reply(" in line]
     assert len(deliver_calls) == 1, (
-        "one channel-neutral call site only; a second would need its own fence "
-        f"check: {deliver_calls}"
+        "one channel-neutral call site only, inside _publish_cross_surface_reply; a "
+        f"second would bypass the fence: {deliver_calls}"
     )
+    helper_src = src[src.index("async def _publish_cross_surface_reply(") :]
+    helper_src = helper_src[: helper_src.index("\nasync def ", 1)]
+    assert "await _deliver_cross_surface_reply(" in helper_src
+    assert "cross_surface_withheld(state, slot)" in helper_src
+    # The publishers, by name: the turn's completed reply and the linked-conversation
+    # command refusal. A third publisher is fine only if it is listed here.
+    publish_calls = [line for line in lines if "await _publish_cross_surface_reply(" in line]
+    assert sorted(line.strip() for line in publish_calls) == sorted(
+        [
+            "await _publish_cross_surface_reply(state, slot, session_key, assistant_text)",
+            "await _publish_cross_surface_reply(state, slot, session_key, _channel_notice)",
+        ]
+    ), f"unexpected publishers of the channel-neutral leg: {publish_calls}"
     # EVERY cross-surface publication asks, not just the channel-neutral leg: Slack
-    # is an audience too, and it resolves its thread owner live. Four sites -- the
-    # channel-neutral reply, the Slack reply, the mid-turn tool stream, and the
-    # teardown's final task append, which would otherwise publish a title whose
-    # in-progress append was withheld.
+    # is an audience too, and it resolves its thread owner live -- and caches the
+    # thread at turn start. The fence is asked at two sites -- the channel-neutral
+    # publication helper and INSIDE Slack's single gate -- and that gate
+    # (``slack_publication_withheld``: the fence plus the hand-off's pinned origin,
+    # ``turn_origin_released``) is asked at the five dedicated Slack sites: the
+    # turn-start echo and stream start, the mid-turn tool stream, the reply with its
+    # options, the teardown's final task append, which would otherwise publish
+    # a title whose in-progress append was withheld, and the linked-conversation
+    # command refusal's notice, which posts to the slot's CACHED thread before the
+    # turn's try/finally (Opus, ``chat_runner.py:10847`` on the r20 head: a relink
+    # landing while its governance gate ran retargeted the cache, and the notice
+    # named one conversation's command word in another's thread). The origin
+    # predicate is the one both audiences share: asked inside the Slack gate, by
+    # the channel-neutral publisher and the channel-neutral user echo, and twice
+    # more only to word the two withheld log lines (the reply's, the refusal's).
     asks = src.count("cross_surface_withheld(state, slot)")
-    assert asks == 4, f"expected four fenced publication sites, found {asks}"
+    assert (
+        asks == 2
+    ), f"expected the fence at the neutral publisher and the Slack gate, found {asks}"
+    gate_src = src[src.index("def slack_publication_withheld(") :]
+    gate_src = gate_src[: gate_src.index("\nasync def _publish_cross_surface_reply(")]
+    assert "cross_surface_withheld(state, slot)" in gate_src
+    assert "turn_origin_released(state, slot)" in gate_src
+    # ... and the thread the site is about to post to, compared with the pinned
+    # origin: a Slack thread co-bound beside a Telegram mirror is still "bound" to
+    # the predicate above and would otherwise receive the Telegram conversation's
+    # turn (GPT, ``chat_runner.py:4735`` on the r22 head). So the gate takes its
+    # target, and every site hands the pair it posts to -- the four turn sites the
+    # thread cached at turn start, the refusal the pair its deliverer resolves.
+    assert "publication_off_turn_origin(" in gate_src
+    slack_asks = src.count("not slack_publication_withheld(")
+    assert slack_asks == 5, f"expected five gated Slack publication sites, found {slack_asks}"
+    assert src.count("slack_publication_withheld(state, slot)") == 0, "a Slack site named no target"
+    assert (
+        src.count("state, slot, _mirror_chan, _mirror_thread") == 4
+    ), "the four turn sites must judge the thread cached at turn start"
+    # The refusal's Slack leg is the fifth, by shape: the gate is in the SAME
+    # condition as the send, not a separate statement a later edit can lose, and it
+    # judges the very pair the deliverer resolves (one resolution, shared).
+    assert (
+        "_refusal_thread_ts, _refusal_channel = linked_slack_target(slot, sessions, session_key)\n"
+        "        if _slack_permitted and not slack_publication_withheld(\n"
+        "            state, slot, _refusal_channel, _refusal_thread_ts\n"
+        "        ):\n"
+        "            await _deliver_linked_slack_message("
+        "state, slot, sessions, session_key, _channel_notice)"
+    ) in src, "the command refusal's Slack notice must sit behind the turn's publication gate"
+    deliverer_src = src[src.index("async def _deliver_linked_slack_message(") :]
+    deliverer_src = deliverer_src[: deliverer_src.index("\ndef cross_surface_withheld(")]
+    assert "linked_slack_target(slot, sessions, session_key)" in deliverer_src
+    assert (
+        "turn_origin_released(state, slot)" in helper_src
+    ), "the channel-neutral publisher must ask the same origin predicate as the Slack gate"
+    assert (
+        src.count("turn_origin_released(state, slot)") == 5
+    ), "the Slack gate, the neutral publisher, the neutral echo, two log lines"
+    # The channel-neutral leg compares ITS target too -- the mirror row it resolves
+    # live -- at both of its sites, the publisher and the user echo.
+    assert "neutral_publication_off_turn_origin(state, slot, session_key)" in helper_src
+    assert (
+        src.count("neutral_publication_off_turn_origin(state, slot, session_key)") == 2
+    ), "the neutral publisher and the neutral echo"
+
+
+def _run_chat_call_sites() -> list[tuple[str, int, dict[str, object]]]:
+    """Every call of the turn runner ``_run_chat`` under ``src/kiro_crew``, as
+    ``(relative path, line, keywords)``.
+
+    A keyword splatted in (``**kwargs``) is resolved through the dict literal the
+    enclosing function assigns to that name, plus any subscript assignment made
+    unconditionally in that function's body -- a key set inside an ``if`` does not
+    count, because the rule below is about what EVERY call carries. A module that
+    binds ``_run_chat`` from anywhere but the dashboard chat modules (the CLI's own
+    runner) is not a call site of this function.
+    """
+    import ast
+
+    package = Path(cr.__file__).resolve().parent.parent
+    runner_modules = {"kiro_crew.dashboard.chat", "kiro_crew.dashboard.chat_runner"}
+    sites: list[tuple[str, int, dict[str, object]]] = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        rel = path.relative_to(package).as_posix()
+        if rel != "dashboard/chat_runner.py":
+            bound_from = {
+                node.module
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                and any(alias.name == "_run_chat" for alias in node.names)
+            }
+            if not bound_from & runner_modules:
+                continue
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            literals: dict[str, dict[str, object]] = {}
+            for stmt in func.body:
+                if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                value = stmt.value
+                for target in targets:
+                    if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
+                        literals[target.id] = {
+                            k.value: v
+                            for k, v in zip(value.keys, value.values)
+                            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+                        }
+                    elif (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)
+                        and value is not None
+                    ):
+                        literals.setdefault(target.value.id, {})[target.slice.value] = value
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = node.func
+                name = (
+                    callee.id
+                    if isinstance(callee, ast.Name)
+                    else callee.attr if isinstance(callee, ast.Attribute) else ""
+                )
+                if name != "_run_chat":
+                    continue
+                keywords: dict[str, object] = {}
+                for kw in node.keywords:
+                    if kw.arg is not None:
+                        keywords[kw.arg] = kw.value
+                    elif isinstance(kw.value, ast.Name):
+                        keywords.update(literals.get(kw.value.id, {}))
+                sites.append((rel, node.lineno, keywords))
+    return sites
+
+
+def test_every_channel_sourced_turn_names_its_conversation_at_the_one_pin():
+    """A turn's channel origin is decided in ONE place and every entry path feeds it.
+
+    Three guards in this family each turned out to be only as good as the caller
+    that pinned the origin (the drain's binding check, the Slack publication
+    sites, the idle linked-thread route), so the rule is structural rather than a
+    fourth site. (1) Every ``_run_chat`` call that marks its turn channel-sourced
+    (``_directive_channel_origin`` other than the literal ``False``) also names the
+    conversation (``_channel_origin``) -- the drain, the idle linked-thread route
+    and the ``/prompts get`` re-entry today; a new entry path that marks without
+    naming fails here before it ships, and at runtime ``pin_turn_channel_origin``
+    would still pin it as publishing to nowhere. (2) ``_turn_channel_origin`` gets a
+    value from exactly one function, ``pin_turn_channel_origin``, called once, at
+    ``_run_chat``'s entry; every other assignment is a clear. (3) Every reader in
+    the package goes through ``turn_channel_origin``.
+    """
+    import ast
+
+    sites = _run_chat_call_sites()
+    assert len(sites) >= 20, f"the call-site enumeration went blind: {len(sites)} sites"
+    channel_sourced = [
+        (rel, line, keywords)
+        for rel, line, keywords in sites
+        if "_directive_channel_origin" in keywords
+        and not (
+            isinstance(keywords["_directive_channel_origin"], ast.Constant)
+            and keywords["_directive_channel_origin"].value is False
+        )
+    ]
+    assert {rel for rel, _line, _kw in channel_sourced} == {
+        "slack/handler.py",
+        "dashboard/chat_runner.py",
+    }, f"unexpected channel-sourced entry paths: {channel_sourced}"
+    assert len(channel_sourced) == 3, (
+        "the idle linked-thread route, the queue drain and the /prompts re-entry: "
+        f"{[(rel, line) for rel, line, _kw in channel_sourced]}"
+    )
+    unnamed = [
+        (rel, line) for rel, line, keywords in channel_sourced if "_channel_origin" not in keywords
+    ]
+    assert unnamed == [], f"channel-sourced turns entering without their conversation: {unnamed}"
+
+    package = Path(cr.__file__).resolve().parent.parent
+    writers: list[tuple[str, int, str]] = []
+    readers: list[tuple[str, int]] = []
+    for path in sorted(package.rglob("*.py")):
+        rel = path.relative_to(package).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(func):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Attribute) and (
+                            target.attr == "_turn_channel_origin"
+                        ):
+                            clears = isinstance(node.value, ast.Constant) and (
+                                node.value.value is None
+                            )
+                            if not clears:
+                                writers.append((rel, node.lineno, func.name))
+                elif (
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "_turn_channel_origin"
+                    and isinstance(node.ctx, ast.Load)
+                ):
+                    readers.append((rel, node.lineno))
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == "_turn_channel_origin"
+                    and func.name != "turn_channel_origin"
+                ):
+                    readers.append((rel, node.lineno))
+    assert [(rel, fn) for rel, _line, fn in writers] == [
+        ("dashboard/chat_runner.py", "pin_turn_channel_origin")
+    ], f"the turn's channel origin is pinned by one function only: {writers}"
+    assert readers == [], f"read the pin through turn_channel_origin, not the field: {readers}"
+    src = Path(cr.__file__).read_text(encoding="utf-8")
+    lines = [line for line in src.splitlines() if not line.strip().startswith("#")]
+    pins = [line for line in lines if "pin_turn_channel_origin(" in line and "def " not in line]
+    assert len(pins) == 1, f"one pin call, at _run_chat's entry: {pins}"
+    entry = src[src.index("async def _run_chat(") :]
+    entry = entry[: entry.index("_incoming_message = message")]
+    assert "pin_turn_channel_origin(" in entry, "the pin is made before anything else in the turn"
 
 
 @pytest.mark.asyncio

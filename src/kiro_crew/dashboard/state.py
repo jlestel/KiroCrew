@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -65,6 +66,7 @@ from kiro_crew.dashboard.slot_queue_repository import (
     durable_queue_entries,
     durable_queue_view,
     queue_persist_signature,
+    reattest_durable_window,
 )
 from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
@@ -2159,6 +2161,56 @@ def _normalize_slot_key(name: str) -> str:
     return _SLOT_KEY_FILENAME_UNSAFE_RE.sub("_", _ascii_slot_key(name))
 
 
+def transcript_slot_name(key: str) -> str:
+    """The dashboard slot key a transcript *key* spells: ONE prefix stripped.
+
+    The inverse of the one prefix the transcript layer adds to a slot key -- the
+    history key ``dashboard:<slot>`` or the filename stem ``dashboard_<slot>`` --
+    and nothing more: exactly one of the two is removed, never both and never
+    repeatedly. Feed it TRANSCRIPT keys, not raw slot keys: a slot key can itself
+    begin with ``dashboard_`` (the normalizer above folds the display name
+    ``dashboard x`` to ``dashboard_x``), and the history layer strips every such
+    prefix when it builds the history key (``chat_utils._history_key_for``), so
+    slot keys ``x`` and ``dashboard_x`` SHARE the transcript ``dashboard:x`` and a
+    restore recreates either as ``x``. What this returns is therefore the one name
+    every side of a transcript agrees on, and it is the one spelling the queue's
+    durable state is keyed by -- through :func:`queue_record_key`, which folds it
+    once more for channel transcripts -- so
+    the record the restore honours is the record the save wrote and the delete
+    retires, and a seal verifies under the key the restored slot carries. A key
+    carrying neither prefix is returned unchanged.
+    """
+    if key.startswith("dashboard:"):
+        return key[len("dashboard:") :]
+    if key.startswith("dashboard_"):
+        return key[len("dashboard_") :]
+    return key
+
+
+def queue_record_key(transcript_key: str) -> str:
+    """The ONE spelling a transcript's queue provenance is keyed by: the
+    queue-generation record (the save's ``chat_persistence._queue_store_key``, the
+    restore's reads, the permanent delete's tombstone in ``handlers/sessions``)
+    and every attestation and record seal (``_ChatSlot.queue_seal_key`` /
+    ``slot_queue_repository.seal_key_of``).
+
+    :func:`transcript_slot_name` of *transcript_key*, folded through
+    :func:`_normalize_slot_key`. The fold is what makes a CHANNEL transcript one
+    record: a bound channel slot's save writes under its transcript key, the live
+    session key ``slack:<ts>`` (``chat_utils.slot_history_key``), while every
+    restore derives the key from the transcript's filename stem, ``slack_<ts>``
+    (``chat_utils.slot_transcript_key``; ``history._safe_key`` folds the colon, so
+    the two address one ``.jsonl``). Keyed by the unfolded name, the record the
+    save wrote sat under a spelling no restore read, the restored line read as a
+    write this gateway kept no record of, and every queued channel message was
+    dropped at the next drain -- on every restart. The normalizer folds the same
+    character class ``_safe_key`` does, so the folded name IS the stem whichever
+    side derives it. For a dashboard transcript the fold is the identity
+    (``dashboard:x`` -> ``x``, the slot name the normalizer minted).
+    """
+    return _normalize_slot_key(transcript_slot_name(transcript_key))
+
+
 # Tag revisions are totally ordered across gateway restarts. Each process claims
 # an EPOCH once at startup (``ensure_tags_revision_epoch``, run off the event
 # loop from ``DashboardState.load_tags``): ``max(persisted counter + 1, current
@@ -2489,6 +2541,13 @@ class _ChatSlot:
         "_queue_persist_inflight",
         "_queue_persist_owed",
         "_last_enqueue_ts",
+        "_origin_proofs",
+        "_rejected_provenance",
+        "_unrecorded_provenance",
+        "_provenance_lock",
+        "_queue_generation",
+        "_queue_generation_committed",
+        "_queue_generation_staged",
         "_approval_futures",
         "_approval_stopped",
         "_trust",
@@ -2667,6 +2726,7 @@ class _ChatSlot:
         "_steer_admissions",
         "_steer_decision_strips",
         "_steer_audience_fences",
+        "_turn_channel_origin",
         "_steer_attachment_meta",
         "_wait_state",
         "_end_wait_request",
@@ -2870,6 +2930,60 @@ class _ChatSlot:
         # Newest enqueue instant, read only while ``_queue`` is non-empty — see
         # ``_note_enqueue``.
         self._last_enqueue_ts: str = ""
+        # The gateway's attestations for queued entries, keyed by queue id --
+        # beside the queue like the enqueue instant, never on an entry (see
+        # ``slot_queue_repository.ORIGIN_PROOF_KEY``). Written by the repository's
+        # stamp; the durable writer seals each attested record under the write's
+        # generation, and the restore mints them back from a verified seal.
+        self._origin_proofs: dict[str, str] = {}
+        # Ids of restored entries whose durable record carried a seal this
+        # gateway could not verify (``slot_queue_repository.
+        # REJECTED_SEAL_CONSTRAINT``): the drain drops them with the dashboard
+        # notice. Written by the restore, cleared by a re-stamp (an edit), pruned
+        # with the attestations.
+        self._rejected_provenance: set[str] = set()
+        # Ids of restored entries from a line whose durable write the fenced store
+        # holds no record of for this transcript (``slot_queue_repository.
+        # UNRECORDED_GENERATION_CONSTRAINT``): a save cut short, a transcript put
+        # back from a copy, a reused slot key. Nothing verified false, nothing to
+        # honour -- the drain drops them with a notice that says so, not with the
+        # rejected-seal tamper wording. Written, cleared and pruned exactly like
+        # the rejected set.
+        self._unrecorded_provenance: set[str] = set()
+        # The lock the three sidecars above are written under
+        # (``slot_queue_repository._provenance_lock_of``). Two threads write
+        # them: the loop thread at every stamp and at the drain's forget, and the
+        # flush executor thread when ``begin_durable_queue_write`` brings the proof
+        # set up to the window before the snapshot. A thread lock, not ``_lock``
+        # (an ``asyncio.Lock`` the executor cannot take); re-entrant because the
+        # reattestation stamps through the repository's one writer.
+        self._provenance_lock = threading.RLock()
+        # The generation the durable writer seals this slot's queue records under
+        # (``slot_queue_repository.ORIGIN_GENERATION_KEY``). Minted fresh by
+        # ``begin_durable_queue_write`` whenever the durable value has moved since
+        # the last committed write, so records from two different writes never
+        # share one; a fresh slot starts with its own so the enqueue-time costing
+        # (``warn_if_not_durable``) sees the record the write will carry.
+        self._queue_generation: str = secrets.token_hex(16)
+        # The generation the save last committed to the fenced store for this slot
+        # (``queue_generation_store``), or None while nothing has been committed
+        # for it -- by this process, or by the one whose line the restore read
+        # (the restore seeds it from the store). The save writes the store only
+        # when the committed line's generation differs from this, so a quiet slot
+        # costs no store write per save; and a slot that HAS a committed
+        # generation moves the store off it when its queue empties, so a line
+        # rolled back to the queue that was just consumed matches nothing.
+        self._queue_generation_committed: str | None = None
+        # The generation the save last STAGED in the fenced store as pending -- the
+        # first of its two store writes, made right before the line's own -- and
+        # has not committed yet; None while nothing is pending (the commit clears
+        # it). Seeded by the restore from the store like the witness above (the
+        # NEWEST pending one: the store carries every generation staged since the
+        # last commit, so a retry after a refused commit does not drop the one the
+        # line on disk still names, and the commit that lands prunes them). The
+        # stage is skipped for a generation the store already holds under either
+        # witness, so a retried save costs no second pending write.
+        self._queue_generation_staged: str | None = None
         self._approval_futures: dict[str, asyncio.Future[str]] = {}  # type: ignore[type-arg]
         # Approval ids a STOP rejected, rather than a person. A stop resolves the
         # future with an ordinary "rejected", so the runner cannot tell the two
@@ -3700,6 +3814,25 @@ class _ChatSlot:
         # TURN-SCOPED: the turn's teardown empties it, so one turn's withheld reply
         # never silences the next, whose authorization is its own.
         self._steer_audience_fences: dict[str, dict] = {}
+        # The channel conversation whose message the RUNNING turn is answering
+        # (``channel_busy.CHANNEL_ORIGIN_META_KEY``'s mapping), an EMPTY mapping
+        # for a channel-sourced turn whose dispatch named no conversation (it
+        # publishes to no channel), or None for a turn that is nobody's hand-off.
+        # Written by ONE decider, ``chat_runner.pin_turn_channel_origin``, from what
+        # the dispatch said about the turn's source -- the drain's stamp, the
+        # linked Slack thread the intercept ran the message from -- and read
+        # through ``chat_runner.turn_channel_origin`` by every publication guard
+        # (``turn_origin_released``: the channel-neutral leg and Slack's mirror
+        # both resolve their audience live, so each publication asks whether that
+        # conversation is still among the session's rooms and withholds when it is
+        # not -- a conversation that released the session mid-turn, and one that
+        # resumed it meanwhile, must not receive the first one's words) and by the
+        # recovery requeue's stamp.
+        #
+        # TURN-SCOPED like the fences above: every ``_run_chat`` pins it before
+        # any publication and its teardown clears it, so a stale value cannot
+        # judge a later turn.
+        self._turn_channel_origin: dict[str, Any] | None = None
         # Validated attachment lists for a pending steer. Requeue moves them
         # to the queue entry; a consumption echo releases them after an accepted
         # steer has stamped its own row.
@@ -4323,9 +4456,37 @@ class _ChatSlot:
     def queue_promote_by_id(self, queue_id: str) -> bool:
         return self._queue_repository.queue_promote_by_id(self, queue_id)
 
+    def queue_seal_key(self) -> str:
+        """The key the queue's attestations and record seals are minted AND
+        verified under: the transcript's slot name (:func:`queue_record_key` of
+        this slot's history key), never ``self.key``.
+
+        The two can differ. A display name such as ``dashboard x`` folds to the slot
+        key ``dashboard_x``, whose transcript is ``dashboard:x`` -- the one slot ``x``
+        also writes -- and a restore recreates the slot under the name it derives
+        from that transcript, ``x``. A bound channel slot's history key is the live
+        session key ``slack:<ts>`` while its restore derives ``slack_<ts>`` from the
+        transcript's stem. A seal minted under an unfolded key then fails to
+        verify under the restored key, and the queue it protects is dropped under a
+        false tamper notice. Every minter and verifier asks this ONE spelling
+        (``slot_queue_repository.seal_key_of``), the same the queue-generation
+        record is filed under (``chat_persistence._queue_store_key``), so a seal
+        verifies wherever the transcript comes back.
+        """
+        # circular import: chat_utils imports this module at module level.
+        from kiro_crew.dashboard.chat_utils import slot_history_key
+
+        return queue_record_key(slot_history_key(self))
+
     def durable_queue_entries(self) -> list[dict[str, Any]]:
-        """The queued user prompts a metadata writer may persist right now."""
-        return durable_queue_entries(self._queue)
+        """The queued user prompts a metadata writer may persist right now,
+        sealed under the slot's current generation."""
+        return durable_queue_entries(
+            self._queue,
+            self._origin_proofs,
+            slot_key=self.queue_seal_key(),
+            generation=self._queue_generation,
+        )
 
     def durable_queue_view(self) -> tuple[list[dict[str, Any]], int]:
         """Persistable queued prompts and the candidate count, from one read.
@@ -4333,7 +4494,66 @@ class _ChatSlot:
         Used where the two are SUBTRACTED (the save's over-cap report), so the
         difference describes one observation of the queue rather than two.
         """
-        return durable_queue_view(self._queue)
+        return durable_queue_view(
+            self._queue,
+            self._origin_proofs,
+            slot_key=self.queue_seal_key(),
+            generation=self._queue_generation,
+        )
+
+    def begin_durable_queue_write(self) -> bool:
+        """Mint the generation a save about to write this slot's queue seals under;
+        True when a fresh one was minted.
+
+        Called by the save at the start of EACH attempt at its proven queue/window
+        pair (``chat_persistence._save_slot_to_history``), never once ahead of the
+        pair. First the proof set is
+        brought up to the window (``reattest_durable_window``): a live entry the
+        head has drained into the durable window since the last save holds no
+        attestation yet, and written that way it would restore as unproven prose
+        that containment drops -- so it is stamped from its live fields here, and
+        the value the generation is decided over below IS the sealed value the
+        line will carry. Reached from the flush EXECUTOR thread as well as the
+        loop (``dashboard_persistence.flush_slot_now`` under ``run_in_executor``),
+        so that reattestation writes the sidecars under ``_provenance_lock``, the
+        one lock both writing threads take. Then a fresh generation
+        exactly when the durable value has MOVED since the last committed write
+        (``queue_persist_pending``): the records of two different writes then
+        never share one, which is what lets the restore refuse a record kept from
+        an older write (``slot_queue_repository.ORIGIN_GENERATION_KEY``). A save
+        that re-emits an unchanged value keeps its generation -- records identical
+        to the ones on the line cannot be a replay -- so the save's own no-op skip
+        and the flush's drift check still read "nothing owed" for a quiet slot.
+        Between writes the generation is stable, so the drift check's recomputed
+        value compares equal to the one the last save committed.
+
+        Both decisions are made over a read the loop thread can move under: a
+        drain landing between the reattestation and the save's snapshot promotes
+        the 33rd entry into the window unsealed, and one landing between the
+        mint's read and the snapshot leaves a moved value under the committed
+        generation. Neither is this method's to close -- it cannot see the
+        snapshot -- so the save proves them INSIDE its pair: it re-attests before
+        the confirming read (a proof the snapshot lacked then shows up as a
+        difference) and accepts a kept generation only for a snapshot whose
+        signature is the committed one, retrying otherwise; the answer here is
+        what lets it tell the two apart.
+
+        The drift is read through the module functions rather than this slot's
+        ``durable_queue_entries``: that method is one of the PAIRED queue reads the
+        save proves against the window (``_stable_durable_queue`` and its retry
+        loop), and this decision is the write's own bookkeeping, not one of them.
+        """
+        reattest_durable_window(self)
+        current = durable_queue_entries(
+            self._queue,
+            self._origin_proofs,
+            slot_key=self.queue_seal_key(),
+            generation=self._queue_generation,
+        )
+        if queue_persist_signature(current) == self._queue_persisted_sig:
+            return False
+        self._queue_generation = secrets.token_hex(16)
+        return True
 
     @property
     def queue_persist_pending(self) -> bool:

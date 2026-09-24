@@ -30,7 +30,11 @@ if TYPE_CHECKING:
     from kiro_crew.slack.outbound import PostedOptions
 
 from kiro_crew.context_blocks import attributable_user_chars
-from kiro_crew.dashboard.slot_queue_repository import ATTACHMENT_META_KEYS
+from kiro_crew.dashboard.slot_queue_repository import (
+    ATTACHMENT_META_KEYS,
+    RESTORED_QUEUE_KEY,
+    dashboard_origin_proven,
+)
 from kiro_crew.dashboard.state import (
     BUSY_RECOVERY_PREFIX,
     COMPACTION_RECOVERY_PREFIX,
@@ -66,7 +70,7 @@ from kiro_crew.history import (
 from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS, safe_read_file
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
-from kiro_crew.quick_prompts import QUICK_PROMPTS
+from kiro_crew.quick_prompts import QUICK_PROMPTS, expand_quick_prompt
 from kiro_crew.security import (
     CREDENTIAL_REDACTION_TAGS,
     EXFILTRATION_REDACTION_TAG_PREFIX,
@@ -562,6 +566,122 @@ def user_text_span(
         else attributable_user_chars(typed_len, prompt_expanded=prompt_expanded)
     )
     return offset, offset + length
+
+
+def dashboard_command_word(message: str, *, channel_origin: bool) -> str:
+    """The leading token the dashboard may read as a COMMAND, or ``""`` for none.
+
+    A turn whose text came from a CHANNEL conversation bound to this session
+    (``channel_busy``'s hand-off, Slack's linked-thread intercept) is prose here:
+    the channel's own command intercept already ran everything that conversation
+    may command, and what it forwarded is what its user meant the model to READ --
+    natively the same text reaches the model as text. Matching it against the
+    dashboard's commands instead would let a channel message run ``/workflow``,
+    ``/goal`` or a harness command on the dashboard owner's authority, which the
+    channel never offered its user. So a channel-origin turn has no command word
+    at all, and every other turn keeps its first token exactly as before.
+    """
+    if channel_origin:
+        return ""
+    return message.split()[0] if message.strip() else ""
+
+
+def opens_with_quick_prompt(message: str) -> bool:
+    """Whether *message* opens with a quick-prompt macro (``/plain``), read off the
+    RAW leading token -- the expander's own rule (``quick_prompts.expand_quick_prompt``),
+    which ``ContextBuilder.build_message`` applies for every surface alike.
+
+    Not :func:`dashboard_command_word`: that blanks a channel-origin turn's leading
+    token so the turn can never DISPATCH a command, but a macro is not a command --
+    a linked conversation's ``/plain ...`` is expanded exactly as the composer's is
+    -- so the turn's replacing-expansion flag, which the ``$skill`` gate and the
+    attribution read, must come from the token as typed. Read off the blanked word,
+    a channel turn's ``/plain ... $skill`` counted as unexpanded and loaded skill
+    bodies the composer's own path refuses to (Opus, ``chat_runner.py:12206``).
+    """
+    return expand_quick_prompt(message) is not None
+
+
+#: What the person who typed into a linked conversation is told when the leading
+#: token of their message is one the dashboard would have run as a command
+#: (:func:`suppressed_channel_command`). The turn is refused rather than sent as
+#: prose: a ``/compact`` that reaches the model as text is neither the command
+#: they meant nor a message they meant to send, and silence would leave them
+#: waiting for a compaction that never comes.
+CHANNEL_COMMAND_UNAVAILABLE = (
+    "⚠️ `{command}` is not available from a linked conversation, so this message "
+    "was not sent to the agent. Dashboard commands run from the dashboard only."
+)
+
+#: Longest token the refusal repeats back. Under ``claude_code`` any leading slash
+#: is a harness command, so the token is the channel user's own text and may be
+#: arbitrarily long; the notice names it, it does not carry it.
+CHANNEL_COMMAND_TOKEN_MAX = 64
+
+
+def displayable_channel_command(word: str) -> str:
+    """The refused token as the notice, the audit row and the channel may see it.
+
+    The token is untrusted text from a linked conversation, and every surface the
+    refusal reaches -- the persisted transcript row, the SEL ``tool_name``, the
+    Slack post -- is one the intercept already redacts the user's own message for
+    (``redact_exfiltration_urls`` then ``redact_credentials``). The same two
+    redactors run here so the notice cannot hand the raw token back around that
+    redaction, and the result is cut to :data:`CHANNEL_COMMAND_TOKEN_MAX` with an
+    ellipsis: a pasted blob is named by its head, never repeated whole.
+    """
+    text, _ = redact_exfiltration_urls(word)
+    text, _ = redact_credentials(text)
+    if len(text) > CHANNEL_COMMAND_TOKEN_MAX:
+        text = text[: CHANNEL_COMMAND_TOKEN_MAX - 1] + "…"
+    return text
+
+
+def suppressed_channel_command(message: str, *, channel_origin: bool, cc_provider: bool) -> str:
+    """The leading token a channel-origin turn is NOT allowed to run, or ``""``.
+
+    :func:`dashboard_command_word` gives a channel-origin turn no command word, so a
+    leading token the dashboard reads as a command from its own composer -- a
+    member of ``_SLASH_COMMANDS``, any slash under ``claude_code`` -- would
+    otherwise stream to the model as prose with nobody told. That is the wrong
+    outcome for the person who typed it: their channel already answered every
+    command it knows, so a token that reached this far is one the channel forwarded
+    as text and the dashboard would have acted on (Slack's linked-thread intercept
+    delivers ``/compact`` this way). The caller refuses the turn with
+    :data:`CHANNEL_COMMAND_UNAVAILABLE` naming the token. ``""`` for every other
+    turn: composer text keeps its command word, and channel prose -- including a
+    leading token no surface reads as a command -- stays prose.
+
+    A quick-prompt macro (``/plain``, ``/teach``) is NOT in that set. It is a prose
+    shortcut, not a command: ``ContextBuilder.build_message`` expands it for every
+    surface alike, with no command word involved, so ``/plain summarise the log``
+    from a linked thread works exactly as it does from the composer and there is
+    nothing to refuse.
+
+    Under ``claude_code`` the harness owns its command set and the composer forwards
+    ANY leading slash, so that rule alone would refuse a channel message that merely
+    opens with a path (``/usr/bin/python3 --version``). A path is not a command
+    anyone has: a token with a second ``/`` or a ``.`` past its first character
+    (:func:`_path_shaped`) stays prose on every provider.
+    """
+    if not channel_origin or not message.strip():
+        return ""
+    word = message.split()[0]
+    if _path_shaped(word):
+        return ""
+    if is_harness_slash_command(word, cc_provider=cc_provider):
+        return word
+    return ""
+
+
+def _path_shaped(word: str) -> bool:
+    """Whether a leading slash token reads as a filesystem path, not a command.
+
+    A command word is one segment (``/compact``, ``/review``); a path has a second
+    ``/`` (``/usr/bin/python3``) or an extension dot (``/setup.py``) after the first
+    character. No command in ``_SLASH_COMMANDS`` or ``QUICK_PROMPTS`` carries either.
+    """
+    return word.startswith("/") and ("/" in word[1:] or "." in word[1:])
 
 
 def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
@@ -3907,17 +4027,98 @@ def carries_attachments(item: dict) -> bool:
     return any(isinstance(meta.get(k), list) and meta.get(k) for k in ATTACHMENT_META_KEYS)
 
 
-def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
+def refuses_as_channel_command(item: dict, *, cc_provider: bool) -> bool:
+    """Whether a queue entry is a channel conversation's words whose leading token
+    the dashboard would refuse (:func:`suppressed_channel_command`).
+
+    Such an entry drains ALONE, like an attachment-bearing one: merged behind other
+    text under the merge banner, the token loses the leading position the refusal
+    keys on, the merged turn is not refused, and the conversation that typed the
+    command is told nothing while the model reads it as prose. The conversation is
+    the address on the entry (``channel_busy.channel_origin_address``), the same
+    reading the drain gives ``_channel_message``; *cc_provider* is the harness
+    axis the refusal itself is asked with.
+    """
+    # circular import: channel_busy reaches this module through chat_delivery.
+    from kiro_crew.dashboard.channel_busy import channel_origin_address
+
+    if channel_origin_address(item.get("meta")) is None:
+        return False
+    content = item.get("content")
+    return isinstance(content, str) and bool(
+        suppressed_channel_command(content, channel_origin=True, cc_provider=cc_provider)
+    )
+
+
+def merge_origin(item: dict, owner: Any) -> tuple[bool, str]:
+    """The conversation a queue entry's words came from, as the key a merge run
+    compares: two entries fold into one turn only when it is EQUAL.
+
+    A merged turn is published as ONE turn -- one pin
+    (``chat_runner.pin_turn_channel_origin``, from the drain's stamp), one echo,
+    one reply -- into the room that pin names. Folding another conversation's
+    words into it publishes them to an audience that never sent them, silently and
+    unretractably, so :func:`_dequeue_next_message` partitions the queue by this
+    key before it joins anything:
+
+    * a channel hand-off keys on its stamp (``channel_busy.channel_origin_address``):
+      the room, spelled as the publication gate spells it
+      (``session_control.mirror_room``, so a missing thread id and an empty one are
+      the same room), and the admitted sender
+      (``channel_busy.CHANNEL_ORIGIN_PRINCIPAL_KEY``) -- so the one stamp a merged
+      turn carries is every folded entry's, and the drop notice's recipient
+      re-decision over that stamp is exact for each of them;
+    * channel text the gateway cannot place -- a channel-sourced entry with no
+      address, or a restored entry with no verifiable provenance, the drain's own
+      reading (``slot_queue_repository.dashboard_origin_proven``) -- keys as channel
+      and nowhere: its turn publishes nothing, and the dashboard's words must not
+      ride into that silence either;
+    * anything else is the dashboard's own text.
+
+    *owner* is the slot whose sidecar holds the proofs; the key is read off the
+    entry's untrusted meta the way every drain-time consumer reads it, never off
+    its content.
+    """
+    # circular imports: session_control imports this module at module level, and
+    # channel_busy reaches it through chat_delivery.
+    from kiro_crew.dashboard.channel_busy import channel_origin_address, channel_origin_principal
+    from kiro_crew.dashboard.session_control import mirror_room
+
+    meta = item.get("meta")
+    address = channel_origin_address(meta)
+    if address is not None:
+        return True, f"{mirror_room(address)}|{channel_origin_principal(meta)}"
+    if item.get("_directive_channel_origin") is True:
+        return True, ""
+    if item.get(RESTORED_QUEUE_KEY) is True and not dashboard_origin_proven(owner, item):
+        return True, ""
+    return False, ""
+
+
+def _dequeue_next_message(slot, merge_enabled: bool, *, cc_provider: bool = False) -> tuple:
     """Drain the queue: merge non-cron messages or pop the first one.
 
-    A merge run stops at a system injection and at an attachment-bearing entry
-    (see :func:`carries_attachments`); an attachment-bearing entry at the head
-    of the queue pops alone.
+    A merge run stops at a system injection, at an attachment-bearing entry (see
+    :func:`carries_attachments`), at a channel entry the turn would refuse (see
+    :func:`refuses_as_channel_command`) and at the first entry of another origin
+    than the head's (see :func:`merge_origin`); such an entry at the head of the
+    queue pops alone, or starts its own run. Queue order is kept: the run is the
+    head's own-origin prefix, never a gather across the queue.
     """
     if merge_enabled and len(slot._queue) > 1:
         to_merge: list[dict] = []
+        run_origin: tuple[bool, str] | None = None
         for item in list(slot._queue):
-            if is_system_injection_item(item) or carries_attachments(item):
+            if (
+                is_system_injection_item(item)
+                or carries_attachments(item)
+                or refuses_as_channel_command(item, cc_provider=cc_provider)
+            ):
+                break
+            origin = merge_origin(item, slot)
+            if run_origin is None:
+                run_origin = origin
+            elif origin != run_origin:
                 break
             to_merge.append(item)
         if len(to_merge) > 1:

@@ -169,7 +169,7 @@ from kiro_crew.dashboard.slot_buffers import (
     note_hold_durable,
     persist_deferred_notes_sync,
 )
-from kiro_crew.dashboard.slot_queue_repository import warn_if_not_durable
+from kiro_crew.dashboard.slot_queue_repository import seal_key_of, warn_if_not_durable
 from kiro_crew.dashboard.state import (
     DashboardState,
     SlotOrigin,
@@ -1041,7 +1041,10 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         _c, _ = redact_exfiltration_urls(message)
         _c, _ = redact_credentials(_c)
         _redacted = _redact_for_display(_c)
-        warn_if_not_durable(slot._queue, qid, slot.key)
+        _proofs = getattr(slot, "_origin_proofs", None)
+        _generation = getattr(slot, "_queue_generation", "")
+        # Under the seal key, as the busy-slot path costs it (``chat_delivery``).
+        warn_if_not_durable(slot._queue, qid, seal_key_of(slot), _proofs, _generation)
         # Start the durable write here too, not only in the busy-slot branch.
         # This branch holds an IDLE slot, so no drain is coming to write the
         # prompt's transcript row and no turn-end flush is scheduled: the queue

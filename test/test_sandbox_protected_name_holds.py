@@ -302,7 +302,17 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   refresh-chain state is never listable from inside the namespace;
     #: * ``redaction-allow`` -- the reader's allowed link hosts, sealed read-only
     #:   so an agent cannot allow the host it wants to send conversation data to.
-    EXPECTED: dict[str, int] = {"standard": 244, "cc": 251, "strict": 252}
+    #:
+    #: A fourth landed with the queued-prompt provenance seal, at the root for
+    #: the same reason (``sandbox._CREW_HIDDEN_LEAVES`` states it beside the
+    #: entry): no masked directory holds per-slot gateway state, and a leaf
+    #: under an agent-writable ancestor could be renamed out from under its mask:
+    #:
+    #: * ``queue-generations`` -- the committed queue generation per slot
+    #:   (``dashboard/queue_generation_store.py``), which the restore requires a
+    #:   session's queued-prompt line to name before it honours the line's seals;
+    #:   written by the gateway's save and read by its restore prefetch only.
+    EXPECTED: dict[str, int] = {"standard": 247, "cc": 254, "strict": 255}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

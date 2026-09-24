@@ -823,8 +823,14 @@ def test_the_predicate_reads_every_audience_accessor_the_reply_delivery_legs_rea
         chat_runner._resolve_mirror_target,
         chat_runner._deliver_cross_surface_reply,
         chat_runner._deliver_linked_slack_message,
+        # The Slack deliverer resolves its thread through this helper, shared with
+        # the publication gate asked right before it; the accessor read lives here.
+        chat_runner.linked_slack_target,
     ):
         delivery_reads |= set(accessor.findall(inspect.getsource(leg)))
+    assert "linked_slack_target(" in inspect.getsource(
+        chat_runner._deliver_linked_slack_message
+    ), "the Slack deliverer must resolve its thread through the shared helper"
     predicate_reads = set(accessor.findall(inspect.getsource(sc.owner_dm_refusal)))
     probe_reads = set(accessor.findall(inspect.getsource(sc._probe_channel_mirror)))
     assert {"get_mirror_link", "get_slack_link"} <= delivery_reads, sorted(delivery_reads)

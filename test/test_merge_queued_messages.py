@@ -157,6 +157,163 @@ class TestDequeueNextMessage:
         assert [c["content"] for c in consumed] == ["user msg"]
         assert [q["content"] for q in slot._queue] == [cron_msg, "another user msg"]
 
+    def test_a_channel_command_the_turn_would_refuse_is_never_merged(self):
+        """A channel conversation's entry whose leading token the dashboard would
+        refuse (``/compact`` under the ``channel_origin`` address) breaks the merge run
+        like an attachment: merged behind other text under the banner, the token would
+        lose the leading position the refusal keys on and reach the model as prose
+        with no notice to the conversation. Red on the previous head (the merge took
+        it)."""
+        address = {"channel_type": "discord", "channel_id": "c1", "thread_id": None}
+        slot = _ChatSlot("s1")
+        slot._queue = [
+            {"id": "a", "content": "msg1"},
+            {"id": "b", "content": "msg2"},
+            {"id": "c", "content": "/compact", "meta": {"channel_origin": address}},
+            {"id": "d", "content": "msg3"},
+        ]
+        for item in slot._queue:
+            slot.append("queued", item["content"], "msg msg-queued")
+
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+
+        assert next_msg == "[2 queued messages merged]\n\nmsg1\n\nmsg2"
+        assert [c["content"] for c in consumed] == ["msg1", "msg2"]
+        assert [q["content"] for q in slot._queue] == ["/compact", "msg3"]
+        # At the head it pops alone, so the turn's refusal keys on it.
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert next_msg == "/compact" and [c["id"] for c in consumed] == ["c"]
+        assert [q["content"] for q in slot._queue] == ["msg3"]
+
+    def test_channel_prose_of_one_conversation_merges_and_an_address_less_command_is_not_a_stop(self):
+        """Only a conversation's own refusable command drains alone by the refusal
+        rule: prose from one conversation merges with more of its own prose, and a
+        ``/compact`` with no conversation on it is not a stop for that rule (the turn
+        refuses it, but has nobody to tell) -- it merges with other channel text the
+        gateway could not place, the one origin it shares (``merge_origin``)."""
+        address = {"channel_type": "discord", "channel_id": "c1", "thread_id": None}
+        slot = _ChatSlot("s1")
+        slot._queue = [
+            {"id": "a", "content": "and the weather?", "meta": {"channel_origin": address}},
+            {"id": "b", "content": "and tomorrow?", "meta": {"channel_origin": address}},
+            {"id": "c", "content": "/compact", "_directive_channel_origin": True},
+            {"id": "d", "content": "and the day after?", "_directive_channel_origin": True},
+        ]
+        for item in slot._queue:
+            slot.append("queued", item["content"], "msg msg-queued")
+
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert next_msg == "[2 queued messages merged]\n\nand the weather?\n\nand tomorrow?"
+        assert [c["id"] for c in consumed] == ["a", "b"]
+
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert next_msg == "[2 queued messages merged]\n\n/compact\n\nand the day after?"
+        assert [c["id"] for c in consumed] == ["c", "d"]
+        assert slot._queue == []
+
+    def test_entries_of_different_origins_never_merge(self):
+        """The merge is partitioned by origin (``merge_origin``). A merged turn is
+        published as ONE turn into the room its one pin names, so folding another
+        conversation's words into it would publish them to an audience that never
+        sent them (GPT, ``chat_runner.py:9212`` on the r25 head, where every one of
+        these ran as one merged turn under the first stamp). Now the run is the
+        head's own-origin prefix: a second room, the dashboard's own text, channel
+        text the gateway cannot place, and another sender in the same room each
+        start their own turn, in queue order."""
+        telegram = {"channel_type": "telegram", "channel_id": "8", "thread_id": None}
+        slack = {
+            "channel_type": "slack",
+            "channel_id": "C0FFEE",
+            "thread_id": "1758.0001",
+            "principal": "U1",
+        }
+        slot = _ChatSlot("s1")
+        slot._queue = [
+            {"id": "a", "content": "tg one", "meta": {"channel_origin": telegram}},
+            {"id": "b", "content": "tg two", "meta": {"channel_origin": telegram}},
+            {"id": "c", "content": "slack one", "meta": {"channel_origin": slack}},
+            {"id": "d", "content": "dash one"},
+            {"id": "e", "content": "dash two"},
+            {"id": "f", "content": "unplaced one", "_directive_channel_origin": True},
+            {"id": "g", "content": "slack two", "meta": {"channel_origin": {**slack, "principal": "U2"}}},
+            {"id": "h", "content": "tg three", "meta": {"channel_origin": telegram}},
+        ]
+        for item in slot._queue:
+            slot.append("queued", item["content"], "msg msg-queued")
+
+        turns: list[tuple[str, list[str]]] = []
+        while slot._queue:
+            next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+            turns.append((next_msg, [c["id"] for c in consumed]))
+
+        assert turns == [
+            ("[2 queued messages merged]\n\ntg one\n\ntg two", ["a", "b"]),
+            ("slack one", ["c"]),
+            ("[2 queued messages merged]\n\ndash one\n\ndash two", ["d", "e"]),
+            ("unplaced one", ["f"]),
+            ("slack two", ["g"]),
+            ("tg three", ["h"]),
+        ]
+
+    def test_the_merge_origin_key_reads_the_room_as_the_publication_gate_spells_it(self):
+        """``merge_origin``: a missing thread id and an empty one are the same room
+        (``mirror_room`` renders both as nothing), the admitted sender is part of the
+        key, channel text with no address keys as channel-and-nowhere, and a
+        restored entry keys by what the gateway can prove about it -- unproven is
+        channel-and-nowhere, a verified dashboard proof is dashboard text."""
+        from kiro_crew.dashboard.chat_utils import merge_origin
+        from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY
+
+        slot = _ChatSlot("s1")
+        room = {"channel_type": "discord", "channel_id": "c1"}
+        assert merge_origin({"meta": {"channel_origin": {**room, "thread_id": None}}}, slot) == (
+            merge_origin({"meta": {"channel_origin": {**room, "thread_id": ""}}}, slot)
+        )
+        assert merge_origin({"meta": {"channel_origin": {**room, "thread_id": "t1"}}}, slot) != (
+            merge_origin({"meta": {"channel_origin": room}}, slot)
+        )
+        assert merge_origin({"meta": {"channel_origin": {**room, "principal": "u1"}}}, slot) != (
+            merge_origin({"meta": {"channel_origin": {**room, "principal": "u2"}}}, slot)
+        )
+        assert merge_origin({"content": "x", "_directive_channel_origin": True}, slot) == (True, "")
+        assert merge_origin({"content": "x"}, slot) == (False, "")
+        # Restored: no proof in the sidecar -> the narrower authority, nowhere to publish.
+        assert merge_origin({"id": "r1", "content": "x", RESTORED_QUEUE_KEY: True}, slot) == (
+            True,
+            "",
+        )
+        # Restored with the gateway's own dashboard-origin proof -> dashboard text.
+        slot.queue_append("proven", directive_user_origin=True)
+        proven = dict(slot._queue[0])
+        proven[RESTORED_QUEUE_KEY] = True
+        assert merge_origin(proven, slot) == (False, "")
+        assert merge_origin(proven, slot) == merge_origin({"content": "y"}, slot)
+
+    def test_the_merge_asks_the_refusal_on_the_turns_harness_axis(self):
+        """Under ``claude_code`` any leading slash is a harness command, so a channel
+        entry ``/slidev deck`` is refusable there and drains alone; on the other axis
+        it is prose and merges -- the merge and the turn's refusal share one rule.
+        Both entries are the one conversation's, so the origin partition is not what
+        decides here."""
+        address = {"channel_type": "discord", "channel_id": "c1", "thread_id": None}
+
+        def _slot() -> _ChatSlot:
+            slot = _ChatSlot("s1")
+            slot._queue = [
+                {"id": "a", "content": "msg1", "meta": {"channel_origin": address}},
+                {"id": "b", "content": "/slidev deck", "meta": {"channel_origin": address}},
+            ]
+            for item in slot._queue:
+                slot.append("queued", item["content"], "msg msg-queued")
+            return slot
+
+        next_msg, _consumed = _dequeue_next_message(_slot(), merge_enabled=True, cc_provider=True)
+        assert next_msg == "msg1"
+        next_msg, _consumed = _dequeue_next_message(
+            _slot(), merge_enabled=True, cc_provider=False
+        )
+        assert next_msg == "[2 queued messages merged]\n\nmsg1\n\n/slidev deck"
+
     def test_partial_merge_before_cron(self):
         """Multiple user messages before a cron are merged; cron and later messages stay."""
         cron_msg = f"{CRON_NOTIFY_PREFIX}daily]: run report"

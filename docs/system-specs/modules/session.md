@@ -2515,7 +2515,16 @@ so absence clears it.
   the save runs in the flush executor thread, so the save takes the pair under
   one consistency generation: read the queue, snapshot the window, read the
   queue again, retry while the two disagree, and REFUSE the save (nothing
-  written, the entry still owed) when no pair is proven inside the budget. Read
+  written, the entry still owed) when no pair is proven inside the budget. The
+  proof set and the write's generation are part of that observation, not a step
+  ahead of it: each attempt re-attests the durable window before both reads
+  (`begin_durable_queue_write`, then `reattest_durable_window` again before the
+  confirming read), so an entry a drain promoted into the window unsealed shows
+  up as a disagreement rather than a value to write, and a generation the mint
+  KEPT (the value read equalled the committed one) is accepted only for a snapshot
+  whose signature is the committed value's -- a drain between the mint's read and
+  the snapshot would otherwise put a moved value on disk under the committed
+  generation, the rollback the generation exists to refuse. Read
   separately, the two halves could commit a file showing neither the entry nor
   its row. A crash between the drain and the save loses the row as well, so a
   replayed entry is a prompt the transcript never recorded — never a second copy
@@ -2571,7 +2580,12 @@ so absence clears it.
   carried count and which ceiling refused it. Both the verdict and the reason are
   read off `durable_queue_entries`' own output — an entry absent from a full set
   was refused by the count cap, absent from a short one by the byte budget — so
-  nothing re-implements the interacting ceilings. This is a LOG, not a receipt
+  nothing re-implements the interacting ceilings; and the record is costed under
+  the key its proof was minted under (`seal_key_of(slot)`, the transcript's slot
+  name, never the raw `slot.key`, which a tab named "dashboard x" or a bound
+  channel thread spells differently), so it is billed WITH the seal the write
+  will carry and the warning names the key the seal, the generation record and
+  the tombstone all use. This is a LOG, not a receipt
   field: a caller-visible `durable` boolean on the acknowledgments has no reader,
   so it is not shipped, and the on-screen queue-card marker belongs with its
   consumer (issue #11695).

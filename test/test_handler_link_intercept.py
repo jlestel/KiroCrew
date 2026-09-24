@@ -169,6 +169,7 @@ class TestLinkedThreadIntercept:
         ds = MagicMock()
         _slot = MagicMock(key="slot1")
         type(_slot).running = PropertyMock(return_value=False)
+        _slot._in_stage_execution = False  # a MagicMock attribute reads truthy
         ds.get_linked_slot = MagicMock(return_value=_slot)
         mock_sel_inst = MagicMock()
         orig_sel = handler.sel
@@ -201,6 +202,7 @@ class TestLinkedThreadIntercept:
         slack = _make_slack()
         slot = MagicMock()
         type(slot).running = PropertyMock(return_value=False)
+        slot._in_stage_execution = False  # a MagicMock attribute reads truthy
         slot.key = "slot1"
         slot._queue = []
         ds = MagicMock()
@@ -229,6 +231,43 @@ class TestLinkedThreadIntercept:
             ds.push_slots_update.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_an_immediate_linked_message_names_its_thread_as_the_turns_source(self):
+        """The idle branch runs the message at once, and the turn it starts is told
+        the thread it came from -- the same address the busy branch stamps on its
+        queue entry -- so ``_run_chat`` pins it and a thread unlinked or moved while
+        the model answers finds every publication withheld. A channel-sourced turn
+        told no thread would be pinned as publishing to nowhere."""
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        slot = MagicMock()
+        type(slot).running = PropertyMock(return_value=False)
+        slot._in_stage_execution = False  # a MagicMock attribute reads truthy
+        slot.key = "slot1"
+        slot._queue = []
+        ds = MagicMock()
+        ds.get_linked_slot = MagicMock(return_value=slot)
+        ds._background_tasks = set()
+        ds.broadcast_ws = MagicMock()
+        ds.push_slots_update = MagicMock()
+
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock) as mock_run_chat,
+        ):
+            await handler.handle_message(slack, MagicMock(), "C1", "hello", "t1", "msg1", "U1")
+
+        kwargs = mock_run_chat.call_args.kwargs
+        assert kwargs["_directive_user_origin"] is True
+        assert kwargs["_directive_channel_origin"] is True
+        assert kwargs["_channel_origin"] == {
+            "channel_type": "slack",
+            "channel_id": "C1",
+            "thread_id": "t1",
+        }
+
+    @pytest.mark.asyncio
     async def test_redact_for_ui_original_for_llm(self):
         """Verify redacted text goes to UI (slot.append) but original goes to LLM (_run_chat)."""
         from kiro_crew.slack import handler
@@ -236,6 +275,7 @@ class TestLinkedThreadIntercept:
         slack = _make_slack()
         slot = MagicMock()
         type(slot).running = PropertyMock(return_value=False)
+        slot._in_stage_execution = False  # a MagicMock attribute reads truthy
         slot.key = "slot1"
         slot._queue = []
         ds = MagicMock()
@@ -316,6 +356,145 @@ class TestLinkedThreadIntercept:
             assert len(slot._queue) == 1
             mock_run_chat.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_a_message_landing_between_two_stages_of_a_live_plan_waits_in_the_queue(self):
+        """Opus, ``slack/handler.py:3116`` on the r25 head: the immediate arm was gated
+        on ``running`` alone, so a thread message arriving between two stages of a live
+        plan (``running`` False, ``_in_stage_execution`` True) started a concurrent
+        ``_run_chat`` over the plan's own and overwrote the slot's task. The intercept
+        now asks the rule every channel's hand-off asks
+        (``channel_busy.slot_turn_in_progress``): the message is queued, no turn starts,
+        and the slot's task is left alone."""
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        slot = MagicMock()
+        type(slot).running = PropertyMock(return_value=False)
+        slot._in_stage_execution = True
+        slot.key = "slot1"
+        slot._queue = []
+        plan_task = object()
+        slot.task = plan_task
+
+        def queue_append(content, *, meta=None, directive_user_origin, directive_channel_origin):
+            slot._queue.append({"id": "q-1", "content": content, "meta": meta})
+            return "q-1"
+
+        slot.queue_append = queue_append
+        ds = MagicMock()
+        ds.get_linked_slot = MagicMock(return_value=slot)
+        ds.broadcast_ws = MagicMock()
+        ds.push_slots_update = MagicMock()
+
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock) as mock_run_chat,
+        ):
+            await handler.handle_message(
+                slack, MagicMock(), "C1", "between stages", "t1", "msg1", "U1"
+            )
+
+        mock_run_chat.assert_not_called()
+        assert [e["content"] for e in slot._queue] == ["between stages"]
+        assert slot.task is plan_task, "the plan's task was overwritten"
+
+    @pytest.mark.asyncio
+    async def test_a_full_queue_refuses_the_linked_message_into_its_thread(self):
+        """The live queue's cap is held at admission on this producer too: a thread
+        whose linked slot already holds ``MAX_LIVE_QUEUE_ENTRIES`` waiting messages
+        is told so, and nothing is queued (the peer channels' hand-off answers
+        ``HANDOFF_QUEUE_FULL`` for the same reason)."""
+        from kiro_crew.dashboard.slot_queue_repository import MAX_LIVE_QUEUE_ENTRIES
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        slot = MagicMock()
+        type(slot).running = PropertyMock(return_value=True)
+        slot.key = "slot1"
+        slot._queue = [
+            {"id": f"q-{n}", "content": f"waiting {n}"} for n in range(MAX_LIVE_QUEUE_ENTRIES)
+        ]
+        slot.queue_append = MagicMock(side_effect=AssertionError("queued past the cap"))
+        ds = MagicMock()
+        ds.get_linked_slot = MagicMock(return_value=slot)
+        ds.broadcast_ws = MagicMock()
+        ds.push_slots_update = MagicMock()
+
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock),
+        ):
+            await handler.handle_message(
+                slack, MagicMock(), "C1", "one too many", "t1", "msg1", "U1"
+            )
+
+        slot.queue_append.assert_not_called()
+        assert len(slot._queue) == MAX_LIVE_QUEUE_ENTRIES
+        assert any(
+            "queue is full" in str(c.args) and c.args[0] == "C1" and c.args[2] == "t1"
+            for c in slack.post_message.call_args_list
+        ), slack.post_message.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_a_queued_linked_message_carries_its_thread_through_the_shared_producer(self):
+        """The busy branch consumes ``queue_for_next_turn`` -- the dashboard's one
+        queue producer (persist, crew log, queue card) -- and stamps the Slack thread
+        on the entry, so a link released while the message waits drops the entry at
+        the drain and tells the thread, the way every other channel's hand-off is."""
+        from kiro_crew.dashboard.channel_busy import (
+            CHANNEL_ORIGIN_META_KEY,
+            CHANNEL_ORIGIN_PRINCIPAL_KEY,
+        )
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        slot = MagicMock()
+        type(slot).running = PropertyMock(return_value=True)
+        slot.key = "slot1"
+        slot._queue = []
+        captured: dict = {}
+
+        def queue_append(content, *, meta=None, directive_user_origin, directive_channel_origin):
+            captured["meta"] = meta
+            captured["flags"] = (directive_user_origin, directive_channel_origin)
+            slot._queue.append({"id": "q-1", "content": content, "meta": meta})
+            return "q-1"
+
+        slot.queue_append = queue_append
+        ds = MagicMock()
+        ds.get_linked_slot = MagicMock(return_value=slot)
+        ds.broadcast_ws = MagicMock()
+        ds.push_slots_update = MagicMock()
+
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock),
+        ):
+            await handler.handle_message(slack, MagicMock(), "C1", "hello", "t1", "msg1", "U1")
+
+        assert captured["flags"] == (True, True)
+        # The address names the sender this gate admitted, as the peer channels'
+        # hand-off does: the drop notice re-decides THAT person against the live
+        # roster at egress, and a stamp naming nobody is refused there.
+        assert captured["meta"].get(CHANNEL_ORIGIN_META_KEY) == {
+            "channel_type": "slack",
+            "channel_id": "C1",
+            "thread_id": "t1",
+            CHANNEL_ORIGIN_PRINCIPAL_KEY: "U1",
+        }
+        # The shared producer announces the queue card; a direct append never did.
+        frames = [call.args[0] for call in ds.broadcast_ws.call_args_list]
+        assert frames.count("queue_push") == 1
+        # ONE rendering of the pending message: the card. The user row is written
+        # by the drain when the entry runs (exactly as a composer-queued send is),
+        # so appending it here too would show the message as a bubble AND a card,
+        # and again as a second bubble once the drain wrote its own row.
+        user_rows = [c for c in slot.append.call_args_list if c.args and c.args[0] == "user"]
+        assert user_rows == [], "the queued message was appended as a user row beside its card"
+
 
 # ── Linked thread intercept on the messaging-transport path ──
 
@@ -333,6 +512,7 @@ class TestTransportLinkedThreadIntercept:
         slack = _make_slack()
         slot = MagicMock()
         type(slot).running = PropertyMock(return_value=False)
+        slot._in_stage_execution = False  # a MagicMock attribute reads truthy
         slot.key = "slot1"
         slot._queue = []
         ds = MagicMock()
@@ -370,6 +550,7 @@ class TestTransportLinkedThreadIntercept:
         slack = _make_slack()
         _slot = MagicMock(key="slot1")
         type(_slot).running = PropertyMock(return_value=False)
+        _slot._in_stage_execution = False  # a MagicMock attribute reads truthy
         ds = MagicMock()
         ds.get_linked_slot = MagicMock(return_value=_slot)
         mock_sel_inst = MagicMock()
@@ -413,6 +594,7 @@ class TestSessionsKeywordFallThrough:
     def _linked_ds(self):
         slot = MagicMock()
         type(slot).running = PropertyMock(return_value=False)
+        slot._in_stage_execution = False  # a MagicMock attribute reads truthy
         slot.key = "slot1"
         slot._queue = []
         ds = MagicMock()

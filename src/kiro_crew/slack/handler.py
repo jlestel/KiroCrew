@@ -60,6 +60,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.config.paths import kiro_agents_dir, peek_data_home
 from kiro_crew.constants import (
     DENY_CAUSE_APPROVAL_TIMEOUT,
+    SLACK_NAMESPACE,
     STEER_NOTICE_BOUND_SECS,
     is_control_tag_tail,
     strip_control_comments,
@@ -117,7 +118,7 @@ from kiro_crew.messaging.dispatch import (
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute
-from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.link import ChannelLink, canonical_key
 from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
@@ -3013,6 +3014,15 @@ async def maybe_handle_keyword_command(
     return False
 
 
+#: The linked slot's live queue is at its cap while the dashboard drives it: the
+#: thread's message is refused rather than queued past the bound (the same rule
+#: the peer channels' hand-off answers with ``HANDOFF_QUEUE_FULL``).
+_LINKED_QUEUE_FULL_REFUSAL = (
+    "⏳ The dashboard is running a turn in this session and its queue is full. "
+    "Send this again once it finishes."
+)
+
+
 async def maybe_route_linked_thread(
     text: str,
     session_key: str,
@@ -3092,16 +3102,39 @@ async def maybe_route_linked_thread(
     # context). The LLM's own output is redacted before display.
     _safe_text, _ = redact_exfiltration_urls(text)
     _safe_text, _ = redact_credentials(_safe_text)
-    # Nothing rendered this Slack-typed row optimistically in the dashboard, so
-    # broadcast_user=True: append delivers the ONE identity-carrying frame
-    # (a frame without ``meta.mid`` lets a client receiving the row through a
-    # second door render it a second time as a duplicate).
-    append_and_surface(
-        _dashboard_state, _linked_slot, "user", _safe_text, "msg msg-u", broadcast_user=True  # type: ignore[arg-type]
-    )
-    if not _linked_slot.running:
+    # The thread this message came from, as ``channel_busy``'s origin mapping --
+    # ONE address for both arms below. Run at once, the turn pins it
+    # (``_run_chat``'s ``_channel_origin``) so the reply, the tool stream and the
+    # echo go to this thread or nowhere: Slack's mirror caches its thread at turn
+    # start and resolves the owner live, so a thread unlinked or moved while the
+    # model answers must find its publications withheld, not delivered. Queued, the
+    # entry carries the same address as its origin, so the drain can release it
+    # when the binding goes and tell this thread.
+    _thread_origin = ChannelLink(
+        channel_type=SLACK_NAMESPACE, channel_id=channel, thread_id=reply_ts
+    ).to_dict()
+    # circular import: the dashboard pulls in Slack modules at module level.
+    from kiro_crew.dashboard.channel_busy import slot_turn_in_progress
+
+    # The rule every channel's hand-off asks (``dashboard_turn_in_progress``), not
+    # ``running`` alone: between two stages of a live plan the slot's task is
+    # briefly clear while ``_in_stage_execution`` still holds, and a thread
+    # message landing then must wait in the queue, not start a concurrent
+    # ``_run_chat`` over the plan's own and overwrite its task.
+    if not slot_turn_in_progress(_linked_slot):
         from kiro_crew.dashboard.chat import _run_chat
 
+        # Nothing rendered this Slack-typed row optimistically in the dashboard, so
+        # broadcast_user=True: append delivers the ONE identity-carrying frame
+        # (a frame without ``meta.mid`` lets a client receiving the row through a
+        # second door render it a second time as a duplicate). Only on THIS
+        # branch: a queued message is rendered by its queue card and the drain
+        # writes its user row when it runs, exactly as a composer-queued send is --
+        # appending here as well showed it as a bubble beside the card, then again
+        # as a second bubble when the drain wrote its own row.
+        append_and_surface(
+            _dashboard_state, _linked_slot, "user", _safe_text, "msg msg-u", broadcast_user=True  # type: ignore[arg-type]
+        )
         _chat_task = asyncio.create_task(
             _run_chat(
                 _dashboard_state,  # type: ignore[arg-type]
@@ -3109,23 +3142,45 @@ async def maybe_route_linked_thread(
                 text,
                 _directive_user_origin=True,
                 _directive_channel_origin=True,
+                _channel_origin=_thread_origin,
             )
         )
         _linked_slot.task = _chat_task
         _dashboard_state._background_tasks.add(_chat_task)  # type: ignore[attr-defined]
         _chat_task.add_done_callback(_dashboard_state._background_tasks.discard)  # type: ignore[attr-defined]
     else:
-        # circular import: session_control pulls in dashboard modules at module level.
-        from kiro_crew.dashboard.session_control import containment_meta
+        # circular import: the dashboard pulls in Slack modules at module level.
+        from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_PRINCIPAL_KEY
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+        from kiro_crew.dashboard.slot_queue_repository import MAX_LIVE_QUEUE_ENTRIES
 
-        # Stamp the admission-time containment. A linked slot records
-        # linked=True here, so its own channel's queued messages keep draining;
-        # only a constraint that appears AFTER this enqueue drops the entry.
-        _linked_slot.queue_append(
+        # The queue's own bound, held at admission like every other producer
+        # holds it (the peer channels' hand-off answers ``HANDOFF_QUEUE_FULL``):
+        # a thread cannot grow the slot's queue without limit during one busy
+        # turn. Refused into the thread, nothing queued.
+        if len(getattr(_linked_slot, "_queue", ())) >= MAX_LIVE_QUEUE_ENTRIES:
+            await slack.post_message(channel, _LINKED_QUEUE_FULL_REFUSAL, reply_ts)
+            return True
+
+        # The dashboard's one queue producer, so the entry gets what every queued
+        # send gets -- the admission-time containment stamp (a linked slot records
+        # linked=True, so only a constraint appearing AFTER this enqueue drops the
+        # entry), the crew-log line, the queue card and the durable write -- and
+        # the thread rides the entry as its origin: the drain drops a queued
+        # message whose link was released while it waited (``/unlink``, a relink
+        # elsewhere) instead of answering it into a session the thread has left,
+        # and tells this thread so (``channel_busy.notify_channel_origin_dropped``).
+        # The address carries the sender this gate just admitted, as the peer
+        # channels' hand-off stamps theirs: the notice re-decides that person's
+        # authorization against the live roster at egress, and a stamp naming
+        # nobody is refused there rather than posted unjudged.
+        queue_for_next_turn(
+            _dashboard_state,  # type: ignore[arg-type]
+            _linked_slot,
             text,
-            meta=containment_meta(_dashboard_state, _linked_slot),  # type: ignore[arg-type]
             directive_user_origin=True,
-            directive_channel_origin=True,
+            channel_origin=True,
+            channel_address={**_thread_origin, CHANNEL_ORIGIN_PRINCIPAL_KEY: user_id},
         )
     _dashboard_state.push_slots_update()  # type: ignore[attr-defined]
     sel().log_tool_invocation(

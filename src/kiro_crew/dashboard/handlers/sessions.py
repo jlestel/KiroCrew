@@ -49,7 +49,7 @@ from kiro_crew.channel_transcript_migration import _orphan_target_stem
 from kiro_crew.cloud.login_target import parse_whoami_output
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, cron_owner_matches
-from kiro_crew.dashboard import directive_queue
+from kiro_crew.dashboard import directive_queue, queue_generation_store
 from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     slot_history_key,
@@ -62,7 +62,12 @@ from kiro_crew.dashboard.handlers._shared import (
 )
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
-from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key
+from kiro_crew.dashboard.state import (
+    DashboardState,
+    _normalize_slot_key,
+    queue_record_key,
+    transcript_slot_name,
+)
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.history import (
     SEARCH_MIN_CHARS,
@@ -2032,6 +2037,13 @@ CRON_OWNERSHIP_UNKNOWN_CODE = "cron_ownership_unknown"
 #: in the same slot, which is not recoverable by the person it happens to.
 LEDGER_EXCLUSION_UNWRITABLE_CODE = "ledger_exclusion_unwritable"
 
+#: Reported for a row whose committed queue-generation record could not be
+#: moved aside (``queue_generation_store.stage_queue_generation_tombstone``). The
+#: transcript is left alone for the same reason as the ledger case: a record that
+#: outlives its transcript would verify that transcript put back from a copy under
+#: the same slot key, a consumed sealed command among its queued prompts.
+QUEUE_GENERATION_TOMBSTONE_CODE = "queue_generation_tombstone_unwritable"
+
 
 class _OwnerKeyUnreadable(Exception):
     """A delete REFUSED because the exact cron owner key of the row cannot be read.
@@ -2143,12 +2155,13 @@ class _HistoryDeleteClaim:
 
 
 def _history_delete_candidate_keys(key: str) -> tuple[str, ...]:
-    """Every exact/legacy spelling that may index *key*'s dashboard slot."""
-    stripped = key
-    if stripped.startswith("dashboard:"):
-        stripped = stripped[len("dashboard:") :]
-    while stripped.startswith("dashboard_"):
-        stripped = stripped[len("dashboard_") :]
+    """Every exact/legacy spelling that may index *key*'s dashboard slot.
+
+    The first spelling is the slot key the transcript names
+    (``state.transcript_slot_name``, ONE prefix stripped -- the restore's own
+    reading, so the record it tombstones below is the record the restore reads).
+    """
+    stripped = transcript_slot_name(key)
     canonical = canonical_key(key)
     return tuple(
         dict.fromkeys(
@@ -2485,22 +2498,53 @@ def _delete_history_session(
                 resolved_claim,
                 cron_owner_keys=frozenset(owner_keys),
             )
-            if (
-                exclude is not None
-                and resolved_claim.registry_key
-                and resolved_claim.complete
-                and resolved_claim.path_match_verified
-            ):
-                recorded = exclude(resolved_claim.registry_key)
-                resolved_claim = replace(
-                    resolved_claim,
-                    ledger_excluded_units=frozenset(recorded.added),
-                    ledger_carry_tombstoned=recorded.carry_tombstoned,
-                )
-            if skip_pinned:
-                result = log.delete_session(key, skip_pinned=True)
+            # The slot's committed queue generation (``queue_generation_store``) is
+            # state that must not survive into the next session on this recycled
+            # slot key, for the reason the ledger exclusion below must not: a record
+            # that outlives its transcript would verify that transcript put back
+            # from a copy, a consumed sealed command among its queued prompts.
+            # Moved ASIDE before the exclusion and the unlink, inside this hold, so a
+            # failure refuses the delete with the row intact and nothing written
+            # (``QueueGenerationTombstoneError`` propagates) -- and moved BACK when
+            # any later step refuses (the exclusion raises, ``delete_session``
+            # answers False or None, anything raises), because a record gone from
+            # under a transcript that survives is that transcript's queued prompts
+            # dropped at the next restart. Purged only once the transcript is gone:
+            # the tombstone is the last irreversible step, as the exclusion's
+            # rollback in the callers makes the exclusion. Under the ONE spelling
+            # the store is keyed by: the transcript's own slot name
+            # (``state.queue_record_key``), which the save writes the record
+            # under and the restore reads it under -- never the live slot's raw key,
+            # which can differ from it (``dashboard_x`` shares transcript
+            # ``dashboard:x`` with ``x``; a bound channel slot's ``slack:<ts>`` is
+            # the stem ``slack_<ts>`` folded) and would leave the record standing.
+            staged_tombstone = queue_generation_store.stage_queue_generation_tombstone(
+                (queue_record_key(key),)
+            )
+            try:
+                if (
+                    exclude is not None
+                    and resolved_claim.registry_key
+                    and resolved_claim.complete
+                    and resolved_claim.path_match_verified
+                ):
+                    recorded = exclude(resolved_claim.registry_key)
+                    resolved_claim = replace(
+                        resolved_claim,
+                        ledger_excluded_units=frozenset(recorded.added),
+                        ledger_carry_tombstoned=recorded.carry_tombstoned,
+                    )
+                if skip_pinned:
+                    result = log.delete_session(key, skip_pinned=True)
+                else:
+                    result = log.delete_session(key)
+            except BaseException:
+                staged_tombstone.rollback()
+                raise
+            if result:
+                staged_tombstone.purge()
             else:
-                result = log.delete_session(key)
+                staged_tombstone.rollback()
     except HistoryLockTimeout:
         logger.warning("delete_session: lock timeout, not deleting key=%s", key)
         return False, claim
@@ -2727,6 +2771,22 @@ async def api_session_delete(request: web.Request) -> web.Response:
         )
     except _OwnerKeyUnreadable:
         return _cron_ownership_unknown_refusal(crons, swept.get(key, ()))
+    except queue_generation_store.QueueGenerationTombstoneError:
+        # Nothing was unlinked and no exclusion was written: the record is moved
+        # aside first inside the same hold, so the row is intact -- and a later
+        # refusal (the exclusion, the unlink) moves the record back, so the queue
+        # the surviving transcript carries restores as it was.
+        return web.json_response(
+            {
+                "error": (
+                    "This session's queued-prompt record could not be moved aside, so it "
+                    "was not deleted. Deleting it now would let a copy of its transcript "
+                    "re-run a queued command in the next session on the same slot."
+                ),
+                "code": QUEUE_GENERATION_TOMBSTONE_CODE,
+            },
+            status=409,
+        )
     except session_ledger.LedgerExclusionError:
         # Nothing was unlinked: the exclusion is written inside the same hold, before the
         # delete, so a refusal leaves the row intact.
@@ -3280,6 +3340,12 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
                 await _rollback_ledger_exclusion(session_ledger, delete_claim, restore_carry=True)
         except _OwnerKeyUnreadable:
             undeletable.append({"id": key, "code": CRON_OWNERSHIP_UNKNOWN_CODE})
+        except queue_generation_store.QueueGenerationTombstoneError:
+            # The record is moved aside before the exclusion and the unlink, inside
+            # the same hold: this row's transcript is left alone and nothing was
+            # excluded. (A row refused LATER -- ``None``/``False`` above -- has its
+            # record moved back by ``_delete_history_session`` itself.)
+            undeletable.append({"id": key, "code": QUEUE_GENERATION_TOMBSTONE_CODE})
         except session_ledger.LedgerExclusionError:
             # The exclusion or its rollback could not be written, so this row's transcript
             # is left alone and the row says why. Nothing was unlinked: the exclusion runs

@@ -23,7 +23,11 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.dashboard.chat_utils import _redact_for_display, _redact_meta
-from kiro_crew.dashboard.slot_queue_repository import ATTACHMENT_META_KEYS, warn_if_not_durable
+from kiro_crew.dashboard.slot_queue_repository import (
+    ATTACHMENT_META_KEYS,
+    seal_key_of,
+    warn_if_not_durable,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -739,11 +743,25 @@ def queue_for_next_turn(
     attachments: dict[str, list[str]] | None = None,
     decision_strip: dict | None = None,
     turn_actor: str = "",
+    channel_origin: bool = False,
+    channel_address: dict[str, Any] | None = None,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
 
     The running turn's teardown drains the queue, so this is how a message
     reaches a busy slot when steering is unavailable or not asked for.
+
+    *channel_origin* marks the entry ``_directive_channel_origin``: the text was
+    typed into a CHANNEL conversation bound to this session (``channel_busy``),
+    so a directive the drained turn derives from it keeps channel authority
+    rather than inheriting the dashboard owner's. Default False keeps every
+    composer and app send exactly as before.
+
+    *channel_address* is that conversation, serialized (``ChannelLink.to_dict``),
+    stamped under ``channel_busy.CHANNEL_ORIGIN_META_KEY``: the drain drops the
+    entry once the conversation stops resuming the session and tells the
+    conversation so. Queue plumbing like the containment stamp -- the drain keeps
+    it off the row it writes.
 
     *send_id* is the client-minted ``meta.sendId`` the plain send path persists
     on its user row, already passed through ``normalize_send_id`` by the caller.
@@ -789,10 +807,14 @@ def queue_for_next_turn(
         meta.update(attachments)
     if decision_strip:
         meta["decisions_strip"] = decision_strip
+    if channel_address:
+        # Key literal rather than imported: channel_busy imports this module.
+        meta["channel_origin"] = dict(channel_address)
     qid = slot.queue_append(
         message,
         meta=meta,
         directive_user_origin=directive_user_origin,
+        directive_channel_origin=channel_origin,
     )
     # Append-only session ledger. The session id comes off the client the running
     # turn published on the slot -- a message is only queued because a turn IS
@@ -826,7 +848,14 @@ def queue_for_next_turn(
     # past the count cap or the byte budget and the send is still accepted, so
     # that case is reported at WARNING rather than left silent. It is not a field
     # on this frame: a caller-visible flag was carried here and read by nothing.
-    warn_if_not_durable(slot._queue, qid, slot.key)
+    # Costed under the key the proofs were MINTED under (``seal_key_of``: the
+    # transcript's slot name, not ``slot.key`` -- a tab named "dashboard x" or a
+    # bound channel thread spells the two differently), so the record is billed
+    # WITH its seal, as the write bills it, and the warning names the key the
+    # seal, the generation record and the tombstone all use.
+    _proofs = getattr(slot, "_origin_proofs", None)
+    _generation = getattr(slot, "_queue_generation", "")
+    warn_if_not_durable(slot._queue, qid, seal_key_of(slot), _proofs, _generation)
     start_queue_persist(state, slot)
     return qid
 

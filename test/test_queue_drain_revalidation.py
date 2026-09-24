@@ -605,11 +605,16 @@ async def test_channel_provenance_reaches_the_drained_turn(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_mixed_origin_merge_keeps_channel_provenance(tmp_path, monkeypatch, _inline_audit):
-    """Any channel entry makes the merged turn channel-authorized.
-
-    Changing the origin reduction back to ``all`` would let an adjacent dashboard
-    entry erase the channel boundary for the whole model turn.
+async def test_mixed_origin_entries_do_not_merge_and_the_channel_turn_keeps_its_authority(
+    tmp_path, monkeypatch, _inline_audit
+):
+    """With merging on, a channel entry and a dashboard entry queued together are
+    TWO turns (``chat_utils.merge_origin`` partitions the run by origin): the
+    channel entry drains alone, channel-authorized, and the dashboard's words wait
+    for their own turn instead of riding under the channel turn's pin. Until the
+    r25 head the two merged into one channel-authorized turn -- the reduction that
+    kept the narrower authority is still the ``any`` below, now over a run that is
+    one origin by construction.
     """
     state = _make_state(tmp_path)
     state.subagents = None
@@ -632,6 +637,7 @@ async def test_mixed_origin_merge_keeps_channel_provenance(tmp_path, monkeypatch
     captured: dict[str, object] = {}
 
     def _stub_run_chat(_state, _slot, _prompt, **kwargs):
+        captured["prompt"] = _prompt
         captured.update(kwargs)
 
         async def _done():
@@ -650,7 +656,9 @@ async def test_mixed_origin_merge_keeps_channel_provenance(tmp_path, monkeypatch
     monkeypatch.setattr(cr, "spawn_guarded_turn", _fake_spawn)
 
     assert await cr._start_next_queued_turn(state, slot) is True
+    assert captured["prompt"] == "from the linked channel"
     assert captured["_directive_channel_origin"] is True
+    assert [e["content"] for e in slot._queue] == ["from the dashboard"]
 
 
 def test_requeued_steer_in_a_plain_slot_carries_human_provenance(tmp_path):

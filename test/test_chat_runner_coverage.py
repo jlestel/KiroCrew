@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 from contextlib import contextmanager
@@ -50,6 +51,7 @@ from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.history import ConversationLog
 from kiro_crew.memory_stores import UnknownMemoryStore
+from kiro_crew.messaging.link import ChannelLink
 from kiro_crew.metrics import turns as turns_mod
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.security import oauth_url_contains_credential
@@ -3459,6 +3461,552 @@ class TestRunChatLocalCommands:
         state.sessions.get_or_create.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_channel_origin_command_is_refused_with_a_notice(self, tmp_path):
+        """A ``/compact`` typed into a linked conversation (Slack's linked thread, a
+        channel hand-off) has no command word on the dashboard. That must not make
+        it silent prose: the person who typed it is told, and the text is not sent."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with _quiet_sel():
+            await chat_runner._run_chat(
+                state, slot, "/compact", _directive_user_origin=True, _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_not_awaited()
+        notices = [
+            m.get("content", "")
+            for m in slot.messages
+            if "not available from a linked conversation" in m.get("content", "")
+        ]
+        assert notices, "a channel-origin /compact was forwarded silently"
+        assert "`/compact`" in notices[0]
+        assert slot.messages[-1]["role"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_quick_prompt_is_routed_as_prose(self, tmp_path):
+        """``/plain summarise the log`` typed into a linked thread is a prose
+        shortcut, not a command: ``/plain`` is in no command set on any provider and
+        ``ContextBuilder.build_message`` expands it surface-neutrally. It is not
+        refused with ``CHANNEL_COMMAND_UNAVAILABLE``; the turn runs and the model
+        gets the expanded quick prompt with the user's own words, exactly as it would
+        from the composer."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok"), _complete()])
+
+        with _quiet_sel():
+            await chat_runner._run_chat(
+                state,
+                slot,
+                "/plain summarise the log",
+                _directive_user_origin=True,
+                _directive_channel_origin=True,
+            )
+        await _settle(slot)
+
+        assert not any(
+            "not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "a quick-prompt shortcut from a linked thread was refused as a command"
+        state.sessions.get_or_create.assert_awaited()
+        # The runner forwards the text untouched; expanding the macro is
+        # ``ContextBuilder.build_message``'s job (not wired in this fixture) and it
+        # does so for every surface alike.
+        prompt = client.stream.call_args_list[0].args[0]
+        assert "/plain summarise the log" in prompt
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_origin", [True, False])
+    async def test_a_quick_prompt_is_a_replacing_expansion_on_every_surface(
+        self, tmp_path, channel_origin
+    ):
+        """Opus, ``chat_runner.py:12206`` on the r25 head: the macro flag was read off
+        the COMMAND word, which a channel-origin turn has blanked, so a linked
+        conversation's ``/plain ... $skill`` counted as unexpanded and the ``$skill``
+        gate loaded skill bodies -- exactly what the composer's own ``/plain`` refuses
+        to do. The flag now comes from the token as typed (``opens_with_quick_prompt``):
+        the ``$skill`` expansion is skipped for the macro on both surfaces alike (red
+        on the r25 head for the channel case), while the composer still keeps its
+        command word and the channel turn still has none."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok"), _complete()])
+        kwargs = (
+            {"_directive_user_origin": True, "_directive_channel_origin": True}
+            if channel_origin
+            else {}
+        )
+
+        with (
+            _quiet_sel(),
+            patch.object(
+                chat_runner, "_expand_dollar_skills", return_value=("unused", 1)
+            ) as expand,
+        ):
+            await chat_runner._run_chat(state, slot, "/plain summarise $demo", **kwargs)
+        await _settle(slot)
+
+        expand.assert_not_called()
+        state.sessions.get_or_create.assert_awaited()
+        assert "/plain summarise $demo" in client.stream.call_args_list[0].args[0]
+
+    def test_the_quick_prompt_token_is_read_as_typed(self):
+        """``opens_with_quick_prompt`` follows the expander's own rule, on the raw
+        text: the macro with or without an argument, any case, leading whitespace;
+        not a bare word, not another slash token, not the macro mid-text."""
+        from kiro_crew.dashboard.chat_utils import opens_with_quick_prompt
+
+        assert opens_with_quick_prompt("/plain") is True
+        assert opens_with_quick_prompt("/plain summarise $demo") is True
+        assert opens_with_quick_prompt("  /PLAIN summarise") is True
+        assert opens_with_quick_prompt("plain summarise") is False
+        assert opens_with_quick_prompt("/compact") is False
+        assert opens_with_quick_prompt("summarise /plain") is False
+        assert opens_with_quick_prompt("") is False
+
+    @pytest.mark.asyncio
+    async def test_channel_authority_without_a_conversation_is_prose_not_a_refusal(self, tmp_path):
+        """A restored entry the gateway could not vouch for drains with channel
+        AUTHORITY (the narrower boundary: no command word, channel monitor surface)
+        but is not a channel conversation's words -- the drain says so with
+        ``_channel_message=False``. Its ``/compact`` is therefore neither run nor
+        refused with ``CHANNEL_COMMAND_UNAVAILABLE``, which would name a linked
+        conversation the text never came from: it reaches the model as prose. Red on
+        the previous head, where the refusal keyed on the authority flag alone."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok"), _complete()])
+        applied: list[str] = []
+
+        async def _apply(*_a, **_kw):
+            applied.append("directive")
+            return True
+
+        with _quiet_sel(), patch.object(chat_runner, "apply_session_directive", _apply):
+            await chat_runner._run_chat(
+                state,
+                slot,
+                "/compact",
+                _directive_channel_origin=True,
+                _channel_message=False,
+            )
+        await _settle(slot)
+
+        assert applied == [], "unproven restored text ran a dashboard command"
+        assert not any(
+            "not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "text with channel authority but no conversation was refused as a channel message"
+        state.sessions.get_or_create.assert_awaited()
+        assert "/compact" in client.stream.call_args_list[0].args[0]
+
+    @pytest.mark.asyncio
+    async def test_a_direct_channel_turn_still_refuses_the_command(self, tmp_path):
+        """The Slack thread dispatcher runs a conversation's text directly and passes
+        only the authority flag; with ``_channel_message`` unset that text IS the
+        conversation's own words, so the refusal is unchanged."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with _quiet_sel():
+            await chat_runner._run_chat(state, slot, "/compact", _directive_channel_origin=True)
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_not_awaited()
+        assert any(
+            "not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "provider,acp_backend,refused",
+        [
+            ("acp", "", False),
+            ("acp", "kas", False),
+            ("claude_code", "", True),
+            ("acp", "claude", True),
+        ],
+    )
+    async def test_a_channel_harness_command_is_refused_on_either_claude_axis(
+        self, tmp_path, provider, acp_backend, refused
+    ):
+        """``/review`` is the claude harness's own command, and that harness answers
+        on either provider axis -- the ``claude_code`` seam or the ``acp`` seam
+        spawning the claude backend -- so a linked conversation's ``/review`` is
+        refused on both, and stays prose where no harness would run it."""
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok"), _complete()])
+        slot = _slot()
+        slot._empty_response_retries = 2
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.provider = provider
+        cfg.agent.acp_backend = acp_backend
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()),
+        ):
+            await chat_runner._run_chat(
+                state, slot, "/review the last commit", _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        notices = [
+            m for m in slot.messages if "not available from a linked conversation" in m["content"]
+        ]
+        assert bool(notices) is refused, (provider, acp_backend)
+        if refused:
+            state.sessions.get_or_create.assert_not_awaited()
+        else:
+            state.sessions.get_or_create.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_credential_shaped_channel_token_is_redacted_in_the_notice(self, tmp_path):
+        """Under ``claude_code`` ANY leading slash is a harness command, so the refused
+        token is the channel user's own text. The intercept already redacts the
+        transcript copy of their message; the notice that names the token -- a
+        persisted transcript row, a SEL ``tool_name`` and a Slack post -- must not
+        hand the raw token back around that redaction, and a token is bounded so a
+        pasted blob cannot ride the notice whole."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        secret = "ghp_" + "A" * 36
+        token = "/" + secret + "x" * 200
+        logged: list[dict] = []
+
+        with (
+            patch.object(chat_runner, "is_claude_code", return_value=True),
+            patch.object(chat_runner, "sel") as sel_fn,
+        ):
+            sel_fn.return_value.log_tool_invocation = lambda **kw: logged.append(kw)
+            await chat_runner._run_chat(
+                state, slot, token + " please", _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_not_awaited()
+        notices = [
+            m.get("content", "")
+            for m in slot.messages
+            if "not available from a linked conversation" in m.get("content", "")
+        ]
+        assert notices, "a channel-origin harness token was forwarded silently"
+        assert secret not in notices[0], "the raw credential reached the transcript notice"
+        assert "[REDACTED" in notices[0]
+        assert len(notices[0]) < 200, "an unbounded token rode the notice whole"
+        blocked = [kw for kw in logged if kw.get("outcome") == "blocked"]
+        assert blocked and secret not in blocked[0]["tool_name"]
+        from kiro_crew.dashboard.chat_utils import CHANNEL_COMMAND_TOKEN_MAX
+
+        assert len(blocked[0]["tool_name"]) <= CHANNEL_COMMAND_TOKEN_MAX
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_refusal_reaches_the_linked_conversation(self, tmp_path):
+        """The person who typed the command reads their channel, not this
+        transcript, so the notice takes the same two legs a turn's reply takes. The
+        caller is the intercept, which names the thread the command came from and
+        runs it while that thread is still bound."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        state.sessions.get_slack_link = MagicMock(return_value=("1758.0001", "C0FFEE"))
+        origin = {"channel_type": "slack", "channel_id": "C0FFEE", "thread_id": "1758.0001"}
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()) as slack,
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as mirror,
+        ):
+            await chat_runner._run_chat(
+                state, slot, "/compact", _directive_channel_origin=True, _channel_origin=origin
+            )
+        await _settle(slot)
+
+        slack.assert_awaited_once()
+        assert "`/compact` is not available from a linked conversation" in slack.await_args.args[-1]
+        mirror.assert_awaited_once()
+        assert (
+            "`/compact` is not available from a linked conversation" in mirror.await_args.args[-1]
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_channel_turn_that_names_no_conversation_publishes_its_notice_nowhere(
+        self, tmp_path, caplog
+    ):
+        """Channel authority without a conversation is pinned as publishing to nowhere
+        (``pin_turn_channel_origin``): the transcript keeps the refusal notice, the
+        channel-neutral leg is withheld like every publication of such a turn, and
+        the pin is logged once at the turn's entry."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        caplog.set_level(logging.WARNING, logger="kiro_crew.dashboard.chat_runner")
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as mirror,
+        ):
+            await chat_runner._run_chat(state, slot, "/compact", _directive_channel_origin=True)
+        await _settle(slot)
+
+        mirror.assert_not_awaited()
+        assert any(
+            "`/compact` is not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "the transcript must still carry the notice; only the publication is withheld"
+        assert [
+            r.getMessage() for r in caplog.records if "names no conversation" in r.getMessage()
+        ] == [
+            f"channel-sourced turn on {slot.key} names no conversation; its channel "
+            "publications are withheld"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_refusal_is_not_posted_into_a_governance_denied_slack_thread(
+        self, tmp_path
+    ):
+        """The Slack leg is a proactive send to a channel, so it asks the channels-scope
+        governance gate first (``channel_egress_permitted``), as the ladder leg and the
+        drop notice's Slack leg do. A command queued while the scope was permitted and
+        drained after an administrator denied it must not reach the thread. The
+        transcript keeps the notice."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "channel_egress_permitted", return_value=False) as gate,
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()) as slack,
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()),
+        ):
+            await chat_runner._run_chat(state, slot, "/compact", _directive_channel_origin=True)
+        await _settle(slot)
+
+        assert gate.call_args_list, "the Slack leg never asked the governance gate"
+        assert gate.call_args.args[1] == "slack" and isinstance(gate.call_args.args[0], str)
+        slack.assert_not_awaited()  # the refusal notice must not reach a governance-denied thread
+        assert any(
+            "`/compact` is not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_refusal_is_withheld_from_a_fenced_session(self, tmp_path):
+        """The notice is a cross-surface publication like the turn's reply, so it asks
+        the same fence: a peer steer was admitted under one containment and the
+        containment holding NOW is another, so nothing may publish to the audience the
+        admission never saw. The transcript keeps the notice either way."""
+        from kiro_crew.dashboard import session_control as sc
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        # Admitted with no mirror, then a mirror appears: `mirrored` newly holds.
+        slot._steer_audience_fences["tok"] = sc.containment_meta(state, slot)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink("telegram", channel_id="7")
+        )
+        assert chat_runner.cross_surface_withheld(state, slot) is True
+        # The thread the command came from stays bound, so the FENCE is what withholds.
+        state.sessions.get_slack_link = MagicMock(return_value=("1758.0001", "C0FFEE"))
+        origin = {"channel_type": "slack", "channel_id": "C0FFEE", "thread_id": "1758.0001"}
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()) as slack,
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as mirror,
+        ):
+            await chat_runner._run_chat(
+                state, slot, "/compact", _directive_channel_origin=True, _channel_origin=origin
+            )
+        await _settle(slot)
+
+        mirror.assert_not_awaited()
+        # Slack is an audience too: the fence is inside its gate, so the notice does
+        # not reach the thread the admission never saw either.
+        slack.assert_not_awaited()
+        assert any(
+            "`/compact` is not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "the transcript must still carry the notice; only the publication is withheld"
+
+    @staticmethod
+    def _slack_thread_a(state, slot) -> dict[str, str]:
+        """Thread A is the slot's CACHED thread and the store's binding when the
+        refusal is reached; the origin the drain stamped names it."""
+        state.slack_client = MagicMock(post_message=AsyncMock())
+        slot._slack_channel, slot._slack_thread_ts = "C0FFEE", "1758.0001"
+        state.sessions.get_slack_link = MagicMock(return_value=("1758.0001", "C0FFEE"))
+        return {"channel_type": "slack", "channel_id": "C0FFEE", "thread_id": "1758.0001"}
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_notice_is_not_posted_into_a_thread_retargeted_during_its_gate(
+        self, tmp_path, caplog
+    ):
+        """Opus (``chat_runner.py:10847`` on the r20 head): thread A's queued
+        ``/compact`` reaches the refusal; while its governance gate runs off the loop,
+        a relink retargets the slot to thread B (``_link_slack_persisted`` rewrites the
+        cached ``_slack_thread_ts`` and evicts the old owner). The Slack leg posts to
+        the slot's CACHE, so on that head B was shown A's command word while the
+        channel-neutral leg withheld the same text, and A was told nothing. The leg
+        now asks the turn's publication gate synchronously with the send, like every
+        dedicated Slack publication: nothing reaches B, nothing reaches A, the
+        transcript keeps the notice, and the withholding is logged once."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        origin = self._slack_thread_a(state, slot)
+        caplog.set_level(logging.INFO, logger="kiro_crew.dashboard.chat_runner")
+
+        def _gate_during_which_the_thread_moves(session_key: str, channel_type: str) -> bool:
+            # The relink lands while the gate runs: cache and store now name B, and
+            # A is outside the session's rooms.
+            slot._slack_thread_ts = "1758.0002"
+            state.sessions.get_slack_link.return_value = ("1758.0002", "C0FFEE")
+            return True
+
+        with (
+            _quiet_sel(),
+            patch.object(
+                chat_runner, "channel_egress_permitted", _gate_during_which_the_thread_moves
+            ),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as mirror,
+        ):
+            await chat_runner._run_chat(
+                state, slot, "/compact", _directive_channel_origin=True, _channel_origin=origin
+            )
+        await _settle(slot)
+
+        # B never typed the command and A left: the cached thread gets nothing.
+        state.slack_client.post_message.assert_not_awaited()
+        mirror.assert_not_awaited()
+        assert any(
+            "`/compact` is not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "the transcript must still carry the notice; only the publication is withheld"
+        withheld = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("withholding the Slack command-refusal notice for ")
+        ]
+        assert len(withheld) == 1 and withheld[0].endswith(
+            "the conversation whose message this turn answers no longer resumes the session"
+        ), withheld
+        assert slot._turn_channel_origin is None, "the pin is turn-scoped"
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_notice_reaches_a_thread_that_stays_bound_through_its_gate(
+        self, tmp_path
+    ):
+        """The gate costs a bound thread nothing: the real Slack leg posts the notice
+        into A, at the thread the entry named."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        origin = self._slack_thread_a(state, slot)
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "channel_egress_permitted", return_value=True),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()),
+        ):
+            await chat_runner._run_chat(
+                state, slot, "/compact", _directive_channel_origin=True, _channel_origin=origin
+            )
+        await _settle(slot)
+
+        state.slack_client.post_message.assert_awaited_once()
+        channel_id, text, thread_ts = state.slack_client.post_message.await_args.args
+        assert (channel_id, thread_ts) == ("C0FFEE", "1758.0001")
+        assert "`/compact` is not available from a linked conversation" in text
+
+    @pytest.mark.asyncio
+    async def test_a_refused_channel_command_hands_the_queue_forward(self, tmp_path):
+        """A channel hand-off is QUEUED by design, so the refusal is reached from the
+        drain with more entries possibly behind it. Returning before the turn's tail
+        would strand them until some unrelated message drains the slot -- and a later
+        message could run first. The refusal leaves through the same queue-cycle
+        hand-off the tail uses: the next entry starts, or the cycle finishes."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        slot.queue_append(
+            "and the weather?", directive_user_origin=True, directive_channel_origin=True
+        )
+        real_run = chat_runner._run_chat
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+        ):
+            await real_run(
+                state, slot, "/compact", _directive_user_origin=True, _directive_channel_origin=True
+            )
+
+        assert slot._queue == [], "the follow-up stayed stranded behind the refused command"
+        assert spawn.call_count == 1, "the next queued turn was not started"
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_prose_still_reaches_the_provider(self, tmp_path):
+        """Only a token the dashboard would have run is refused; channel prose --
+        including a leading slash no surface reads as a command -- runs as text."""
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [_complete()])
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with _quiet_sel():
+            await chat_runner._run_chat(
+                state, slot, "/usr/bin/python3 fails to start", _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_awaited()
+        assert not any(
+            "not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_path_shaped_channel_token_is_prose_under_claude_code_too(self, tmp_path):
+        """Under ``claude_code`` every leading slash is a harness command from the
+        composer -- but a path is not a command anyone typed: a second ``/`` or a
+        ``.`` after the first segment is a file, and a channel message opening with
+        one is delivered, not refused."""
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [_complete()])
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with _quiet_sel(), patch.object(chat_runner, "is_claude_code", return_value=True):
+            await chat_runner._run_chat(
+                state, slot, "/usr/bin/python3 --version", _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_awaited()
+        assert not any(
+            "not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "path-shaped channel prose was refused as a command"
+
+    @pytest.mark.asyncio
     async def test_prompts_get_blocked_path_reports_a_sensitive_path(self, tmp_path):
         state, client = _runner_state(tmp_path)
         slot = _slot()
@@ -3530,6 +4078,733 @@ class TestRunChatLocalCommands:
             await _drive(state, slot, "/prompts")
 
         assert any("No prompts found" in m.get("content", "") for m in slot.messages)
+
+
+# ── _run_chat: a hand-off's reply goes to the conversation that asked ─────
+
+
+class TestAHandOffAnswersTheConversationThatAsked:
+    """The channel-neutral reply leg resolves the mirror LIVE when it delivers, and a
+    hand-off's turn runs long after its admission: a conversation that handed the
+    message off can release the session while the model answers, and another one can
+    resume it. The reply then belongs to nobody the session now mirrors, so the
+    publisher (``_publish_cross_surface_reply``) withholds it -- the transcript keeps
+    it -- instead of handing one conversation's reply to the next. A turn that is
+    nobody's hand-off keeps the documented behaviour: a mirror bound while it runs
+    receives its reply."""
+
+    ORIGIN = {"channel_type": "telegram", "channel_id": "7", "thread_id": None, "principal": "u1"}
+
+    @staticmethod
+    def _stream_that_retargets(client, state, new_link) -> None:
+        """Script one turn whose model answer lands AFTER the binding moved."""
+        calls = {"n": 0}
+
+        async def _events():
+            # The prompt went out under the sender's binding; while the model
+            # answers, the sender unlinks and another conversation resumes the
+            # session (or nobody does: ``new_link`` None).
+            state.sessions.get_mirror_link.return_value = new_link
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="sunny, 21C")
+            yield _complete()
+
+        def _stream(*_args, **_kwargs):
+            calls["n"] += 1
+            return _events() if calls["n"] == 1 else _async_iter([_complete()])
+
+        client.stream = MagicMock(side_effect=_stream)
+
+    async def _hand_off(self, state, slot, message: str = "and the weather?") -> tuple:
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as reply,
+            patch.object(
+                chat_runner, "_deliver_cross_surface_user_message", new=AsyncMock()
+            ) as echo,
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()),
+        ):
+            await chat_runner._run_chat(
+                state,
+                slot,
+                message,
+                _directive_user_origin=True,
+                _directive_channel_origin=True,
+                _channel_origin=dict(self.ORIGIN),
+            )
+        await _settle(slot)
+        return reply, echo
+
+    @pytest.mark.asyncio
+    async def test_a_retarget_between_prompt_and_reply_withholds_the_reply(self, tmp_path):
+        """GPT's scenario: channel A's hand-off runs; A unlinks and B binds mid-turn.
+        B is the mirror the leg would resolve, and it never asked."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        state.sessions.get_mirror_link = MagicMock(return_value=ChannelLink("telegram", "7"))
+        self._stream_that_retargets(client, state, ChannelLink("telegram", "8"))
+
+        reply, echo = await self._hand_off(state, slot)
+
+        echo.assert_awaited_once()  # A was still the mirror when its words were echoed
+        reply.assert_not_awaited()  # B receives nothing of A's reply
+        assert any(
+            m.get("role") == "assistant" and "sunny, 21C" in m.get("content", "")
+            for m in slot.messages
+        ), "the transcript must keep the reply; only the publication is withheld"
+        assert slot._turn_channel_origin is None, "the pin is turn-scoped"
+
+    @pytest.mark.asyncio
+    async def test_a_release_between_prompt_and_reply_withholds_the_reply(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        state.sessions.get_mirror_link = MagicMock(return_value=ChannelLink("telegram", "7"))
+        self._stream_that_retargets(client, state, None)
+
+        reply, _echo = await self._hand_off(state, slot)
+
+        reply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_reply_reaches_the_conversation_that_stays_bound(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        state.sessions.get_mirror_link = MagicMock(return_value=ChannelLink("telegram", "7"))
+        self._stream_that_retargets(client, state, ChannelLink("telegram", "7"))
+
+        reply, echo = await self._hand_off(state, slot)
+
+        echo.assert_awaited_once()
+        reply.assert_awaited_once()
+        assert "sunny, 21C" in reply.await_args.args[-1]
+        assert slot._turn_channel_origin is None
+
+    @pytest.mark.asyncio
+    async def test_the_pin_is_the_drains_stamp_not_the_slots_last_turn(self, tmp_path):
+        """A turn that is nobody's hand-off sets the pin to None even when the slot
+        carried one before, so a stale stamp never judges a composer turn."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        slot._turn_channel_origin = dict(self.ORIGIN)
+        state.sessions.get_mirror_link = MagicMock(return_value=ChannelLink("telegram", "8"))
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok"), _complete()])
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as reply,
+        ):
+            await chat_runner._run_chat(state, slot, "hello")
+        await _settle(slot)
+
+        reply.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_composer_turn_keeps_the_mirror_bound_while_it_ran(self, tmp_path):
+        """The documented behaviour for every other turn (``messaging/link.py``'s
+        rebind, the fence's exact comparison): the owner binding a channel while a
+        dashboard turn runs receives that turn's reply there."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        self._stream_that_retargets(client, state, ChannelLink("telegram", "8"))
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as reply,
+        ):
+            await chat_runner._run_chat(state, slot, "hello", _directive_user_origin=True)
+        await _settle(slot)
+
+        reply.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_notice_is_withheld_from_a_conversation_that_left(self, tmp_path):
+        """The command refusal is the hand-off's other publication, reached before the
+        turn's try/finally: the same rule applies and the pin is still released."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        # Retargeted between the drain and the turn's first statement.
+        state.sessions.get_mirror_link = MagicMock(return_value=ChannelLink("telegram", "8"))
+
+        reply, _echo = await self._hand_off(state, slot, "/compact")
+
+        reply.assert_not_awaited()
+        assert any(
+            "`/compact` is not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        )
+        assert slot._turn_channel_origin is None
+
+
+# ── _run_chat: a Slack hand-off publishes to its thread or nowhere ─────────
+
+
+class TestASlackHandOffPublishesToItsThreadOrNowhere:
+    """Slack's dedicated mirror caches the thread at turn start (``get_slack_link``)
+    and posts the echo, the tool stream, the reply with its options and the final
+    task append to that cached pair. A linked-thread hand-off whose thread is
+    unlinked -- or moved to another thread -- while the model answers would
+    otherwise keep publishing into the revoked thread (GPT, ``chat_runner.py:18065``
+    on the r18 head: the sites asked only the steer-audience fence). Every one of
+    those publications now asks ``slack_publication_withheld``: the fence AND the
+    hand-off's pinned origin through ``channel_origin_still_bound`` -- the same
+    predicate the channel-neutral leg asks -- so a thread that left gets nothing
+    further, the transcript keeps the reply, and the stream is still ended."""
+
+    THREAD = ("1758.0001", "C0FFEE")
+    ORIGIN = {
+        "channel_type": "slack",
+        "channel_id": "C0FFEE",
+        "thread_id": "1758.0001",
+        "principal": "U1",
+    }
+
+    @staticmethod
+    def _slack(state) -> AsyncMock:
+        slack = AsyncMock()
+        slack.start_stream = AsyncMock(return_value="stream.1")
+        slack.post_blocks = AsyncMock(return_value="opts.1")
+        state.slack_client = slack
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        state.sessions.get_slack_link = MagicMock(return_value=("1758.0001", "C0FFEE"))
+        return slack
+
+    @staticmethod
+    def _tool(title: str) -> LLMEvent:
+        return LLMEvent(kind=EVENT_TOOL_CALL, title=title, tool_call_id=title, tool_kind="read")
+
+    def _stream_with_the_thread_moving(self, client, state, new_link) -> None:
+        """One tool call under the thread, then the thread moves, then a second tool
+        call and the answer land AFTER the move."""
+        calls = {"n": 0}
+
+        async def _events():
+            yield self._tool("Reading the forecast")
+            state.sessions.get_slack_link.return_value = new_link
+            yield self._tool("Reading the map")
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="sunny, 21C [OPTIONS: yes | no]")
+            yield _complete()
+
+        def _stream(*_args, **_kwargs):
+            calls["n"] += 1
+            return _events() if calls["n"] == 1 else _async_iter([_complete()])
+
+        client.stream = MagicMock(side_effect=_stream)
+
+    async def _hand_off(self, state, slot, message: str = "and the weather?", *, origin=True):
+        slot._empty_response_retries = 2
+        kwargs = (
+            {
+                "_directive_user_origin": True,
+                "_directive_channel_origin": True,
+                "_channel_origin": dict(self.ORIGIN),
+            }
+            if origin
+            else {}
+        )
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()),
+            patch.object(chat_runner, "_deliver_cross_surface_user_message", new=AsyncMock()),
+            patch.object(chat_runner, "mint_options_token", return_value="tok"),
+        ):
+            await chat_runner._run_chat(state, slot, message, **kwargs)
+        await _settle(slot)
+
+    @pytest.mark.asyncio
+    async def test_an_unlink_mid_turn_stops_every_further_publication(self, tmp_path, caplog):
+        """GPT's scenario: the busy linked Slack message runs; the thread is unlinked
+        after `_mirror_thread` was cached. Red on the r18 head: the second tool's
+        task, the reply and its options and the final "complete" all reached the
+        revoked thread. Now nothing after the unlink does; the stream is still ended;
+        the transcript keeps the reply; the withheld reply is logged."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slack = self._slack(state)
+        self._stream_with_the_thread_moving(client, state, (None, None))
+        caplog.set_level(logging.INFO, logger="kiro_crew.dashboard.chat_runner")
+
+        await self._hand_off(state, slot)
+
+        # Before the unlink: the echo, the stream start and the first tool's task.
+        slack.post_message.assert_awaited_once()
+        assert "💬" in slack.post_message.await_args.args[1]
+        slack.start_stream.assert_awaited_once()
+        assert [c.args[3:5] for c in slack.append_task.await_args_list] == [
+            ("Reading the forecast", "in_progress")
+        ], "a publication reached the thread after it was unlinked"
+        # After it: no second task, no reply, no options, no final complete.
+        slack.post_blocks.assert_not_awaited()
+        assert not any("sunny" in str(c.args) for c in slack.post_message.await_args_list)
+        # The stream is still ended (it publishes nothing), and the transcript keeps
+        # the reply -- only the publication is withheld.
+        slack.stop_stream.assert_awaited_once_with("C0FFEE", "stream.1")
+        assert any(
+            m.get("role") == "assistant" and "sunny, 21C" in m.get("content", "")
+            for m in slot.messages
+        )
+        assert any(
+            "withholding the Slack reply" in r.getMessage()
+            and "no longer resumes the session" in r.getMessage()
+            for r in caplog.records
+        )
+        assert slot._turn_channel_origin is None, "the pin is turn-scoped"
+
+    @pytest.mark.asyncio
+    async def test_a_retarget_mid_turn_leaves_the_cached_thread_nothing(self, tmp_path):
+        """The thread moves to another one: the cached pair is a conversation outside
+        the session's rooms, and the new one never asked -- neither gets the rest of
+        the turn."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slack = self._slack(state)
+        self._stream_with_the_thread_moving(client, state, ("1758.0002", "C0FFEE"))
+
+        await self._hand_off(state, slot)
+
+        assert [c.args[3:5] for c in slack.append_task.await_args_list] == [
+            ("Reading the forecast", "in_progress")
+        ]
+        slack.post_blocks.assert_not_awaited()
+        assert not any("sunny" in str(c.args) for c in slack.post_message.await_args_list)
+        assert all(
+            c.args[0] == "C0FFEE" and c.args[2] == "1758.0001"
+            for c in slack.post_message.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_thread_that_stays_bound_gets_the_whole_turn(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slack = self._slack(state)
+        self._stream_with_the_thread_moving(client, state, ("1758.0001", "C0FFEE"))
+
+        await self._hand_off(state, slot)
+
+        assert [c.args[3:5] for c in slack.append_task.await_args_list] == [
+            ("Reading the forecast", "in_progress"),
+            ("Reading the forecast", "complete"),
+            ("Reading the map", "in_progress"),
+            ("Reading the map", "complete"),
+        ]
+        assert any("sunny, 21C" in str(c.args) for c in slack.post_message.await_args_list)
+        slack.post_blocks.assert_awaited_once()
+        slack.stop_stream.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_composer_turn_keeps_its_thread_through_a_thread_change(self, tmp_path):
+        """No pinned origin: the documented behaviour stands -- the thread cached at
+        turn start receives the turn even if the link store changes meanwhile (only
+        a hand-off is bound to the conversation that asked)."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slack = self._slack(state)
+        self._stream_with_the_thread_moving(client, state, (None, None))
+
+        await self._hand_off(state, slot, origin=False)
+
+        assert len(slack.append_task.await_args_list) == 4
+        assert any("sunny, 21C" in str(c.args) for c in slack.post_message.await_args_list)
+        slack.post_blocks.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_idle_linked_thread_message_is_bound_to_its_thread_too(self, tmp_path, caplog):
+        """GPT's idle scenario (``chat_runner.py:4590``): the slot is idle, so the
+        linked-thread intercept (``slack/handler.maybe_route_linked_thread``) runs the
+        message at once instead of queueing it, and the thread is unlinked after the
+        turn cached it. The turn publishes to that thread or nowhere exactly as a
+        drained hand-off does: the intercept names the thread as the turn's source
+        and ``_run_chat`` pins it at the one place every entry path passes, so the
+        idle route cannot reduce the gate to the steer fence."""
+        from kiro_crew.slack import handler
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        slack = self._slack(state)
+        self._stream_with_the_thread_moving(client, state, (None, None))
+        state.get_linked_slot = MagicMock(return_value=slot)
+        caplog.set_level(logging.INFO, logger="kiro_crew.dashboard.chat_runner")
+
+        with (
+            _quiet_sel(),
+            patch.object(handler, "_dashboard_state", state),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch.object(handler, "sel", return_value=MagicMock()),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()),
+            patch.object(chat_runner, "_deliver_cross_surface_user_message", new=AsyncMock()),
+            patch.object(chat_runner, "mint_options_token", return_value="tok"),
+        ):
+            routed = await handler.maybe_route_linked_thread(
+                "and the weather?", "slack:1758.0001", "U1", "C0FFEE", AsyncMock(), "1758.0001"
+            )
+            assert routed is True, "the linked message was not routed to the idle slot"
+            await slot.task
+        await _settle(slot)
+
+        # Before the unlink: the echo, the stream start and the first tool's task.
+        slack.post_message.assert_awaited_once()
+        assert "💬" in slack.post_message.await_args.args[1]
+        slack.start_stream.assert_awaited_once()
+        assert [c.args[3:5] for c in slack.append_task.await_args_list] == [
+            ("Reading the forecast", "in_progress")
+        ], "a publication reached the thread after it was unlinked"
+        # After it: no second task, no reply, no options, no final complete.
+        slack.post_blocks.assert_not_awaited()
+        assert not any("sunny" in str(c.args) for c in slack.post_message.await_args_list)
+        slack.stop_stream.assert_awaited_once_with("C0FFEE", "stream.1")
+        assert any(
+            m.get("role") == "assistant" and "sunny, 21C" in m.get("content", "")
+            for m in slot.messages
+        )
+        assert any(
+            "withholding the Slack reply" in r.getMessage()
+            and "no longer resumes the session" in r.getMessage()
+            for r in caplog.records
+        )
+        assert slot._turn_channel_origin is None, "the pin is turn-scoped"
+
+    def test_the_pin_is_decided_once_from_what_the_dispatch_said(self, tmp_path, caplog):
+        """``pin_turn_channel_origin`` is the one decider. A named conversation is
+        pinned as a copy and judged live; a channel-sourced turn that names NONE is
+        pinned as publishing to nowhere -- released even while the thread is bound,
+        logged once -- and stamps nothing on a recovery; anything else pins None and
+        keeps the documented composer behaviour."""
+        state = _state(tmp_path)
+        slot = _slot()
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        state.sessions.get_slack_link = MagicMock(return_value=("1758.0001", "C0FFEE"))
+        caplog.set_level(logging.WARNING, logger="kiro_crew.dashboard.chat_runner")
+
+        origin = dict(self.ORIGIN)
+        chat_runner.pin_turn_channel_origin(slot, channel_origin=origin, channel_sourced=True)
+        assert chat_runner.turn_channel_origin(slot) == self.ORIGIN
+        assert chat_runner.turn_channel_origin(slot) is not origin, "pinned as a copy"
+        assert chat_runner.turn_origin_released(state, slot) is False
+        assert not caplog.records
+
+        chat_runner.pin_turn_channel_origin(slot, channel_origin=None, channel_sourced=True)
+        assert chat_runner.turn_channel_origin(slot) == {}
+        assert chat_runner.turn_origin_released(state, slot) is True
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is True
+        assert not chat_runner.turn_channel_origin(slot), "nothing worth stamping on a recovery"
+        assert [r.getMessage() for r in caplog.records] == [
+            f"channel-sourced turn on {slot.key} names no conversation; its channel "
+            "publications are withheld"
+        ]
+
+        chat_runner.pin_turn_channel_origin(slot, channel_origin=None, channel_sourced=False)
+        assert chat_runner.turn_channel_origin(slot) is None
+        assert chat_runner.turn_origin_released(state, slot) is False
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is False
+
+    def test_the_gate_is_the_fence_and_the_pinned_origin(self, tmp_path, monkeypatch):
+        """The predicate alone: nothing pinned and no fence publishes; a pinned origin
+        whose room left withholds; a fence withholds; an unreadable store withholds."""
+        state = _state(tmp_path)
+        slot = _slot()
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        state.sessions.get_slack_link = MagicMock(return_value=("1758.0001", "C0FFEE"))
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is False
+        assert chat_runner.turn_origin_released(state, slot) is False
+        slot._turn_channel_origin = dict(self.ORIGIN)
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is False
+        state.sessions.get_slack_link = MagicMock(return_value=(None, None))
+        assert chat_runner.turn_origin_released(state, slot) is True
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is True
+        state.sessions.get_slack_link = MagicMock(side_effect=RuntimeError("store gone"))
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is True
+        slot._turn_channel_origin = None
+        state.sessions.get_slack_link = MagicMock(return_value=("1758.0001", "C0FFEE"))
+        monkeypatch.setattr(chat_runner, "cross_surface_withheld", lambda _s, _sl: True)
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is True
+
+
+# ── _run_chat: a co-bound session publishes a hand-off to its origin room only ──
+
+
+class TestACoBoundSessionPublishesAHandOffToItsOriginRoomOnly:
+    """A mirror row and a Slack thread co-bound on one session key is a supported
+    state, and the origin predicate rightly reads a hand-off's conversation as still
+    bound while it is anywhere in that set. But each leg publishes into ONE room
+    (GPT, ``chat_runner.py:4735`` on the r22 head): a Telegram hand-off's echo, tool
+    stream and reply were posted into the co-bound Slack thread, which never asked.
+    Every publication now also compares its own target with the pinned origin
+    (``publication_off_turn_origin`` over ``mirror_room``): the origin room gets
+    the turn, the sibling gets nothing, and a composer turn still reaches both."""
+
+    THREAD = ("1758.0001", "C0FFEE")
+    TELEGRAM = ChannelLink("telegram", "8")
+    TELEGRAM_ORIGIN = {"channel_type": "telegram", "channel_id": "8", "thread_id": None}
+    SLACK_ORIGIN = {
+        "channel_type": "slack",
+        "channel_id": "C0FFEE",
+        "thread_id": "1758.0001",
+        "principal": "U1",
+    }
+
+    def _co_bound(self, state) -> AsyncMock:
+        slack = AsyncMock()
+        slack.start_stream = AsyncMock(return_value="stream.1")
+        slack.post_blocks = AsyncMock(return_value="opts.1")
+        state.slack_client = slack
+        state.sessions.get_mirror_link = MagicMock(return_value=self.TELEGRAM)
+        state.sessions.get_slack_link = MagicMock(return_value=self.THREAD)
+        return slack
+
+    @staticmethod
+    def _one_tool_then_answer(client) -> None:
+        calls = {"n": 0}
+
+        async def _events():
+            yield LLMEvent(
+                kind=EVENT_TOOL_CALL, title="Reading the map", tool_call_id="t1", tool_kind="read"
+            )
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="sunny, 21C [OPTIONS: yes | no]")
+            yield _complete()
+
+        def _stream(*_args, **_kwargs):
+            calls["n"] += 1
+            return _events() if calls["n"] == 1 else _async_iter([_complete()])
+
+        client.stream = MagicMock(side_effect=_stream)
+
+    async def _turn(self, state, slot, origin: dict | None) -> tuple:
+        slot._empty_response_retries = 2
+        kwargs = (
+            {
+                "_directive_user_origin": True,
+                "_directive_channel_origin": True,
+                "_channel_origin": dict(origin),
+            }
+            if origin is not None
+            else {}
+        )
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as reply,
+            patch.object(
+                chat_runner, "_deliver_cross_surface_user_message", new=AsyncMock()
+            ) as echo,
+            patch.object(chat_runner, "mint_options_token", return_value="tok"),
+        ):
+            await chat_runner._run_chat(state, slot, "and the weather?", **kwargs)
+        await _settle(slot)
+        return reply, echo
+
+    @pytest.mark.asyncio
+    async def test_a_telegram_hand_off_never_reaches_the_co_bound_slack_thread(
+        self, tmp_path, caplog
+    ):
+        """GPT's scenario. Red on the r22 head: the thread received the echo, the
+        tool's task, the reply and its options. Now the Telegram chat -- the leg that
+        resolves to the origin -- gets the echo and the reply, and the Slack client is
+        never asked to post, stream or append; the transcript keeps the reply."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slack = self._co_bound(state)
+        self._one_tool_then_answer(client)
+        caplog.set_level(logging.INFO, logger="kiro_crew.dashboard.chat_runner")
+
+        reply, echo = await self._turn(state, slot, self.TELEGRAM_ORIGIN)
+
+        echo.assert_awaited_once()
+        reply.assert_awaited_once()
+        slack.post_message.assert_not_awaited()
+        slack.start_stream.assert_not_awaited()
+        slack.append_task.assert_not_awaited()
+        slack.post_blocks.assert_not_awaited()
+        slack.stop_stream.assert_not_awaited()
+        assert any(
+            m.get("role") == "assistant" and "sunny, 21C" in m.get("content", "")
+            for m in slot.messages
+        )
+        assert slot._turn_channel_origin is None, "the pin is turn-scoped"
+
+    @pytest.mark.asyncio
+    async def test_a_slack_thread_hand_off_never_reaches_the_co_bound_telegram_chat(
+        self, tmp_path, caplog
+    ):
+        """The same rule the other way: the thread's hand-off is published into the
+        thread (echo, stream, task, reply, options), and the channel-neutral leg --
+        whose target is the co-bound Telegram row -- withholds the echo and the reply,
+        saying so once."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slack = self._co_bound(state)
+        self._one_tool_then_answer(client)
+        caplog.set_level(logging.INFO, logger="kiro_crew.dashboard.chat_runner")
+
+        reply, echo = await self._turn(state, slot, self.SLACK_ORIGIN)
+
+        echo.assert_not_awaited()
+        reply.assert_not_awaited()
+        slack.post_message.assert_awaited()
+        assert "💬" in slack.post_message.await_args_list[0].args[1]
+        slack.start_stream.assert_awaited_once()
+        assert [c.args[3:5] for c in slack.append_task.await_args_list] == [
+            ("Reading the map", "in_progress"),
+            ("Reading the map", "complete"),
+        ]
+        assert any("sunny, 21C" in str(c.args) for c in slack.post_message.await_args_list)
+        slack.post_blocks.assert_awaited_once()
+        assert any(
+            "withholding cross-surface reply" in r.getMessage()
+            and "the session's mirror is not the conversation" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_composer_turn_still_reaches_both_rooms(self, tmp_path):
+        """No pinned origin: the documented behaviour -- every bound room receives the
+        turn -- is untouched by the per-target comparison."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slack = self._co_bound(state)
+        self._one_tool_then_answer(client)
+
+        reply, echo = await self._turn(state, slot, None)
+
+        echo.assert_awaited_once()
+        reply.assert_awaited_once()
+        slack.start_stream.assert_awaited_once()
+        assert any("sunny, 21C" in str(c.args) for c in slack.post_message.await_args_list)
+        slack.post_blocks.assert_awaited_once()
+
+    @staticmethod
+    async def _drain_to_idle(slot) -> None:
+        """Await every turn the drain and the turns' own tail-drains start, in order."""
+        for _ in range(8):
+            task = slot.task
+            if task is None or not hasattr(task, "cancel") or task.done():
+                return
+            await asyncio.wait_for(task, 30)
+        raise AssertionError("the queue kept starting turns")
+
+    @pytest.mark.asyncio
+    async def test_two_origins_queued_under_merge_run_as_two_turns_each_into_its_own_room(
+        self, tmp_path
+    ):
+        """GPT's r25 scenario (``chat_runner.py:9212``): with the default-off
+        ``dashboard.merge_queued_messages`` on, a Telegram hand-off and a Slack-thread
+        hand-off queued together folded into ONE turn under the first stamp, and the
+        Telegram chat received the Slack sender's words under the merge banner. Red on
+        the r25 head (the Telegram echo carried ``[2 queued messages merged]`` and the
+        Slack words; the Slack thread got nothing). The drain now partitions the queue
+        by origin (``chat_utils.merge_origin``): two turns, in queue order, through the
+        real ``_run_chat`` -- the Telegram chat gets the Telegram words and their reply,
+        the Slack thread its own, neither sees the other's text, and no merge banner is
+        published anywhere."""
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slack = self._co_bound(state)
+        replies = iter(["dry in Telegram", "wet in Slack"])
+
+        def _stream(*_args, **_kwargs):
+            return _async_iter(
+                [LLMEvent(kind=EVENT_TEXT_CHUNK, text=next(replies, "")), _complete()]
+            )
+
+        client.stream = MagicMock(side_effect=_stream)
+        queue_for_next_turn(
+            state,
+            slot,
+            "telegram asks about the weather",
+            directive_user_origin=True,
+            channel_origin=True,
+            channel_address=dict(self.TELEGRAM_ORIGIN),
+        )
+        queue_for_next_turn(
+            state,
+            slot,
+            "slack asks about tomorrow",
+            directive_user_origin=True,
+            channel_origin=True,
+            channel_address=dict(self.SLACK_ORIGIN),
+        )
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.dashboard.merge_queued_messages = True
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as reply,
+            patch.object(
+                chat_runner, "_deliver_cross_surface_user_message", new=AsyncMock()
+            ) as echo,
+        ):
+            assert await chat_runner._start_next_queued_turn(state, slot) is True
+            await self._drain_to_idle(slot)
+
+        # No cross-room text, no merge banner, anywhere: this is the leak itself.
+        slack_texts = [c.args[1] for c in slack.post_message.await_args_list]
+        telegram_texts = [str(c.args[2]) for c in echo.await_args_list + reply.await_args_list]
+        assert not any(
+            "merged" in t or "slack asks" in t or "wet in Slack" in t for t in telegram_texts
+        ), telegram_texts
+        assert not any(
+            "merged" in t or "telegram asks" in t or "dry in Telegram" in t for t in slack_texts
+        ), slack_texts
+        assert client.stream.call_count == 2, "two origins are two turns"
+        assert slot._queue == []
+        # The Telegram chat (the channel-neutral leg): its own words, its own reply.
+        echo.assert_awaited_once()
+        assert echo.await_args.args[2] == "telegram asks about the weather"
+        reply.assert_awaited_once()
+        assert reply.await_args.args[2] == "dry in Telegram"
+        # The Slack thread (the dedicated leg): its own words, its own reply.
+        assert any(t.startswith("💬") and "slack asks about tomorrow" in t for t in slack_texts)
+        assert any("wet in Slack" in t for t in slack_texts)
+        slack.start_stream.assert_awaited_once()
+        assert slot._turn_channel_origin is None, "the pin is turn-scoped"
+
+    def test_the_target_comparison_alone(self, tmp_path):
+        """``publication_off_turn_origin``: nobody's hand-off compares as nothing to
+        withhold; the origin room itself publishes; a sibling room is withheld; a
+        turn pinned as naming no conversation fails closed. The neutral form reads the
+        mirror row the leg would deliver to: none means nothing to withhold, a raising
+        store withholds."""
+        state = _state(tmp_path)
+        slot = _slot()
+        slack_room = "slack:C0FFEE:1758.0001"
+        telegram_room = "telegram:8:"
+
+        assert chat_runner.publication_off_turn_origin(slot, slack_room) is False
+        slot._turn_channel_origin = dict(self.TELEGRAM_ORIGIN)
+        assert chat_runner.publication_off_turn_origin(slot, telegram_room) is False
+        assert chat_runner.publication_off_turn_origin(slot, slack_room) is True
+        slot._turn_channel_origin = dict(self.SLACK_ORIGIN)
+        assert chat_runner.publication_off_turn_origin(slot, slack_room) is False
+        assert chat_runner.publication_off_turn_origin(slot, telegram_room) is True
+        slot._turn_channel_origin = {}
+        assert chat_runner.publication_off_turn_origin(slot, slack_room) is True
+
+        slot._turn_channel_origin = dict(self.SLACK_ORIGIN)
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        assert chat_runner.neutral_publication_off_turn_origin(state, slot, "k") is False
+        state.sessions.get_mirror_link = MagicMock(return_value=self.TELEGRAM)
+        assert chat_runner.neutral_publication_off_turn_origin(state, slot, "k") is True
+        slot._turn_channel_origin = dict(self.TELEGRAM_ORIGIN)
+        assert chat_runner.neutral_publication_off_turn_origin(state, slot, "k") is False
+        state.sessions.get_mirror_link = MagicMock(side_effect=RuntimeError("store gone"))
+        assert chat_runner.neutral_publication_off_turn_origin(state, slot, "k") is True
+        slot._turn_channel_origin = None
+        assert chat_runner.neutral_publication_off_turn_origin(state, slot, "k") is False
+        # The Slack gate composes the thread it is handed into the same grammar.
+        slot._turn_channel_origin = dict(self.TELEGRAM_ORIGIN)
+        state.sessions.get_mirror_link = MagicMock(return_value=self.TELEGRAM)
+        state.sessions.get_slack_link = MagicMock(return_value=self.THREAD)
+        assert chat_runner.turn_origin_released(state, slot) is False, "co-bound is still bound"
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is True
+        slot._turn_channel_origin = dict(self.SLACK_ORIGIN)
+        assert chat_runner.slack_publication_withheld(state, slot, "C0FFEE", "1758.0001") is False
 
 
 # ── _run_chat: recovery ladders ───────────────────────────────────────────
