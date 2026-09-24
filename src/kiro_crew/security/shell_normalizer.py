@@ -493,6 +493,52 @@ _DATA_CONSUMER_PROGRAMS = frozenset(
 
 # program in a run that ``shlex`` handed over as a single word.
 _CONTROL_OPERATOR_RE = re.compile(r"[;&|\n]+")
+# The same split with the operators KEPT, so a script is walked segment by segment.
+_CONTROL_OPERATOR_SPLIT_RE = re.compile(r"([;&|\n]+)")
+# An assignment after ``||``/``&&`` may not run and one before ``|``/``&`` runs in a
+# subshell: neither replaces the binding before it.  A run of assignments followed by
+# a boundary (or nothing) persists; followed by a command word it is a prefix.
+_CONDITIONAL_OPERATORS = frozenset({"||", "&&", "|"})
+_SUBSHELL_OPERATORS = frozenset({"|", "&"})
+_COMMAND_BOUNDARY_TOKENS = frozenset({";", "||", "&&", "|", "&", ";;", ";&", ";;&"})
+_SHELL_WORD_RE = re.compile(r"""(?:"[^"]*"|'[^']*'|\S)+""")
+# Special and declaration builtins: a prefix before them persists (``x=<cli> export x``).
+_ASSIGNMENT_PERSISTING_BUILTINS = frozenset(
+    "export readonly declare typeset local eval set unset : . source exec shift trap"
+    " times break continue return exit".split()
+)
+
+
+def _is_command_word(token: str) -> bool:
+    """True when a prefix before *token* is scoped to it: not a boundary, redirection,
+    comment or a builtin the prefix persists through."""
+    return not (
+        token in _COMMAND_BOUNDARY_TOKENS
+        or token in _ASSIGNMENT_PERSISTING_BUILTINS
+        or token.startswith("#")
+        or _REDIRECT_START_RE.match(token) is not None
+    )
+
+
+def _leading_assignments(segment: str) -> "list[tuple[str, str]]":
+    """``(name, value)`` for a segment's LEADING run of assignments (``y=1 x=<cli>``)."""
+    pairs: list[tuple[str, str]] = []
+    for word in _SHELL_WORD_RE.findall(segment):
+        assign = _LOCAL_ASSIGN_RE.match(word)
+        if not assign:
+            break
+        pairs.append((assign.group(1), assign.group(2).strip("\"'")))
+    return pairs
+
+
+def _is_command_scoped_assignment(segment: str) -> bool:
+    """True when a segment is ``NAME=value ... command`` (``X=foo true``), not a bare run."""
+    rest = _SHELL_WORD_RE.findall(segment)[len(_leading_assignments(segment)) :]
+    return bool(rest) and _is_command_word(rest[0])
+
+
+# The whitespace ``shlex`` splits on: one INSIDE a token is proof the token was quoted.
+_SHLEX_WHITESPACE_RE = re.compile(r"[ \t\r\n]")
 # A word that OPENS with a command substitution, past any quote or paren the shell
 # strips first: its basename reading is the substitution body's program
 # (``$(kirocrew`` reads as ``kirocrew``), which is what runs.  A BRACE before it is
@@ -579,6 +625,13 @@ def _split_glued_operators(tokens: "list[str]") -> "list[str]":
     ``shlex`` splits on whitespace only, so ``X=<name>;$X`` arrives as one token and an
     assignment glued to the command that uses it is invisible to both.  Splitting keeps
     the operator itself as a token so argv-boundary logic still sees it.
+
+    A token that CONTAINS ``shlex`` whitespace was quoted, and a quoted word is ONE
+    argument however many ``;`` it carries (``bash -c '<name>=<cli>; $<name> <verb>'``).
+    Split into pieces ALONE, the payload walk -- which takes the ONE token after the
+    carrier -- saw only ``<name>=<cli>``.  So such a token is yielded WHOLE first
+    (the walk re-tokenizes it) and then its pieces, because the whitespace may sit
+    inside a quoted VALUE of a top-level glued run (``X="a b";Y=<cli>;$Y <verb>``).
     """
     out: list[str] = []
     for token in tokens:
@@ -591,12 +644,14 @@ def _split_glued_operators(tokens: "list[str]") -> "list[str]":
         if not _LOCAL_ASSIGN_RE.match(token) or not _CONTROL_OPERATOR_RE.search(token):
             out.append(token)
             continue
-        for piece in _CONTROL_OPERATOR_RE.split(token):
-            if piece:
+        if _SHLEX_WHITESPACE_RE.search(token):
+            out.append(token)  # quoted whole (see above): the carrier's operand first
+        # The operator run is kept as spelled, so the resolver's guard sees ``||``.
+        for piece in _CONTROL_OPERATOR_SPLIT_RE.split(token):
+            if _CONTROL_OPERATOR_RE.fullmatch(piece):
+                out.append(piece.strip() or ";")
+            elif piece:
                 out.append(piece)
-            out.append(";")
-        if out and out[-1] == ";":
-            out.pop()
     return out
 
 
@@ -1181,17 +1236,10 @@ def _shell_c_carrier_glued(token: str) -> "str | None":
 # the payload's FIRST-WORD length -- a real program name -- so 64 covers any
 # rule-relevant program with room to spare, while keeping the per-token scan
 # O(window) and immune to cluster padding (padding only adds fake splits
-# farther from the end, whose program words are runs of flag letters).  A
-# first word LONGER than the window is a NAME the payload refers back to (an
-# assignment used through ``$name``, a function called by name), and those
-# splits are found by the reference instead -- see
-# ``_shell_c_carrier_payloads``.
+# farther from the end, whose program words are runs of flag letters).  A first
+# word LONGER than the window is a NAME the payload refers back to; those splits
+# are found by the reference (``_shell_c_carrier_payloads``, ``_LEADING_LETTERS_RE``).
 _CARRIER_SPLIT_WINDOW = 64
-
-# The leading letter run of an identifier-shaped word (``name`` of ``name_1``):
-# what a carrier's letter-only leading region can end with when the payload's
-# first word is that identifier.  Finds the split candidates that sit before
-# the window above.
 _LEADING_LETTERS_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]+")
 
 
@@ -1219,21 +1267,10 @@ def _shell_c_carrier_payloads(token: str) -> "list[str]":
     split's program word is a run of flag letters that matches no rule.
     Without the bound, a ~3 KB ``-acac…`` token made the candidate set
     quadratic and the synchronous deny scan outlived the loop watchdog.
-    The window's premise -- the first word is a program name -- fails when
-    the payload opens with a shell ASSIGNMENT: ``-Cc'<name>=<cli>; $<name>
-    <verb>'`` folds to ``-cc<name>=…``, the letter region runs through the
-    whole name, and a name longer than the window leaves the option ``c``
-    outside it, so only the first-``c`` reading (``c<name>=…``, an assignment
-    to a different name that ``$<name>`` never resolves) was yielded and the
-    mint went unexamined.  A first word that long is rule-relevant only as a
-    name the payload REFERS BACK TO -- through ``$name``, or as a function
-    called by name -- so before the window a split is yielded exactly where
-    the first word it produces is referenced later in the token.  That is
-    bounded by the references rather than by the ``c`` count: distinct
-    region suffixes have distinct lengths, so k of them need k*(k+1)/2
-    characters of references, and the candidates grow with the square root
-    of the token's length.  A word's leading letter run is what a letter-only
-    region can end with (``name_1`` is referenced as ``name``).
+    A first word LONGER than the window (an assignment name) is rule-relevant only as
+    a name the payload REFERS BACK TO, so before the window a split is yielded where
+    the first word it produces is referenced later; k candidates need k*(k+1)/2
+    characters of references.
     The first-``c`` split is always yielded
     regardless of the window: it is the LONGEST suffix, so the unanchored
     regex tier sees every shorter reading as a substring of it.
@@ -1265,7 +1302,6 @@ def _shell_c_carrier_payloads(token: str) -> "list[str]":
         region_end += 1
     index = max(1, region_end - _CARRIER_SPLIT_WINDOW)
     if index > 1:
-        # Before the window: the splits whose first word is referred to later.
         region = token[:region_end]
         for prefix in {m.group(0) for m in _LEADING_LETTERS_RE.finditer(token, region_end)}:
             split = region_end - len(prefix) - 1
@@ -2966,6 +3002,14 @@ def _is_self_program(token: str) -> bool:
     return _glob_could_expand_to(base, _SELF_PROGRAM_SPELLINGS)
 
 
+def _is_protected_program(token: str) -> bool:
+    """True if *token*'s first word names the CLI or a kill program: a binding worth
+    keeping live against a later assignment (at worst a refusal)."""
+    program = (token.split() or [token])[0]
+    base = _program_basename(program)
+    return _is_self_program(program) or base in _KILL_BY_NAME_PROGRAMS or base == "kill"
+
+
 def _self_tokens(text_lower: str) -> "list[str]":
     """Tokenize the WHOLE command, resolving quoting before any splitting.
 
@@ -3131,8 +3175,37 @@ def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
     # because ``shlex`` splits on whitespace only.  Split on top-level control operators
     # first so the assignment is seen as an assignment and the use as a use.
     tokens = _split_glued_operators(tokens)
+    # End of each token's assignment run, computed once (a per-token walk was quadratic).
+    run_end = _next_stop_indexes(tokens, lambda tk: _LOCAL_ASSIGN_RE.match(tk) is None)
     for idx, token in enumerate(tokens):
         assign = _LOCAL_ASSIGN_RE.match(token)
+        subshell_scoped = False
+        if assign:
+            # ``X=foo true`` is a prefix scoped to ONE command: it must not REPLACE the
+            # shell's binding (``x=<cli>; x=foo true; $x <verb>`` mints), but a FIRST
+            # binding is recorded (the command inherits it), as is a protected value.
+            # A value opening a substitution or quote spans the following tokens.
+            value_text = assign.group(2)
+            spans_tokens = (
+                "$(" in value_text
+                or "`" in value_text
+                or value_text.count('"') % 2 == 1
+                or value_text.count("'") % 2 == 1
+            )
+            look = run_end[idx]
+            prefix_value = _VAR_USE_RE.sub(
+                lambda m: values.get(m.group(1) or m.group(2), m.group(0)), value_text
+            )
+            if (
+                not spans_tokens
+                and look < len(tokens)
+                and _is_command_word(tokens[look])
+                and assign.group(1) in values
+                and not _is_protected_program(prefix_value.strip("\"'"))
+            ):
+                out.append(token)
+                continue
+            subshell_scoped = look < len(tokens) and tokens[look] in _SUBSHELL_OPERATORS
         # ``NAME+=tail`` APPENDS, and the pattern above cannot match it at all (``+`` is
         # not a name character), so an appended PROGRAM word was invisible here: `F=fi;
         # F+=nd; $F <fenced> -exec cat {} +` ran a `find` this resolver never saw, while
@@ -3176,6 +3249,46 @@ def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
             values[name] = values.get(name, "") + piece
             out.append(token)
             continue
+        if (
+            values
+            and "$" in token
+            and _CONTROL_OPERATOR_RE.search(token)
+            and (assign or _SHLEX_WHITESPACE_RE.search(token))
+        ):
+            # A whole quoted SCRIPT (see :func:`_split_glued_operators`): this frame's
+            # binding is expanded into it only UNTIL the script assigns the name itself,
+            # segment by segment; a guarded or subshell-scoped assignment does not.
+            inner: set[str] = set()
+            parts = _CONTROL_OPERATOR_SPLIT_RE.split(token)
+            for pos, segment in enumerate(parts):
+                if _CONTROL_OPERATOR_RE.fullmatch(segment):
+                    continue
+
+                def outer(name: str, whole: str) -> str:
+                    return whole if name in inner else values.get(name, whole)
+
+                segment = _PARAM_TRANSFORM_RE.sub(lambda m: outer(m.group(1), m.group(0)), segment)
+                segment = _INDIRECT_VAR_USE_RE.sub(
+                    lambda m: outer(values.get(m.group(1), ""), m.group(0)), segment
+                )
+                segment = _VAR_USE_RE.sub(
+                    lambda m: outer(m.group(1) or m.group(2), m.group(0)), segment
+                )
+                parts[pos] = segment
+                # A name is the script's own when ITS value is protected or the run
+                # persists; a protected sibling (``x=echo y=<cli> true``) is not enough.
+                guarded = pos > 0 and parts[pos - 1].strip() in _CONDITIONAL_OPERATORS
+                subshell = pos + 1 < len(parts) and parts[pos + 1].strip() in _SUBSHELL_OPERATORS
+                persists = (
+                    not guarded and not subshell and not _is_command_scoped_assignment(segment)
+                )
+                inner.update(
+                    name
+                    for name, value in _leading_assignments(segment.lstrip())
+                    if persists or _is_protected_program(value)
+                )
+            out.append("".join(parts))
+            continue
         if assign and values and "$" in (assign.group(2) or ""):
             # A new value may be built FROM a variable already tracked
             # (``x=p; x=${x}kill``).  Expanding before classifying is what makes the
@@ -3211,6 +3324,16 @@ def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
             # value: ``shlex`` splits on whitespace only, so ``X=name;`` arrives
             # with the operator attached.
             value = assign.group(2).strip("\"'").rstrip(";&|")
+            # A guarded or subshell-scoped reassignment (``X=<cli> || X=echo``) may not
+            # run, so it does not hide a PROTECTED prior value.
+            prior = values.get(assign.group(1))
+            if (
+                value
+                and prior is not None
+                and ((idx > 0 and tokens[idx - 1] in _CONDITIONAL_OPERATORS) or subshell_scoped)
+                and _is_protected_program(prior)
+            ):
+                value = prior
             if value:
                 values[assign.group(1)] = value
             out.append(token)
@@ -3234,6 +3357,17 @@ def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
             token = _VAR_USE_RE.sub(
                 lambda m: values.get(m.group(1) or m.group(2), m.group(0)), token
             )
+            # A use in COMMAND position of a value holding whitespace is word-split
+            # (``x="<cli> -v"; $x <verb>`` runs ``<cli>``); an argument stays one word.
+            prev = tokens[idx - 1] if idx else ";"
+            if (
+                token != tokens[idx]
+                and _SHLEX_WHITESPACE_RE.search(token)
+                and not _SHLEX_WHITESPACE_RE.search(tokens[idx])
+                and (_CONTROL_OPERATOR_RE.fullmatch(prev[-1:]) or _LOCAL_ASSIGN_RE.match(prev))
+            ):
+                out.extend(token.split())
+                continue
         out.append(token)
     return out
 
@@ -3581,7 +3715,9 @@ def _shell_payload_walk(text_lower: str) -> "list[tuple[str, list[str]]]":
             # structural, not a cap: a payload is carried inside one token of its
             # parent, so it is strictly shorter than the parent's source text.
             payload = _decode_printf_escapes(payload)
-            if len(payload) >= parent_len or payload in seen:
+            # An ``eval`` join spans the whole token AND its pieces: at most twice the parent.
+            bound = 2 * parent_len if payload in joined_here else parent_len
+            if len(payload) >= bound or payload in seen:
                 continue
             seen.add(payload)
             pending.append((payload, len(source), payload not in joined_here))

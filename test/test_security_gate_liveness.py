@@ -56,9 +56,11 @@ def _url_payload_command(n: int) -> str:
 #: budget is that size plus room for the machinery, plus the redaction record,
 #: credential-source and allowed-host modules, plus the resolver child script
 #: (``_child_realpath.py``, ~190 lines) that lives beside the resolver it serves
-#: rather than in the pool package. It is a bound on total volume:
+#: rather than in the pool package, plus the assignment resolver's command-boundary
+#: and bounded ``eval``-join rules in ``shell_normalizer.py`` (~170 lines, the same
+#: kind of raise the resolver child script made). It is a bound on total volume:
 #: relocating a declaration between submodules moves nothing across it.
-_PACKAGE_LINE_BUDGET = 27_200
+_PACKAGE_LINE_BUDGET = 27_400
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
