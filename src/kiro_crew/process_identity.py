@@ -10,9 +10,10 @@ handle names is still standing, and hand the handle to
 before and after the child walk, signals the group, sweeps the recorded children,
 and RETURNS what stopped the kill instead of swallowing it.
 
-Used by the cron reaper and ``cancel()`` (:mod:`kiro_crew.cron`): one caller, and
-the module boundary is what makes a rename or a rule change land in that caller
-through its imports rather than through a copy.
+Used by the cron reaper and ``cancel()`` (:mod:`kiro_crew.cron`) and by the
+sub-agent manager's two teardown paths (:mod:`kiro_crew.subagent`): two callers
+of one definition, and the module boundary is what makes a rename or a rule
+change land in both through their imports rather than through a copy.
 
 The tree. A ``kiro-cli`` process is spawned with ``start_new_session=True`` on
 POSIX, so its pid is also its process-group id and every descendant that did not
@@ -70,9 +71,10 @@ import asyncio
 import logging
 import os
 import sys
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterable
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass, field, replace
+from typing import Any, cast
 
 from kiro_crew import platform_compat
 from kiro_crew.executors import subprocess_executor
@@ -697,8 +699,13 @@ _SWEEP_SETTLE_READS = 6
 _SWEEP_SETTLE_SECS = 0.05
 
 
-def _joined(*failures: str | None) -> str | None:
-    """The named failures, joined for one record; None when there is none."""
+def join_failures(*failures: str | None) -> str | None:
+    """The named failures, joined with ``; `` for one record; None when there is none.
+
+    The kill's own parts (the leader, the sweep, a gone leader's group) and the
+    supervisors' (the kill's report, the pid-less popped session, a start past
+    its spawn door) are all parts of ONE record, joined here and nowhere else.
+    """
     named = [failure for failure in failures if failure]
     return "; ".join(named) if named else None
 
@@ -855,7 +862,7 @@ async def kill_verified_process(
             # reachable at all).
             logger.debug("%s: PID %d already dead for %s", who, pid, key)
             failure = await _finish_gone_leader(handle, who=who, key=key)
-            return _joined(
+            return join_failures(
                 failure,
                 await _sweep_children(
                     child_pids, who=who, key=key, kill_escaped_children=_kill_escaped_children
@@ -874,7 +881,7 @@ async def kill_verified_process(
                 handle.start_id,
                 actual_start,
             )
-            return _joined(
+            return join_failures(
                 f"pid {pid} is alive but could not be verified as this run's; not signalled",
                 await _sweep_children(
                     child_pids, who=who, key=key, kill_escaped_children=_kill_escaped_children
@@ -886,7 +893,7 @@ async def kill_verified_process(
             # again); only the recorded children are swept.
             logger.warning("%s: PID %d recycled for %s, not signalling it", who, pid, key)
             failure = await _finish_gone_leader(handle, who=who, key=key)
-            return _joined(
+            return join_failures(
                 failure,
                 await _sweep_children(
                     child_pids, who=who, key=key, kill_escaped_children=_kill_escaped_children
@@ -940,7 +947,7 @@ async def kill_verified_process(
                     f"{len(unattributed)} child(ren) found during the walk (pid {named}) could not "
                     "be attributed to the run after its leader exited; not signalled"
                 )
-            return _joined(
+            return join_failures(
                 failure,
                 await _sweep_children(
                     dict(handle.child_pids),
@@ -987,7 +994,7 @@ async def kill_verified_process(
                 failure = failure_name(exc)
         if failure is not None:
             logger.error("%s: SIGKILL of pid %d failed for %s: %s", who, pid, key, failure)
-        return _joined(
+        return join_failures(
             failure,
             await _sweep_children(
                 child_pids, who=who, key=key, kill_escaped_children=_kill_escaped_children
@@ -999,3 +1006,202 @@ async def kill_verified_process(
         # happen as intended, and the caller's record has to say so.
         logger.exception("%s: SIGKILL failed for %s", who, key)
         return failure_name(exc)
+
+
+# ── The supervisors' teardown glue, one definition for both ──
+#
+# The cron reaper (``kiro_crew.cron``) and the sub-agent manager
+# (``kiro_crew.subagent``) run the same reset-then-kill pass: snapshot the key's
+# processes, reset under a scope that captures the exact session the reset pops,
+# kill what the reset could not stop, and name what no pass could answer. The
+# pieces below are that pass's glue -- pure, or reading the session manager only
+# through ``getattr`` so a test double without the facility is simply not fenced
+# or captured -- kept HERE so neither supervisor carries a copy the other can
+# drift from. What stays per supervisor is one line each: the kill of a single
+# handle (its log prefix and its tests' seam) and the record the failure lands in.
+
+#: The failure a reset that popped a session with no recorded pid is.
+POPPED_WITHOUT_HANDLE = "the session the reset popped had no process handle yet; not signalled"
+
+
+def absorb_handle(kept: ProcessHandle, newer: ProcessHandle) -> ProcessHandle:
+    """``kept`` with ``newer``'s evidence folded in -- both name ONE incarnation.
+
+    Identity is ``(pid, start id)``; the group id and the child records are
+    evidence about that incarnation, read at different moments, and
+    ``compare=False``, so two equal handles can carry different evidence: a
+    snapshot taken before the reset names the children the client had recorded
+    THEN, while the same session's handle read at the pop names the ones it
+    recorded since. Keeping whichever handle arrived first dropped the later
+    reading -- a recorded child that escaped the group was never swept, never
+    named as standing, and the record said ``reaped`` over it. The union keeps
+    every child record (a pid recorded twice takes the later reading) and the
+    first group id read while the leader's identity held. The object is kept
+    when ``newer`` adds nothing -- every child RECORD it carries, not merely
+    every child pid, is already ``kept``'s: a child pid the kernel reused
+    between the two readings comes back under another record, and that record
+    is the newer identity the merge must carry -- so a single-source handle
+    keeps its identity.
+    """
+    if newer.child_pids.items() <= kept.child_pids.items() and (
+        kept.pgid is not None or newer.pgid is None
+    ):
+        return kept
+    return replace(
+        kept,
+        pgid=kept.pgid if kept.pgid is not None else newer.pgid,
+        child_pids={**kept.child_pids, **newer.child_pids},
+    )
+
+
+def add_handle(handles: list[ProcessHandle], candidate: ProcessHandle) -> None:
+    """Add ``candidate`` to ``handles``: one entry per incarnation, evidence merged.
+
+    The entry equal to ``candidate`` -- same pid AND start id -- absorbs its
+    evidence (:func:`absorb_handle`) in place; a candidate no entry equals is
+    appended. The same pid under another start id is another process and gets
+    its own entry. A pid is never the key.
+    """
+    for index, kept in enumerate(handles):
+        if kept == candidate:
+            handles[index] = absorb_handle(kept, candidate)
+            return
+    handles.append(candidate)
+
+
+def kill_set(
+    handles: list[ProcessHandle],
+    popped: list[tuple[Any, ProcessHandle]],
+    *,
+    seen: Iterable[Any] = (),
+) -> tuple[list[ProcessHandle], str | None]:
+    """The snapshot handles plus the popped session's, one per process incarnation, and the failure a pid-less pop is.
+
+    Keyed by the handle -- ``(pid, start id)`` -- never by the pid: a popped
+    session whose pid is a snapshot handle's pid under another start id is a
+    different process (the number was recycled) and is killed on its own
+    handle; one whose handle EQUALS a snapshot handle is the same incarnation
+    read later, and its child records and group join that entry
+    (:func:`add_handle`) rather than being dropped with it. A popped session
+    with no recorded pid that the snapshot did NOT see (``seen``: the session
+    objects the snapshot read, compared by identity) is a session whose process
+    the run cannot name -- a cold start that registered after the snapshot and
+    has not spawned yet -- and nothing can verify what it leaves behind: a
+    named kill failure (:data:`POPPED_WITHOUT_HANDLE`), never reaped. One the
+    snapshot DID see names no process now as it named none then -- a provider
+    that runs no process of its own, a client already reset -- and is nothing
+    to kill, not a failure: calling it one audited every such run's ordinary
+    teardown as ``failed``.
+    """
+    targets = list(handles)
+    missing: str | None = None
+    known = list(seen)
+    for session, handle in popped:
+        if handle.pid is None:
+            if not any(session is candidate for candidate in known):
+                missing = POPPED_WITHOUT_HANDLE
+        else:
+            add_handle(targets, handle)
+    return targets, missing
+
+
+def teardown_capture(
+    sessions: Any, session_key: str
+) -> tuple[dict[str, Any], list[tuple[Any, ProcessHandle]]]:
+    """The reset's scope, as the keyword arguments to hand ``reset``, and the list its pop fills.
+
+    A supervisor's pre-reset snapshot is keyed by name: a cold start can register
+    a new session under the key between that snapshot and the reset's pop, and
+    it is THAT session the reset then pops and hangs on -- unnamed by the
+    snapshot, so a fallback fed the snapshot alone would find nothing to kill
+    and the run would be recorded reaped over a live process. The scope's
+    ``on_pop`` runs in the same registry-lock hold as the pop
+    (``SessionManager.teardown_scope``), so the handle is read off the popped
+    session atomically with the pop, before any await could lose it. Returns
+    ``{"scope": scope}`` to splat into ``reset`` and the list the hook fills
+    with ``(session, handle)`` pairs (at most one: a reset pops at most one
+    session). A session manager without scopes gets the plain call -- ``{}`` --
+    and the snapshot alone then applies. A scope is a hold on the manager's
+    torn-down table (``tearing_down(key)``, the list the snapshot reads), so a
+    manager without that table has no scopes to hand out, whatever its
+    ``teardown_scope`` attribute answers: a double that answers every attribute
+    (a ``MagicMock``) produces a scope no reset fills, and its ``reset`` may not
+    take the keyword at all -- handing it one captured nothing and failed the
+    reset it was meant to observe. The table's shape is the same check the
+    snapshot applies to its entries.
+    """
+    popped: list[tuple[Any, ProcessHandle]] = []
+    factory = getattr(sessions, "teardown_scope", None)
+    table = getattr(sessions, "tearing_down", None)
+    if not callable(factory) or not callable(table) or not isinstance(table(session_key), list):
+        return {}, popped
+    scope = factory(on_pop=lambda session: popped.append((session, process_handle_of(session))))
+    return {"scope": scope}, popped
+
+
+async def kill_each(
+    handles: list[ProcessHandle],
+    kill: Callable[[ProcessHandle | None], Awaitable[str | None]],
+) -> str | None:
+    """Kill every handle's process through ``kill``, one after another; the failures joined, or None once all are signalled or gone.
+
+    ``kill`` is the supervisor's single-handle kill (its ``_sigkill_session``:
+    the log prefix and the seam its tests drive), which never raises and returns
+    what stopped it. No handle at all is one ``kill(None)``: nothing to kill,
+    logged by the supervisor as such, not a failure.
+    """
+    if not handles:
+        return await kill(None)
+    failures = [await kill(handle) for handle in handles]
+    return join_failures(*failures)
+
+
+def ending_fence(sessions: Any, session_key: str) -> AbstractContextManager[None]:
+    """The key's ending fence to hold from before the first pass through the record, or a no-op for a manager without one.
+
+    ``SessionManager.ending_key`` raises the fence synchronously on entry
+    (before the holder's first await) and lifts it however the block ends. A
+    supervisor opens one per key of the run it ends, around the kill passes AND
+    the terminal record and audit that follow them, so a claim or a cold start
+    under the key meets a key that is either being ended -- held at the door --
+    or recorded, never one that is neither. A session manager without it (a
+    test double) is not fenced: the passes and their post-pass read are then
+    the whole answer.
+    """
+    fence = getattr(sessions, "ending_key", None)
+    if not callable(fence):
+        return nullcontext()
+    return cast(AbstractContextManager[None], fence(session_key))
+
+
+def spawn_in_flight(sessions: Any, session_key: str) -> str | None:
+    """The named failure for a cold start past its spawn door under the fenced key, or None.
+
+    Read after the passes, fence still up, through
+    ``SessionManager._spawn_in_flight``: a reservation the manager holds under
+    the key predates the fence (a caller that meets the fence is held at the
+    door and holds none), but a reservation is not yet a process -- a claim
+    waiting on the busy session's turn semaphore, or a cold start still ahead
+    of its pre-spawn fence check, has started nothing and is held or refused
+    before it does, and naming it would record a kill failure over a run whose
+    processes the passes did answer. What is named is a start past that door --
+    inside ``provider.start()``, nothing published that any snapshot could see
+    -- whose registration is refused and whose provider is hard-killed when the
+    start returns (its call then allocates again, after the lift), and a start
+    that already returned during the passes and was refused there: its provider
+    was hard-killed by the allocation path, a kill dispatched off the loop whose
+    outcome this record cannot read back. Nothing here signals either, and the
+    record must not say the run's processes were answered while one is being
+    started or was only just refused. The manager's reason phrase is carried
+    into the record. A manager without the read (a test double) reports
+    nothing: only the facade's real answer counts, a double's default return is
+    not a reason.
+    """
+    probe = getattr(sessions, "_spawn_in_flight", None)
+    reason = probe(session_key) if callable(probe) else None
+    if not isinstance(reason, str) or not reason:
+        return None
+    return (
+        "a cold start under the key was past its spawn door when the run was ended "
+        f"(fenced: {reason}); not signalled"
+    )
