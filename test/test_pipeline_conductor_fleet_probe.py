@@ -2118,3 +2118,232 @@ def test_no_parametrize_argument_reads_the_clock() -> None:
                         f"line {inner.lineno}: {ast.unparse(inner)} is evaluated at "
                         f"collection time in the parametrize list of {node.name}"
                     )
+
+
+# Every way this repo's runner is spelled on a command line, as an argv PREFIX. The
+# pin below is enumerated over this table crossed with the cap spellings, not over a
+# list of command lines: the property under test is "any invocation form, bounded or
+# not", so a form added here is covered in both directions by construction and a fix
+# that only repairs the spelling someone happened to write down cannot pass.
+RUNNER_FORMS = {
+    "bare": ["pytest"],
+    "module": ["python3", "-m", "pytest"],
+    "versioned-interpreter-module": ["python3.12", "-m", "pytest"],
+    "venv-abspath": ["/wt/.venv/bin/pytest"],
+    "py.test": ["py.test"],
+    "alias": ["pytest-3"],
+    "alias-minor": ["pytest-3.12"],
+    "alias-abspath": ["/usr/bin/pytest-3"],
+    "alias-py.test": ["py.test-3"],
+    "alias-behind-launcher": ["timeout", "900", "pytest-3"],
+    "alias-behind-launcher-with-own-flag": ["nice", "-n", "10", "pytest-3"],
+}
+
+# Every spelling of a numeric worker cap. `-n auto` is deliberately absent: the rule's
+# documented sense is that a count nobody chose is the reportable one, and `auto` is
+# bounded by the rootdir hook rather than by the caller.
+CAP_SPELLINGS = {
+    "glued-zero": ["-n0"],
+    "glued-four": ["-n4"],
+    "split": ["-n", "0"],
+    "equals": ["-n=0"],
+    "long-equals": ["--numprocesses=0"],
+    "long-split": ["--numprocesses", "2"],
+}
+
+# Tokens that appear AFTER the cap and name the runner without being an invocation of
+# it. Each one defeated the cap lookahead, which only ever looked forward from the
+# token it matched: the bound sits earlier in the line, so from the second occurrence
+# it is invisible and a bounded run was reported.
+TRAILING_RUNNER_SHAPED_ARGS = {
+    "junitxml": ["--junitxml=build/pytest.xml"],
+    "log-file": ["--log-file", "/var/tmp/pytest-run.log"],
+    "basetemp": ["--basetemp", "/var/tmp/pytest-of-ci"],
+    "rootdir": ["--rootdir", "/wt/pytest-sandbox"],
+}
+
+
+def banned_pids(mod, root: Path, fleet: Path) -> set[str]:
+    """The pids ``_host_lines`` emitted a ``BANNED`` line for."""
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    return {line.split()[1].split("=", 1)[1] for line in lines if line.startswith("BANNED pid=")}
+
+
+def fleet_pid(root: Path, fleet: Path, pid: str, argv: list[str]) -> None:
+    """A fleet-owned pid whose ``cmdline`` carries the real procfs byte shape.
+
+    ``proc_pid`` writes ``"\\0".join(argv) + "\\0"`` -- arguments NUL-separated and one
+    NUL terminator, which is what the kernel produces. The scan is driven through that
+    byte path on purpose: a pre-joined string handed straight to the rules cannot show
+    that the split, the dropped terminator and the re-join preserved the argument
+    boundaries the argv-side checks read.
+    """
+    entry = proc_pid(root, pid, argv, starttime=500)
+    (entry / "cwd").symlink_to(fleet)
+
+
+@pytest.mark.parametrize("form", sorted(RUNNER_FORMS))
+@pytest.mark.parametrize("cap", sorted(CAP_SPELLINGS))
+def test_every_runner_form_stays_quiet_when_it_declares_a_cap(
+    mod, tmp_path, monkeypatch, form, cap
+):
+    """A run that CHOSE its worker count is never reported, however it is spelled.
+
+    This is the direction that destroys work: the documented answer to a fleet-owned
+    ``BANNED`` line is to stop that worker and discard the turn it was in, so a false
+    row here costs real work rather than signal.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    argv = [*RUNNER_FORMS[form], *CAP_SPELLINGS[cap], "test/test_x.py"]
+    fleet_pid(root, fleet, "401", argv)
+    assert banned_pids(mod, root, fleet) == set(), f"{form} + {cap} was reported while capped"
+
+
+@pytest.mark.parametrize("form", sorted(RUNNER_FORMS))
+def test_every_runner_form_is_reported_when_it_declares_no_cap(mod, tmp_path, monkeypatch, form):
+    """A run whose worker count nobody chose is reported, however it is spelled.
+
+    The other direction, and the one the probe exists for. A form missing here is an
+    unbounded run the conductor's banned counter cannot see, so intake keeps admitting
+    work while the host is being consumed.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "402", [*RUNNER_FORMS[form], "test/"])
+    assert banned_pids(mod, root, fleet) == {"402"}, f"{form} went unreported while uncapped"
+
+
+@pytest.mark.parametrize("form", sorted(RUNNER_FORMS))
+@pytest.mark.parametrize("trailing", sorted(TRAILING_RUNNER_SHAPED_ARGS))
+def test_a_capped_run_stays_quiet_when_a_later_argument_names_the_runner(
+    mod, tmp_path, monkeypatch, form, trailing
+):
+    """A cap is still a cap when a LATER argument spells the runner's name.
+
+    ``--junitxml=build/pytest.xml`` and ``--log-file /var/tmp/pytest-run.log`` are
+    ordinary arguments of a bounded run. A forward-only cap lookahead re-tries at that
+    second occurrence, where the bound is behind it and cannot be seen, and reports the
+    run -- measured as two deterministic false rows on a live fleet.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    argv = [
+        *RUNNER_FORMS[form],
+        "-n0",
+        "test/test_x.py",
+        *TRAILING_RUNNER_SHAPED_ARGS[trailing],
+    ]
+    fleet_pid(root, fleet, "403", argv)
+    assert banned_pids(mod, root, fleet) == set(), (
+        f"{form} was reported while capped because a later argument named the runner "
+        f"({trailing})"
+    )
+
+
+# The alias in a position that is NOT the program: a directory component, a package
+# name, a log filename, an argument to some other command. These are what a joined-line
+# rule cannot separate from an invocation, and the whole reason the alias is detected on
+# the argv side instead -- so they are the control for that choice, not a side note.
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["ls", "/var/tmp/pytest-of-ci/pytest-3"], id="tmpdir-as-final-token"),
+        pytest.param(["pip", "install", "pytest-3"], id="package-name"),
+        pytest.param(["pip", "install", "pytest-3.12"], id="versioned-package-name"),
+        pytest.param(["cat", "pytest-3.log"], id="log-filename"),
+        pytest.param(["cat", "py.test.log"], id="py.test-log-filename"),
+        pytest.param(["ls", "/var/tmp/pytest-of-ci/py.test"], id="py.test-as-path"),
+        pytest.param(
+            ["grep", "-rn", "FAILED", "/var/tmp/pytest-of-ci/pytest-3/results.log"],
+            id="grep-target",
+        ),
+        pytest.param(["tail", "-2", "/var/tmp/pytest-of-ci/pytest-3/x.log"], id="tail-target"),
+        pytest.param(["rm", "-rf", "/var/tmp/pytest-of-ci/pytest-3"], id="cleanup-target"),
+    ],
+)
+def test_an_alias_that_is_not_the_program_is_never_reported(mod, tmp_path, monkeypatch, argv):
+    """The alias as data, under a command that is not a test run.
+
+    Each one is disqualified by its own FIRST token rather than by a pattern that has to
+    guess: the command already had a program before the alias appeared, so the alias is
+    an argument. Reporting these is what adding the alias to the joined-line rule would
+    have cost.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "404", argv)
+    assert banned_pids(mod, root, fleet) == set()
+
+
+def test_the_argv_row_names_the_argv_path_rather_than_a_rule_that_did_not_fire(
+    mod, tmp_path, monkeypatch
+):
+    """``rule=`` on an alias row names the argv path, not the pytest pattern.
+
+    The pattern genuinely did not match -- the alias is invisible to it by design --
+    so printing it would send a reader to a lookahead that is working correctly.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "405", ["pytest-3", "test/"])
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert len(lines) == 1
+    assert f"rule={mod.ARGV_RUNNER_RULE_LABEL}" in lines[0]
+    assert mod.ARGV_RUNNER_RULE_LABEL not in mod.DEFAULT_BANNED_RES
+    # The label has to survive being read as one whitespace-separated field on a line
+    # the conductor parses, so it carries no space and nothing that reopens a field.
+    assert not any(ch in mod.ARGV_RUNNER_RULE_LABEL for ch in " \t\"'`")
+
+
+def test_an_alias_run_reports_its_scope_instead_of_declining(mod, tmp_path, monkeypatch):
+    """``scope=`` answers for an alias run too.
+
+    Scope keys on the runner's own token standing alone in argv. While the alias was
+    absent from that set, every alias row printed ``scope=unknown`` -- the readout that
+    says the probe could not tell a whole-suite run from a one-file one, on exactly the
+    rows where it matters.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "406", ["pytest-3", "test/test_x.py"])
+    fleet_pid(root, fleet, "407", ["pytest-3", "--cov", "src/kiro_crew"])
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    scopes = {
+        line.split()[1].split("=", 1)[1]: line.split("scope=", 1)[1].split()[0] for line in lines
+    }
+    assert scopes == {"406": "paths", "407": "suite"}
+
+
+@pytest.mark.parametrize(
+    ("base", "is_alias"),
+    [
+        ("pytest-3", True),
+        ("pytest-3.12", True),
+        ("pytest-3.12.1", True),
+        ("py.test-3", True),
+        ("pytest-3.exe", True),
+        ("pytest", False),
+        ("pytest-cov", False),
+        ("pytest-3.log", False),
+        ("pytest-of-ci", False),
+        ("pytest3", False),
+        ("pytest-", False),
+        ("mypytest-3", False),
+        ("pytest-3-extra", False),
+    ],
+)
+def test_the_alias_pattern_admits_a_version_and_nothing_else(mod, base, is_alias):
+    """The alias shape is a version suffix, not any suffix.
+
+    ``pytest-cov`` is a plugin, ``pytest-3.log`` is a file and ``pytest-of-ci`` is a
+    tmpdir. All three are alias-SHAPED under a loose pattern, and the argv-position gate
+    would not save a token that reached it at index 0.
+    """
+    assert bool(mod._ALIAS_RUNNER_BASE_RE.match(base)) is is_alias
