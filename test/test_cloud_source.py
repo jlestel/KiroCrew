@@ -2,12 +2,39 @@
 
 from __future__ import annotations
 
+import os
+import stat
+import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
 
+from conftest import make_dir_link
 from kiro_crew.cloud import aws, source
+
+
+class _FakeGroup:
+    """A ``grp`` record with a chosen member list, for the group-privacy pins.
+
+    Named tuples from ``grp`` cannot be constructed with an arbitrary member list
+    without also supplying a real gid that exists on the host, and the point of
+    these pins is to state the membership rather than inherit the host's.
+    """
+
+    def __init__(self, name: str, members: list[str]) -> None:
+        self.gr_name = name
+        self.gr_gid = -1
+        self.gr_mem = members
+
+
+class _FakeUser:
+    """A ``pwd`` record, for asserting a passwd enumeration that omits this account."""
+
+    def __init__(self, name: str, gid: int) -> None:
+        self.pw_name = name
+        self.pw_gid = gid
 
 
 class TestRepoRoot:
@@ -293,27 +320,921 @@ class TestBuildTarball:
         # the ls-files tar path so uncommitted edits are shipped.
         monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: True)
 
-        def _archive_must_not_run(root):  # pragma: no cover - must not be called
+        def _archive_must_not_run(root, **k):  # pragma: no cover - must not be called
             raise AssertionError("git archive must be skipped for a dirty tree")
 
         monkeypatch.setattr(source, "_use_git_archive", _archive_must_not_run)
         (tmp_path / "app.py").write_text("x=2  # edited, uncommitted\n")
         monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
-        tarball = source.build_source_tarball(tmp_path)
+        staged = source.build_source_tarball(tmp_path)
         try:
-            with tarfile.open(tarball) as tf:
+            with tarfile.open(staged.path) as tf:
                 data = tf.extractfile("app.py").read().decode()
             assert "edited, uncommitted" in data  # working-tree content, not HEAD
         finally:
-            tarball.unlink()
+            staged.path.unlink()
 
     def test_clean_tree_prefers_git_archive(self, monkeypatch, tmp_path):
         # The fast path (git archive) is still used when the tree is clean.
         monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: False)
         sentinel = tmp_path / "archive.tar.gz"
         sentinel.write_bytes(b"x")
-        monkeypatch.setattr(source, "_use_git_archive", lambda root: sentinel)
-        assert source.build_source_tarball(tmp_path) == sentinel
+        monkeypatch.setattr(source, "_use_git_archive", lambda root, **k: sentinel)
+        assert source.build_source_tarball(tmp_path).path == sentinel
+
+
+class TestTarballStagingDirectory:
+    """Where the source tarball is built, not what goes into it.
+
+    ``upload_source`` passes the tarball to ``s3api put-object`` as
+    ``--body <path>``, so the AWS CLI re-opens it by name after this process has
+    closed it. Every builder must therefore leave the file somewhere the
+    launcher owns for the length of that window -- never in the process temp
+    root, whose location ``tempfile`` takes from the environment and which
+    carries no promise of being owner-only.
+    """
+
+    @staticmethod
+    def _pin_home_and_temp_root(monkeypatch, tmp_path) -> tuple[Path, Path]:
+        """Point the data home and the process temp root at two separate dirs.
+
+        Separating them is what makes the assertions discriminating: a builder
+        that honours the temp root and one that resolves the data home would
+        otherwise write to the same place under pytest's ``tmp_path``.
+        """
+        home = tmp_path / "data-home"
+        home.mkdir(mode=0o700)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        return home, temp_root
+
+    @staticmethod
+    def _tiny_targz(path: Path) -> Path:
+        """A real (tiny) gzip tarball, so size and open checks see valid bytes."""
+        member = path.parent / "member.txt"
+        member.write_text("x\n")
+        with tarfile.open(path, "w:gz") as tf:
+            tf.add(member, arcname="member.txt")
+        return path
+
+    def _capture_staged_names(self, monkeypatch) -> list[str]:
+        """Every path ``NamedTemporaryFile`` hands out, in call order."""
+        created: list[str] = []
+        real_ntf = tempfile.NamedTemporaryFile
+
+        def _capturing(*a, **kw):
+            fh = real_ntf(*a, **kw)
+            created.append(fh.name)
+            return fh
+
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", _capturing)
+        return created
+
+    def test_the_tarfile_fallback_stages_under_the_data_home(self, monkeypatch, tmp_path):
+        home, temp_root = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+
+        tarball = source._tar_fallback(repo)
+        try:
+            assert tarball.parent == home / source._STAGING_DIR_LEAF
+            # The process temp root must not have been used at all.
+            assert list(temp_root.iterdir()) == []
+        finally:
+            tarball.unlink(missing_ok=True)
+
+    def test_the_git_archive_path_stages_both_tarballs_under_the_data_home(
+        self, monkeypatch, tmp_path
+    ):
+        # `git archive` writes one file and `_refilter_archive` rewrites it into a
+        # second: BOTH are staged, so capture every name rather than only the
+        # path handed back.
+        home, temp_root = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        payload = self._tiny_targz(tmp_path / "payload.tar.gz")
+        real_run = subprocess.run
+
+        def _fake_run(argv, **kw):
+            if argv[:1] == ["git"] and "archive" in argv:
+                Path(argv[argv.index("-o") + 1]).write_bytes(payload.read_bytes())
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        staged = self._capture_staged_names(monkeypatch)
+
+        tarball = source._use_git_archive(tmp_path / "repo")
+        try:
+            assert tarball is not None, "the stubbed git archive should have succeeded"
+            expected_parent = home / source._STAGING_DIR_LEAF
+            assert len(staged) == 2, f"expected an archive and a re-filtered copy, got {staged}"
+            assert [Path(p).parent for p in staged] == [expected_parent, expected_parent]
+            assert tarball.parent == expected_parent
+            assert list(temp_root.iterdir()) == []
+        finally:
+            if tarball is not None:
+                tarball.unlink(missing_ok=True)
+
+    def test_the_refilter_stages_under_the_data_home(self, monkeypatch, tmp_path):
+        home, temp_root = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        archive = self._tiny_targz(tmp_path / "archive.tar.gz")
+
+        filtered = source._refilter_archive(archive)
+        try:
+            assert filtered.parent == home / source._STAGING_DIR_LEAF
+            assert list(temp_root.iterdir()) == []
+        finally:
+            filtered.unlink(missing_ok=True)
+
+    def test_the_staging_directory_is_owner_only(self, monkeypatch, tmp_path):
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        staging = source._staging_dir()
+        assert staging == home / source._STAGING_DIR_LEAF
+        assert staging.is_dir()
+        if os.name == "posix":
+            assert stat.S_IMODE(staging.stat().st_mode) == 0o700
+
+    def test_a_pre_existing_staging_directory_is_re_restricted(self, monkeypatch, tmp_path):
+        # A leaf left group- or world-readable by an earlier umask must not be
+        # accepted as-is: the tarball is the box's whole source tree.
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        loose = home / source._STAGING_DIR_LEAF
+        loose.mkdir()
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        # The loose mode IS the fixture: the assertion below is that _staging_dir
+        # tightens a leaf an earlier umask left group- and world-readable. Nothing
+        # is published from this temp directory.
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(loose, 0o755)  # noqa: S103 - the loose mode is the fixture. lockdown-ok.
+        assert stat.S_IMODE(source._staging_dir().stat().st_mode) == 0o700
+
+    def test_a_lockdown_that_cannot_be_applied_refuses_the_build(self, monkeypatch, tmp_path):
+        # restrict_dir_to_owner is fail-loud by contract. A mount that rejects the
+        # change must stop the build, not warn and stage the tarball anyway.
+        self._pin_home_and_temp_root(monkeypatch, tmp_path)
+
+        def _refuse(path):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(source.platform_compat, "restrict_dir_to_owner", _refuse)
+        with pytest.raises(aws.AWSError, match="owner-only"):
+            source._staging_dir()
+
+    def test_a_lockdown_that_silently_does_not_take_refuses_the_build(self, monkeypatch, tmp_path):
+        # A filesystem with a fixed permission mask accepts the chmod and keeps
+        # its own mode, so a successful call is not evidence of the mode. The
+        # read-back is what closes that, and it is the whole point of this pin.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        leaf = home / source._STAGING_DIR_LEAF
+        leaf.mkdir()
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(
+            leaf, 0o757
+        )  # noqa: S103 - simulating the mask a FAT/CIFS mount keeps. lockdown-ok.
+        monkeypatch.setattr(source.platform_compat, "restrict_dir_to_owner", lambda path: None)
+        with pytest.raises(aws.AWSError, match="reachable by other accounts"):
+            source._staging_dir()
+
+    def test_a_link_planted_at_the_staging_leaf_is_refused(self, monkeypatch, tmp_path):
+        # A link at the leaf would put every tarball back outside the fence, and
+        # no per-file check can see that -- fail closed instead of building.
+        #
+        # conftest.make_dir_link, not symlink_to: a directory symlink needs
+        # SeCreateSymbolicLinkPrivilege, which an unelevated Windows shell lacks,
+        # so a symlink here would skip on exactly the host whose junction branch of
+        # is_link_or_junction this check depends on.
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        elsewhere = tmp_path / "attacker-controlled"
+        elsewhere.mkdir()
+        make_dir_link(home / source._STAGING_DIR_LEAF, elsewhere)
+        with pytest.raises(aws.AWSError, match="staging directory"):
+            source._staging_dir()
+
+    def test_a_linked_ancestor_above_the_data_home_is_followed(self, monkeypatch, tmp_path):
+        # A link ABOVE the data home is the operator's own layout -- a symlinked
+        # $HOME, a dotfile-managed ~/.kiro -- and the product documents both as
+        # supported (atomic_write._link_trust_anchor, workflows.md). Refusing it
+        # would refuse a launch on the DEFAULT data-home path, which is lexical
+        # (Path.home() / ".kiro" / "crew"), so it is where such a link arrives.
+        #
+        # Driven through config_dir rather than KIROCREW_HOME: the override arrives
+        # already resolved, so a link is unobservable on that path.
+        #
+        # What still protects the build is that _first_replaceable walks the
+        # RESOLVED chain, so the ownership and mode tests land on the directories
+        # that really hold the tarball. Asserting the resolved location is what
+        # makes this discriminating: a staging dir merely created at the lexical
+        # name would pass a bare "no exception" check.
+        real = tmp_path / "real-parent"
+        (real / "data-home").mkdir(mode=0o700, parents=True)
+        link = tmp_path / "linked-parent"
+        make_dir_link(link, real)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        monkeypatch.setattr(source, "config_dir", lambda: link / "data-home")
+
+        staging = source._staging_dir()
+
+        assert staging == link / "data-home" / source._STAGING_DIR_LEAF
+        assert staging.is_dir()
+        assert not staging.is_symlink()
+        assert staging.resolve() == (real / "data-home" / source._STAGING_DIR_LEAF).resolve()
+
+    def test_a_data_home_relocated_through_a_link_is_followed(self, monkeypatch, tmp_path):
+        # The same policy one level down: the data home ITSELF being a link is the
+        # documented "data home moved onto another disk" layout, and it sits AT the
+        # trust anchor rather than below it. Planting such a link needs write on its
+        # parent, which is exactly what _first_replaceable refuses -- so on a chain
+        # that passes those tests the link can only be the operator's own.
+        real = tmp_path / "another-disk"
+        real.mkdir(mode=0o700)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        holder = tmp_path / "holder"
+        holder.mkdir(mode=0o700)
+        make_dir_link(holder / "data-home", real)
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        monkeypatch.setattr(source, "config_dir", lambda: holder / "data-home")
+
+        staging = source._staging_dir()
+
+        assert staging.is_dir()
+        assert not staging.is_symlink()
+        assert staging.resolve() == (real / source._STAGING_DIR_LEAF).resolve()
+
+    def test_the_default_data_home_under_a_symlinked_home_is_accepted(self, monkeypatch, tmp_path):
+        """The reviewer's scenario, through the REAL ``config_dir()``.
+
+        ``HOME=/home/u`` with ``/home/u -> /local/home/u`` and ``KIROCREW_HOME``
+        unset is an ordinary host, not an unusual one, and it is the layout this
+        repo's own checkout instructions run on. The default data home is lexical,
+        so ``config_dir()`` hands ``_staging_dir()`` a path whose ancestor is a
+        link, and a blanket refusal there aborts ``cloud launch`` for a user who
+        did nothing unusual and cannot satisfy it without repointing
+        ``KIROCREW_HOME`` at a pre-resolved path.
+
+        Driven through the real ``config_dir()`` rather than a stub, because the
+        lexical default home is the whole mechanism: a stub returning an
+        already-resolved path cannot show it. ``config.paths`` memoises the
+        resolved home per process, so both caches are cleared alongside ``$HOME``
+        or this would read whichever home the process resolved first.
+        """
+        from kiro_crew.config import paths as config_paths
+
+        real_home = tmp_path / "local" / "home" / "u"
+        real_home.mkdir(mode=0o700, parents=True)
+        link_home = tmp_path / "home"
+        link_home.mkdir()
+        make_dir_link(link_home / "u", real_home)
+        home = link_home / "u"
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(config_paths, "_resolved_home", None)
+        monkeypatch.setattr(config_paths, "_config_dir_memo", None)
+
+        # The premise: the default home really is reached through the link.
+        base = source.config_dir()
+        assert base == home / ".kiro" / "crew"
+        assert home.is_symlink() or source.platform_compat.is_link_or_junction(home)
+
+        staging = source._staging_dir()
+
+        assert staging == base / source._STAGING_DIR_LEAF
+        assert staging.is_dir()
+        assert not staging.is_symlink()
+        assert (
+            staging.resolve() == (real_home / ".kiro" / "crew" / source._STAGING_DIR_LEAF).resolve()
+        )
+        # And it is still locked down, which is the guarantee the leaf carries.
+        if os.name == "posix":
+            assert stat.S_IMODE(staging.stat().st_mode) & 0o077 == 0
+
+    def test_a_writable_parent_of_a_relocated_home_is_refused(self, monkeypatch, tmp_path):
+        # The other half of following a link at or above the data home: what the
+        # guard gives up must be ONLY the link, never the hazard the link hid.
+        #
+        # The data home is a link onto another disk, and the loose directory is the
+        # link TARGET's parent -- the directory whose write bit lets `real-home` be
+        # renamed away and replaced after this process closes the tarball. That
+        # directory appears on the RESOLVED chain and on no lexical one: walking the
+        # path as written stats `holder/data-home`, which follows the link and reads
+        # the target's own sound 0o700, then stops at `holder`. So `shared` is not
+        # merely misnamed by a lexical walk, it is invisible to one, and resolving is
+        # what brings the real hazard into scope at all.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        shared = tmp_path / "shared-real-parent"
+        real_home = shared / "real-home"
+        real_home.mkdir(mode=0o700, parents=True)
+        holder = tmp_path / "holder"
+        holder.mkdir(mode=0o700)
+        make_dir_link(holder / "data-home", real_home)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        monkeypatch.setattr(source, "config_dir", lambda: holder / "data-home")
+        # Every LEXICAL component is sound, so a walk on the path as written passes.
+        assert stat.S_IMODE(holder.stat().st_mode) & stat.S_IWOTH == 0
+        assert stat.S_IMODE((holder / "data-home").stat().st_mode) & stat.S_IWOTH == 0
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(shared, 0o777)  # noqa: S103 - the shared parent is the fixture. lockdown-ok.
+
+        with pytest.raises(aws.AWSError, match="writable by any account") as caught:
+            source._staging_dir()
+
+        # Named in its RESOLVED form, which is the directory the operator has to fix.
+        assert str(shared.resolve()) in str(caught.value)
+
+    def test_an_ancestor_others_can_write_refuses_the_build(self, monkeypatch, tmp_path):
+        # Replacing a directory entry needs write on its PARENT, so a writable
+        # ancestor lets the data home itself be swapped wholesale after every
+        # check on the home's own mode has passed.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        shared = tmp_path / "shared-parent"
+        home = shared / "data-home"
+        home.mkdir(mode=0o700, parents=True)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(shared, 0o777)  # noqa: S103 - the shared parent is the fixture. lockdown-ok.
+        with pytest.raises(aws.AWSError, match="writable by any account"):
+            source._staging_dir()
+        assert str(shared) in str(
+            pytest.raises(aws.AWSError, source._staging_dir).value
+        ), "the refusal should name the outermost problem, not an inner one"
+
+    def test_a_group_writable_ancestor_is_accepted_when_the_group_is_private(
+        self, monkeypatch, tmp_path
+    ):
+        # A host with user-private groups leaves an ordinary directory 0o775 to a
+        # group holding only the operator, so refusing on the bit ALONE would refuse
+        # every launch on that host. The membership decides instead, so this pin
+        # states the membership rather than inheriting whatever group the test host
+        # happens to give a new directory -- on a corporate host that is a shared
+        # group with dozens of members, and this case would then be asserting the
+        # very hole the shared-group pin below covers.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        monkeypatch.setattr(source, "_group_shared_with_another_account", lambda gid: None)
+        shared = tmp_path / "group-writable-parent"
+        home = shared / "data-home"
+        home.mkdir(mode=0o700, parents=True)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(shared, 0o775)  # noqa: S103 - the user-private-group shape. lockdown-ok.
+        staging = source._staging_dir()
+        assert staging == home / source._STAGING_DIR_LEAF
+        assert stat.S_IMODE(shared.stat().st_mode) == 0o775, "the launch rewrote the parent"
+
+    def test_a_group_writable_ancestor_is_refused_when_the_group_is_shared(
+        self, monkeypatch, tmp_path
+    ):
+        # The same 0o775 bit on a SHARED group hands every member of that group the
+        # rename, so it is a foreign writer exactly as others-writable is. Refusing
+        # only on S_IWOTH left this open: "another account can write it" covers a
+        # shared group, and S_IWOTH does not.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        monkeypatch.setattr(
+            source,
+            "_group_shared_with_another_account",
+            lambda gid: "group 'peers', shared with 3 other account(s)",
+        )
+        shared = tmp_path / "group-writable-parent"
+        home = shared / "data-home"
+        home.mkdir(mode=0o700, parents=True)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(shared, 0o775)  # noqa: S103 - the shared-group shape is the fixture. lockdown-ok.
+        with pytest.raises(aws.AWSError) as caught:
+            source._staging_dir()
+        message = str(caught.value)
+        assert str(shared) in message, "the refusal must name the outermost problem"
+        assert "shared with 3 other account(s)" in message, message
+        # A refusal the operator cannot act on is the bug this PR exists to remove.
+        # The ownership test ran first, so this node is theirs or root's either way.
+        assert f"chmod go-w {shared}" in message, "the refusal must name its own remedy"
+        assert stat.S_IMODE(shared.stat().st_mode) == 0o775, "the launch rewrote the parent"
+
+    def test_sticky_exempts_a_group_writable_ancestor_without_asking_the_group(
+        self, monkeypatch, tmp_path
+    ):
+        # Sticky means an entry may be renamed only by its own owner, the directory's
+        # owner, or root, and ownership is settled before the mode. So a sticky
+        # group-writable ancestor is safe whatever the group holds, and the
+        # membership lookup -- which reads two host databases -- must not run at all.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+
+        def _must_not_run(gid):
+            raise AssertionError("sticky already settles it; the group lookup ran anyway")
+
+        monkeypatch.setattr(source, "_group_shared_with_another_account", _must_not_run)
+        shared = tmp_path / "sticky-group-writable-parent"
+        home = shared / "data-home"
+        home.mkdir(mode=0o700, parents=True)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(shared, 0o1775)  # noqa: S103 - sticky + group write is the fixture. lockdown-ok.
+        assert source._staging_dir() == home / source._STAGING_DIR_LEAF
+
+    def test_group_privacy_fails_closed_when_the_host_will_not_enumerate(self, monkeypatch):
+        # Drives the REAL helper. A directory backend that resolves the group but
+        # will not enumerate passwd cannot show that no other account shares the gid,
+        # so privacy is UNPROVEN and that must read as shared. The account's own
+        # absence from the enumeration is the control: a non-empty list that does not
+        # contain this account is still not an enumeration.
+        if os.name != "posix":
+            pytest.skip("POSIX group databases")
+        import grp
+        import pwd
+
+        me = pwd.getpwuid(os.geteuid())
+        mine = grp.getgrgid(me.pw_gid)
+
+        monkeypatch.setattr(grp, "getgrgid", lambda gid: _FakeGroup("solo", []))
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: me)
+        monkeypatch.setattr(pwd, "getpwall", lambda: [])
+        empty = source._group_shared_with_another_account(mine.gr_gid)
+        assert empty is not None and "will not enumerate" in empty, empty
+
+        monkeypatch.setattr(pwd, "getpwall", lambda: [_FakeUser("somebody-else", 4242)])
+        no_control = source._group_shared_with_another_account(mine.gr_gid)
+        assert no_control is not None and "will not enumerate" in no_control, no_control
+
+        monkeypatch.setattr(pwd, "getpwall", lambda: [me])
+        proven = source._group_shared_with_another_account(mine.gr_gid)
+        assert proven is None, f"a group holding only this account is private, got {proven}"
+
+    def test_both_halves_of_group_membership_are_load_bearing(self, monkeypatch):
+        # Drives the REAL helper. On a corporate host BOTH halves fire at once, so a
+        # single case cannot tell which one is carrying the verdict and a mutation
+        # deleting either would survive. Each case here makes exactly one half fire.
+        if os.name != "posix":
+            pytest.skip("POSIX group databases")
+        import grp
+        import pwd
+
+        me = pwd.getpwuid(os.geteuid())
+        gid = me.pw_gid
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: me)
+
+        # Supplementary half alone: gr_mem names somebody else, and passwd shows this
+        # account as the only holder of the gid.
+        monkeypatch.setattr(grp, "getgrgid", lambda g: _FakeGroup("shared", [me.pw_name, "peer"]))
+        monkeypatch.setattr(pwd, "getpwall", lambda: [me])
+        by_gr_mem = source._group_shared_with_another_account(gid)
+        assert by_gr_mem is not None and "shared with 1 other" in by_gr_mem, by_gr_mem
+
+        # Primary half alone: gr_mem is empty, which is exactly how a group shared by
+        # primary membership presents itself, and passwd holds the other account.
+        monkeypatch.setattr(grp, "getgrgid", lambda g: _FakeGroup("shared", []))
+        monkeypatch.setattr(pwd, "getpwall", lambda: [me, _FakeUser("peer", gid)])
+        by_primary = source._group_shared_with_another_account(gid)
+        assert by_primary is not None and "primary group of 1 other" in by_primary, by_primary
+
+        # And a peer on a DIFFERENT gid proves the primary half discriminates on the
+        # gid rather than merely on the enumeration holding more than one row.
+        monkeypatch.setattr(pwd, "getpwall", lambda: [me, _FakeUser("peer", gid + 1)])
+        unrelated = source._group_shared_with_another_account(gid)
+        assert unrelated is None, f"a peer in another group is not a sharer, got {unrelated}"
+
+    def test_group_privacy_matches_this_hosts_own_databases(self):
+        # The real helper against the real host, checked against membership computed
+        # independently here rather than against the helper's own answer. Either
+        # verdict is a pass; disagreeing with the databases is the failure.
+        if os.name != "posix":
+            pytest.skip("POSIX group databases")
+        import grp
+        import pwd
+
+        me = pwd.getpwuid(os.geteuid())
+        entry = grp.getgrgid(me.pw_gid)
+        supplementary = {name for name in entry.gr_mem if name != me.pw_name}
+        everyone = pwd.getpwall()
+        enumerates = any(p.pw_name == me.pw_name for p in everyone)
+        primary = {p.pw_name for p in everyone if p.pw_gid == me.pw_gid and p.pw_name != me.pw_name}
+        expected_private = not supplementary and enumerates and not primary
+        verdict = source._group_shared_with_another_account(me.pw_gid)
+        assert (verdict is None) == expected_private, (
+            f"helper said {verdict!r} for gid {me.pw_gid} ({entry.gr_name}), but the "
+            f"databases say supplementary={sorted(supplementary)} "
+            f"enumerates={enumerates} other_primary={len(primary)}"
+        )
+
+    def test_a_sticky_ancestor_is_accepted(self, monkeypatch, tmp_path):
+        # The sticky bit is exactly the rule that only an entry's owner may rename
+        # it, so a sticky world-writable ancestor (the shape of /tmp) is not the
+        # swap this refuses -- otherwise the check would reject every ordinary host.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        shared = tmp_path / "sticky-parent"
+        home = shared / "data-home"
+        home.mkdir(mode=0o700, parents=True)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(shared, 0o1777)  # noqa: S103 - the /tmp shape is the fixture. lockdown-ok.
+        assert source._staging_dir() == home / source._STAGING_DIR_LEAF
+
+    def test_a_foreign_owned_ancestor_is_refused_whatever_its_mode(self, monkeypatch, tmp_path):
+        # A directory's OWNER can replace what is inside it whatever the mode says,
+        # so an unwritable 0o755 ancestor owned by someone else is still a swap. The
+        # chain here is ordinary; what makes every node foreign is the launcher's
+        # own euid, which is the only half of the comparison a test can move.
+        if os.name != "posix":
+            pytest.skip("POSIX ownership")
+        self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        real_uid = os.geteuid()
+        monkeypatch.setattr(source.os, "geteuid", lambda: real_uid + 4242)
+        with pytest.raises(aws.AWSError, match="owned by another account"):
+            source._staging_dir()
+
+    def test_sticky_does_not_exempt_a_foreign_owned_ancestor(self, monkeypatch, tmp_path):
+        # The hole the ordering closes. Under the sticky bit an entry may be renamed
+        # by the entry's owner, by the DIRECTORY's owner, or by root -- so a
+        # foreign-owned sticky directory hands its owner the same swap, and sticky
+        # must not short-circuit before ownership is judged.
+        #
+        # Exactly ONE node is made foreign, the sticky one. A blanket euid change
+        # would make every node foreign, and then a later node's refusal would let a
+        # sticky-first short-circuit pass this test.
+        if os.name != "posix":
+            pytest.skip("POSIX ownership")
+        shared = tmp_path / "sticky-foreign-parent"
+        home = shared / "data-home"
+        home.mkdir(mode=0o700, parents=True)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(
+            shared, 0o1777
+        )  # noqa: S103 - a sticky foreign parent is the fixture. lockdown-ok.
+
+        real_stat = Path.stat
+        foreign = os.geteuid() + 4242
+        target = str(shared.resolve())
+
+        def _stat_with_one_foreign_owner(self, *a, **kw):
+            info = real_stat(self, *a, **kw)
+            if str(self) in (str(shared), target):
+                fields = list(info)
+                fields[4] = foreign  # st_uid
+                return os.stat_result(tuple(fields))
+            return info
+
+        monkeypatch.setattr(Path, "stat", _stat_with_one_foreign_owner)
+        with pytest.raises(aws.AWSError, match="owned by another account"):
+            source._staging_dir()
+
+    def test_ancestors_above_the_operators_home_are_out_of_scope(self, monkeypatch, tmp_path):
+        # Every real chain runs through directories this account does not own: on a
+        # sandboxed host '/' itself reads as an unmapped uid. Refusing there would
+        # reject an ordinary container and buy nothing, so the walk stops at the
+        # operator's own home.
+        #
+        # The foreign ancestor is CONSTRUCTED above a pinned account home, not
+        # probed from the real one: a host whose '/' and '/home' are both root-owned
+        # offers nothing to find, and a test that reads the operator's real home is
+        # a test that passes or fails on whose machine it runs.
+        if os.name != "posix":
+            pytest.skip("POSIX ownership")
+        above = tmp_path / "above-the-account"
+        account = above / "account-home"
+        home = account / "kirocrew"
+        home.mkdir(mode=0o700, parents=True)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: account))
+
+        real_stat = Path.stat
+        foreign = os.geteuid() + 4242
+        targets = {str(above), str(above.resolve())}
+
+        def _stat_with_one_foreign_ancestor(self, *a, **kw):
+            info = real_stat(self, *a, **kw)
+            if str(self) in targets:
+                fields = list(info)
+                fields[4] = foreign  # st_uid
+                return os.stat_result(tuple(fields))
+            return info
+
+        monkeypatch.setattr(Path, "stat", _stat_with_one_foreign_ancestor)
+        assert above.resolve() not in source._chain_the_launcher_owns(home)
+        assert source._staging_dir() == home / source._STAGING_DIR_LEAF
+
+    def test_a_home_inside_the_account_stops_the_walk_at_that_home(self, monkeypatch, tmp_path):
+        # The scope branch, pinned where it lives rather than through whichever node
+        # happens to refuse first. A home inside the operator's account is checked
+        # from that home down, so the directories above it are never stat-ed.
+        if os.name != "posix":
+            pytest.skip("POSIX paths")
+        account = tmp_path / "account-home"
+        home = account / "kirocrew"
+        home.mkdir(mode=0o700, parents=True)
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: account))
+        chain = source._chain_the_launcher_owns(home)
+        assert chain[0] == account.resolve(), "the walk should start at the operator's own home"
+        assert chain[-1] == home.resolve()
+        assert (
+            Path(account.resolve().root) not in chain
+        ), "a directory above the account is out of scope"
+
+    def test_a_home_relocated_outside_the_account_walks_its_whole_chain(
+        self, monkeypatch, tmp_path
+    ):
+        # The premise above does not cover a data home the operator moved out of
+        # their own account, which is exactly the shared-host case: there an ancestor
+        # can belong to a local peer, so nothing is taken as given.
+        if os.name != "posix":
+            pytest.skip("POSIX paths")
+        elsewhere = tmp_path / "pretend-account-home"
+        elsewhere.mkdir(mode=0o700)
+        home = tmp_path / "srv-shared" / "kirocrew"
+        home.mkdir(mode=0o700, parents=True)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: elsewhere))
+        chain = source._chain_the_launcher_owns(home)
+        assert chain[0] == Path(home.resolve().root), "the walk should start at the root"
+        assert chain[-1] == home.resolve()
+
+    def test_a_peer_writable_directory_under_the_account_refuses_the_build(
+        self, monkeypatch, tmp_path
+    ):
+        # The reachable shape of the same threat: a shared directory inside the
+        # operator's own account holding the data home.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        shared = tmp_path / "shared-parent"
+        home = shared / "data-home"
+        home.mkdir(mode=0o700, parents=True)
+        temp_root = tmp_path / "process-temp-root"
+        temp_root.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(shared, 0o777)  # noqa: S103 - the peer-writable share is the fixture. lockdown-ok.
+        with pytest.raises(aws.AWSError, match="writable by any account"):
+            source._staging_dir()
+
+    def test_the_data_home_is_verified_not_rewritten(self, monkeypatch, tmp_path):
+        # The home belongs to the operator. A launch must not silently chmod it --
+        # it refuses, and the mode it found is still there afterwards.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(home, 0o777)  # noqa: S103 - the writable home is the fixture. lockdown-ok.
+        with pytest.raises(aws.AWSError, match="writable by any account"):
+            source._staging_dir()
+        assert stat.S_IMODE(home.stat().st_mode) == 0o777, "the launch rewrote the operator's home"
+
+    def test_a_world_readable_but_unwritable_home_is_accepted(self, monkeypatch, tmp_path):
+        # Others-WRITABLE is the swap precondition; others-readable is not, and the
+        # leaf's own owner-only mode is what keeps the tarball unreadable. A launch
+        # must not refuse the ordinary 0o755 a plain mkdir leaves under umask 022.
+        if os.name != "posix":
+            pytest.skip("POSIX mode bits")
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(home, 0o755)  # noqa: S103 - the default-umask home is the fixture. lockdown-ok.
+        staging = source._staging_dir()
+        assert staging == home / source._STAGING_DIR_LEAF
+        assert stat.S_IMODE(staging.stat().st_mode) == 0o700
+
+    def test_a_failed_fallback_build_leaves_no_tarball_behind(self, monkeypatch, tmp_path):
+        # The staging dir lives under the data home, which no reboot clears, so a
+        # build that dies mid-write must remove its own half-written file.
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+        staged = self._capture_staged_names(monkeypatch)
+
+        def _boom(*a, **kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(tarfile, "open", _boom)
+        with pytest.raises(OSError, match="disk full"):
+            source._tar_fallback(repo)
+
+        assert staged, "NamedTemporaryFile was never called"
+        leaked = [p for p in staged if Path(p).exists()]
+        assert not leaked, f"failed build leaked staged tarball(s): {leaked}"
+        assert list((home / source._STAGING_DIR_LEAF).iterdir()) == []
+
+    def test_an_interrupted_git_archive_leaves_no_tarball_behind(self, monkeypatch, tmp_path):
+        # An interrupt is not a fallback case: it propagates, so the cleanup the
+        # fallback path does on its way out never runs. Without its own arm the
+        # archive keeps a copy of the whole checkout in the data home, which no
+        # reboot clears, and every aborted launch adds another.
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        staged = self._capture_staged_names(monkeypatch)
+
+        def _interrupted(*a, **kw):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(subprocess, "run", _interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            source._use_git_archive(tmp_path / "repo")
+
+        assert staged, "NamedTemporaryFile was never called"
+        leaked = [p for p in staged if Path(p).exists()]
+        assert not leaked, f"an interrupted archive leaked staged tarball(s): {leaked}"
+        assert list((home / source._STAGING_DIR_LEAF).iterdir()) == []
+
+
+class TestSourceChecksumPin:
+    """The digest ``upload_source`` hands to S3 as ``--checksum-sha256``.
+
+    The ancestor walk can only inspect the staged path BEFORE the AWS CLI re-opens
+    it, which is the wrong side of the substitution window. This checksum is the
+    check that sits on the other side: S3 compares it against the bytes it
+    actually received, so a swapped tarball is a refused upload. For that to hold,
+    the digest must describe the bytes this process WROTE -- a digest taken from a
+    later read of the path would describe whatever the name resolves to then,
+    which is the substitution itself.
+    """
+
+    @staticmethod
+    def _b64_sha256_of(path: Path) -> str:
+        import base64
+        import hashlib
+
+        return base64.b64encode(hashlib.sha256(path.read_bytes()).digest()).decode("ascii")
+
+    def test_fallback_digest_matches_the_bytes_on_disk(self, monkeypatch, tmp_path):
+        (tmp_path / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+        monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: True)
+        staged = source.build_source_tarball(tmp_path)
+        try:
+            assert staged.sha256 == self._b64_sha256_of(staged.path)
+        finally:
+            staged.path.unlink(missing_ok=True)
+
+    def test_refilter_digest_matches_the_bytes_on_disk(self, tmp_path):
+        # The git-archive path's FINAL writer is _refilter_archive, so that is
+        # where its digest has to come from.
+        import hashlib
+
+        src_tar = tmp_path / "in.tar.gz"
+        member = tmp_path / "keep.py"
+        member.write_text("y = 2\n")
+        with tarfile.open(src_tar, "w:gz") as tf:
+            tf.add(member, arcname="keep.py")
+        digest = hashlib.sha256()
+        out = source._refilter_archive(src_tar, digest=digest)
+        try:
+            import base64
+
+            got = base64.b64encode(digest.digest()).decode("ascii")
+            assert got == self._b64_sha256_of(out)
+        finally:
+            out.unlink(missing_ok=True)
+
+    def test_digest_is_base64_not_hex(self, monkeypatch, tmp_path):
+        # S3 rejects a hex digest for x-amz-checksum-sha256; it wants Base64 of
+        # the 32 raw bytes. A hex string would be a silently wrong pin.
+        import base64
+
+        (tmp_path / "app.py").write_text("z = 3\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+        monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: True)
+        staged = source.build_source_tarball(tmp_path)
+        try:
+            assert len(base64.b64decode(staged.sha256, validate=True)) == 32
+            assert len(staged.sha256) == 44 and staged.sha256.endswith("=")
+        finally:
+            staged.path.unlink(missing_ok=True)
+
+    def test_a_rewritten_tarball_no_longer_matches_its_pin(self, monkeypatch, tmp_path):
+        # The whole point, stated as behaviour: change the staged bytes after the
+        # build and the pin stops describing them, which is what makes S3 refuse.
+        (tmp_path / "app.py").write_text("real = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+        monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: True)
+        staged = source.build_source_tarball(tmp_path)
+        try:
+            staged.path.write_bytes(b"substituted tarball")
+            assert staged.sha256 != self._b64_sha256_of(staged.path)
+        finally:
+            staged.path.unlink(missing_ok=True)
+
+    def test_the_digest_never_re_reads_the_staged_file(self, monkeypatch, tmp_path):
+        """The digest must come from the write, not from reopening the file.
+
+        A read-back yields the SAME digest on a quiet host, so no value comparison
+        can tell the two apart -- what separates them is that one reopens the path
+        and the other does not. Reopening is the whole bug: between the write and
+        the reread the name can come to mean a different file, which is the
+        substitution the pin exists to catch. So this asserts the file is opened
+        exactly once, for writing, and that reading it is never attempted.
+        """
+        import builtins
+        import hashlib
+
+        dest = tmp_path / "out.tar.gz"
+        dest.write_bytes(b"")
+        real_open = builtins.open
+        modes: list[str] = []
+
+        def _spy_open(file, mode="r", *a, **k):
+            if str(file) == str(dest):
+                modes.append(mode)
+            return real_open(file, mode, *a, **k)
+
+        def _no_read_bytes(self):  # pragma: no cover - must not be called
+            raise AssertionError("the digest must not re-read the staged tarball")
+
+        monkeypatch.setattr(builtins, "open", _spy_open)
+        monkeypatch.setattr(Path, "read_bytes", _no_read_bytes)
+        digest = hashlib.sha256()
+        source._write_tar_gz(dest, lambda tar: None, digest)
+        monkeypatch.undo()
+
+        assert modes == ["wb"], f"staged file opened {len(modes)} time(s): {modes}"
+        # Control: the digest really was fed, so "opened once" is not passing
+        # because nothing happened.
+        assert digest.digest() != hashlib.sha256(b"").digest()
+        assert digest.digest() == hashlib.sha256(dest.read_bytes()).digest()
+
+    def test_every_tarball_writer_goes_through_the_hashing_writer(self):
+        """No producer may write tarball bytes outside ``_write_tar_gz``.
+
+        Read structurally (AST), not by grepping for text: a string needle would
+        match this test's own source. A future third producer that opened a
+        ``w:gz`` tarball directly would ship bytes the pin never saw, and S3 would
+        then validate the CLI's re-read against a digest of a different file --
+        so the shared writer is the invariant, not a convention.
+        """
+        import ast
+
+        tree = ast.parse(Path(source.__file__).read_text(encoding="utf-8"))
+        enclosing: dict[int, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.walk(node):
+                    enclosing.setdefault(id(child), node.name)
+
+        writes: list[str] = []
+        reads = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr == "open"):
+                continue
+            if not (isinstance(fn.value, ast.Name) and fn.value.id == "tarfile"):
+                continue
+            modes = [a.value for a in node.args if isinstance(a, ast.Constant)]
+            modes += [
+                k.value.value
+                for k in node.keywords
+                if k.arg == "mode" and isinstance(k.value, ast.Constant)
+            ]
+            mode = next((m for m in modes if isinstance(m, str)), "")
+            if mode.startswith("w"):
+                writes.append(enclosing.get(id(node), "<module>"))
+            elif mode.startswith("r"):
+                reads += 1
+
+        # Controls: the walker must actually be finding calls in both directions,
+        # so an empty offender list means the invariant holds rather than that the
+        # scan matched nothing.
+        assert writes, "found no tarfile write-mode open at all -- the scan is broken"
+        assert reads, "found no tarfile read-mode open at all -- the scan is broken"
+        assert set(writes) == {"_write_tar_gz"}, f"tarball bytes written outside the pin: {writes}"
 
 
 class TestBucketNaming:
@@ -744,7 +1665,9 @@ class TestUploadDelete:
         monkeypatch.setattr(source, "ensure_bucket", lambda *a: _BUCKET)
         fake_tar = tmp_path / "src.tar.gz"
         fake_tar.write_bytes(b"x")
-        monkeypatch.setattr(source, "build_source_tarball", lambda *a, **k: fake_tar)
+        monkeypatch.setattr(
+            source, "build_source_tarball", lambda *a, **k: source.StagedSource(fake_tar, "D1G3ST=")
+        )
         cp = {}
         monkeypatch.setattr(
             aws,
@@ -760,6 +1683,12 @@ class TestUploadDelete:
         assert "--key" in cp["args"] and key in cp["args"]
         assert "--body" in cp["args"] and str(fake_tar) in cp["args"]
         assert cp["action"] == "s3:PutObject"
+        # The build-time digest is handed to S3, so a tarball substituted between
+        # our close and the CLI's re-open is refused rather than stored.
+        assert cp["args"][cp["args"].index("--checksum-sha256") + 1] == "D1G3ST="
+        # NOT --checksum-algorithm: that asks the CLI to hash what it re-opened,
+        # which would certify a substitution instead of catching it.
+        assert "--checksum-algorithm" not in cp["args"]
         # anti-squat: pin derived from the bucket name (NOT a 2nd sts call), so a
         # transient sts "" can't silently drop it.
         assert "--expected-bucket-owner" in cp["args"]
