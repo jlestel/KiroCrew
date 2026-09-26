@@ -487,6 +487,11 @@ class AppProcess:
     # row only while both values still identify this process, so a concurrently-recorded
     # successor under the same app name cannot be forgotten.
     pid_start_time: str | None = None
+    # The per-spawn ``KIROCREW_SPAWN_INSTANCE`` token stamped on this backend's
+    # environment (None for an adopted record). It is what vouches the members of
+    # the backend's process group once the leader itself has exited, so a stop that
+    # finds the root dead can still drain the tree the root left behind.
+    spawn_instance: str | None = None
     adopted_pids: list[int] = field(default_factory=list)
     # PID-reuse guard for the adopted set: pid -> platform_compat.process_start_time
     # token captured at adoption. stop signals a recorded PID only when its live
@@ -1047,13 +1052,218 @@ def _clear_failed_spawn_state(app_name: str, spawn_placeholder: AppProcess) -> N
             _allocated_ports.pop(app_name, None)
 
 
+def _signal_backend_tree(
+    app_name: str, proc: subprocess.Popen, start_time: str | None, sig: int
+) -> None:
+    """Signal a spawned backend's whole tree, identity-pinned on Windows.
+
+    POSIX is ``kill_process_tree`` unchanged: the backend leads its own process
+    group, so ``killpg`` reaches every member whether or not the root is still
+    running. Windows has no group to signal. ``taskkill /T /PID <root>`` walks the
+    tree FROM the root, so once the root has exited it reaches nothing -- which is
+    how a launcher that forks its real server and returns leaves that server
+    running with no way to stop it. With the root's creation identity
+    recorded at spawn, ``kill_process_tree_pinned`` opens the exact process object
+    instead and drains the descendants it still anchors, confirming their exit.
+
+    Falls back to the numeric ``taskkill`` -- the behaviour before the pinned path
+    existed, so a stop is never weaker than it was -- when no identity was
+    recorded, when the identity cannot be pinned, when cleanup capacity refuses
+    the tree, or when the exact-handle drain raises (its pinned handles stay
+    registered for maintenance either way). Exceptions from the fallback
+    propagate exactly as ``kill_process_tree``'s do.
+    """
+    if platform_compat.IS_WINDOWS and start_time is not None:
+        try:
+            if platform_compat.kill_process_tree_pinned(proc.pid, start_time, sig):
+                return
+            logger.info(
+                "App %s: pid %d identity could not be pinned for the tree drain; "
+                "falling back to taskkill",
+                app_name,
+                proc.pid,
+            )
+        except platform_compat.WindowsCleanupCapacityError as exc:
+            logger.warning(
+                "App %s: Windows cleanup capacity refused the pid %d tree drain (%s); "
+                "falling back to taskkill",
+                app_name,
+                proc.pid,
+                exc,
+            )
+        except (ProcessLookupError, OSError) as exc:
+            logger.warning(
+                "App %s: exact-handle drain of pid %d did not complete (%s); "
+                "falling back to taskkill",
+                app_name,
+                proc.pid,
+                exc,
+            )
+    platform_compat.kill_process_tree(proc.pid, sig)
+
+
+def _drain_exited_root_tree(
+    app_name: str,
+    proc: subprocess.Popen,
+    root_start_time: str | None,
+    spawn_instance: str | None,
+) -> bool | None:
+    """Terminate whatever a launcher that has already exited left behind. Never raises.
+
+    The root has exited -- that is why the caller is here -- but the processes it
+    forked have not necessarily: a launcher that starts the real server and returns
+    0 is the shape this guards. Three callers: the startup-survival failure branch,
+    where no ``AppProcess`` and no pidfile row exist yet, so nothing later would
+    ever name those survivors; ``stop_app_backend`` for a tracked record whose root
+    exited after startup while a child kept serving; and the health supervisor's
+    restart, which drops that same record before spawning a replacement. In each
+    the record is being dropped, so this is the last exit that can still reach the
+    tree.
+
+    Returns what the caller may CONCLUDE about the tree, because a stop under a
+    withdrawn trust ceiling has to refuse rather than report a success it cannot
+    support: ``True`` when the tree is positively gone, ``False`` when a member
+    positively survives the drain, ``None`` when nothing can be concluded (no
+    identity or token to vouch by, a host that cannot read the vouch, a cleanup
+    capacity refusal). Absence is never inferred from an empty census.
+
+    Windows: the exact-handle drain, keyed on the root identity the caller read
+    BEFORE the survival check (an exited root's creation time cannot be probed
+    afresh once its ``Popen`` handle goes). It confirms exit or raises, so its
+    ``True`` is the conclusion. A capacity refusal or a drain that raises leaves
+    the tree to the cleanup registry's maintenance, as the stale reaper does; a
+    numeric ``taskkill`` fallback is pointless here because the root it would walk
+    from is the exited one.
+
+    POSIX: the group outlives its leader and its id is the leader's pid, but
+    ``kill_process_tree`` cannot be used -- ``getpgid`` raises for a reaped pid --
+    and signalling the bare group NUMBER is refused for the reason
+    ``_reap_orphaned_backend_group`` gives. So it takes the same route as that
+    reaper: members vouched by this spawn's instance token, each signalled pinned
+    to its own identity, then a SIGKILL pass after the reap's grace that is ALSO
+    the final census. That pass runs unconditionally, exactly as the reaper's does:
+    the opening census cannot contain a member the SIGTERM itself caused to be
+    forked (a server whose handler forks a replacement into the same group), so
+    the conclusion is read off the final reading -- no live vouched member AND
+    ``pgroup_exists`` False -- never off the signalled set or the opening snapshot.
+    Off Linux the vouch cannot be read, nothing is signalled and the decline is
+    logged -- the same trade the reaper makes.
+    """
+    if platform_compat.IS_WINDOWS:
+        if root_start_time is None:
+            logger.warning(
+                "App %s: root pid %d exited and its identity was not captured; any "
+                "surviving descendants are left running",
+                app_name,
+                proc.pid,
+            )
+            return None
+        try:
+            drained = platform_compat.kill_process_tree_pinned(
+                proc.pid, root_start_time, platform_compat.SIGTERM
+            )
+        except platform_compat.WindowsCleanupCapacityError as exc:
+            logger.warning(
+                "App %s: Windows cleanup capacity refused the tree drain of exited root "
+                "pid %d (%s); its survivors are left to maintenance",
+                app_name,
+                proc.pid,
+                exc,
+            )
+            return None
+        except (ProcessLookupError, OSError) as exc:
+            logger.warning(
+                "App %s: exact-handle drain of exited root pid %d did not complete (%s); "
+                "retained for maintenance",
+                app_name,
+                proc.pid,
+                exc,
+            )
+            return False
+        if drained:
+            logger.info(
+                "App %s: drained the process tree of exited root pid %d", app_name, proc.pid
+            )
+            return True
+        logger.info(
+            "App %s: exited root pid %d identity could not be pinned; nothing signalled",
+            app_name,
+            proc.pid,
+        )
+        return None
+    if spawn_instance is None:
+        logger.info(
+            "App %s: exited root pid %d carries no spawn instance to vouch its group by; "
+            "any surviving descendants are left running",
+            app_name,
+            proc.pid,
+        )
+        return None
+    if not group_vouching_available():
+        logger.info(
+            "App %s: cannot vouch exited root pid %d's group on this platform; any "
+            "surviving descendants are left running",
+            app_name,
+            proc.pid,
+        )
+        return None
+    try:
+        vouched, signalled = signal_orphaned_spawn_group(
+            proc.pid, platform_compat.SIGTERM, spawn_instance
+        )
+        if vouched:
+            logger.info(
+                "App %s: SIGTERM %d of %d surviving member(s) of exited root pid %d's group",
+                app_name,
+                len(signalled),
+                len(vouched),
+                proc.pid,
+            )
+        deadline = time.monotonic() + _REAP_SIGTERM_GRACE
+        while any(_pid_alive(m) for m in signalled) and time.monotonic() < deadline:
+            time.sleep(_REAP_POLL_INTERVAL)
+        # Final census AND escalation in one reading. ``expected`` keeps the SIGKILL
+        # to the members that took the SIGTERM; a member first seen now is observed
+        # (it decides the conclusion) but never signalled -- it owes no grace, and it
+        # is what a fresh occupant of a recycled group number would look like.
+        final_vouched, killed = signal_orphaned_spawn_group(
+            proc.pid, platform_compat.SIGKILL, spawn_instance, expected=signalled
+        )
+        if killed:
+            logger.info(
+                "App %s: SIGKILL %d surviving member(s) of exited root pid %d's group",
+                app_name,
+                len(killed),
+                proc.pid,
+            )
+        alive = [m for m in final_vouched if _pid_alive(m)]
+        if alive:
+            logger.warning(
+                "App %s: %d member(s) of exited root pid %d's group still alive after the "
+                "drain: %s",
+                app_name,
+                len(alive),
+                proc.pid,
+                sorted(alive),
+            )
+            return False
+        # An empty final reading is fail-open (every /proc read swallows OSError),
+        # so absence is confirmed by the probe that cannot fail open.
+        return not platform_compat.pgroup_exists(proc.pid)
+    except Exception as exc:  # noqa: BLE001 — a failed drain must not crash the caller
+        logger.warning(
+            "App %s: draining exited root pid %d's group failed: %s", app_name, proc.pid, exc
+        )
+        return None
+
+
 def _terminate_retired_spawn(
     app_name: str, proc: subprocess.Popen, log_fh: Any
 ) -> None:
     """Terminate a child whose caller does not own the STARTING placeholder."""
     pid_start_time = _proc_start_time(proc.pid)
     try:
-        platform_compat.kill_process_tree(proc.pid, platform_compat.SIGTERM)
+        _signal_backend_tree(app_name, proc, pid_start_time, platform_compat.SIGTERM)
     except (ProcessLookupError, OSError):
         pass
     try:
@@ -2763,6 +2973,14 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         logger.error("Failed to start app %s backend: %s", app_name, exc)
         return None
 
+    # Pin the ROOT's creation identity before the survival check. On Windows a
+    # launcher that spawns its real server and exits leaves a tree anchored by an
+    # exited root, and the exact-handle drain locates that tree through the root's
+    # (pid, creation time) -- which must be read now, while this Popen still holds
+    # the process open. POSIX does not need it: the group id IS the leader's pid,
+    # and its single identity probe stays in _record_app_pid on the success path.
+    root_start_time = _proc_start_time(proc.pid) if platform_compat.IS_WINDOWS else None
+
     # Verify the child SURVIVED its initial bind. A port collision (e.g. another
     # process grabbed the assigned port between our free-port probe and the child's
     # bind) makes the backend exit almost immediately with EADDRINUSE. Without this
@@ -2790,6 +3008,9 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
             " [PORT COLLISION]" if collided else "",
             tail or "(no output)",
         )
+        # The launcher is dead; whatever it forked may not be. Nothing tracks that
+        # tree yet, so it is drained here or never.
+        _drain_exited_root_tree(app_name, proc, root_start_time, spawn_instance)
         return None
 
     # Surviving the bind check does not mean the backend is healthy: we have only
@@ -2807,6 +3028,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         log_path=str(log_path),
         gateway_started=True,
         admitted_builtin=_admitted_builtin,
+        spawn_instance=spawn_instance,
     )
 
     retired = False
@@ -2915,8 +3137,9 @@ def stop_app_backend(
         except Exception as exc:
             logger.debug("SEL audit failed for app_backend_stop %s: %s", app_name, exc)
         try:
-            # killpg(getpgid) on POSIX, taskkill /T on Windows — via platform_compat.
-            platform_compat.kill_process_tree(ap.proc.pid, platform_compat.SIGTERM)
+            # killpg(getpgid) on POSIX; on Windows the exact-handle drain pinned to the
+            # identity recorded at spawn, so descendants of an exited root are reached.
+            _signal_backend_tree(app_name, ap.proc, ap.pid_start_time, platform_compat.SIGTERM)
         except (ProcessLookupError, OSError):
             pass
         try:
@@ -2985,6 +3208,61 @@ def stop_app_backend(
                 if ap.port:
                     _allocated_ports.setdefault(app_name, ap.port)
             return False
+    elif ap.proc is not None:
+        # The tracked ROOT has already exited, but the record is only now being
+        # dropped -- a launcher that died after startup while the server it forked
+        # kept serving, and a stop (disable, uninstall, ceiling revocation, gateway
+        # shutdown) arriving before the health supervisor replaced the record. The
+        # group signal above needs a live root to resolve from, so without this the
+        # stop dropped the record and left that server running. Same drain as the
+        # startup-failure branch: the identity recorded at spawn on Windows, the
+        # spawn-instance vouch on POSIX, nothing aimed at a bare number.
+        gone = _drain_exited_root_tree(app_name, ap.proc, ap.pid_start_time, ap.spawn_instance)
+        # The same refusal the live-root branch makes above, on the same grounds and
+        # under the same condition: a WITHDRAWN ceiling cannot be told the app was
+        # stopped while un-trusted code may still be serving. Positive survivors
+        # refuse outright; an inconclusive drain (nothing to vouch by, or a host
+        # that cannot read the vouch) is settled by the same port probe the live
+        # branch uses. An ordinary stop tolerates a survivor, as it does above,
+        # and says so.
+        if gone is not True:
+            refuse = _retry_if_serving is not None and (
+                gone is False
+                or bool(ap.port and _health_probe(ap.port, _retry_if_serving).healthy)
+            )
+            if refuse:
+                logger.warning(
+                    "App %s: descendants of its exited backend root (pid %d) may still be "
+                    "serving on port %d, so the stop is reported as refused rather than "
+                    "successful",
+                    app_name,
+                    ap.proc.pid,
+                    ap.port,
+                )
+                try:
+                    sel().log_api_access(
+                        caller="gateway", operation="app_backend_stop",
+                        outcome="rejected_descendant_serving",
+                        resources=f"{app_name} port={ap.port}",
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "SEL audit failed for rejected_descendant_serving %s: %s",
+                        app_name, exc,
+                    )
+                with _lock:
+                    _processes.setdefault(app_name, ap)
+                    if ap.port:
+                        _allocated_ports.setdefault(app_name, ap.port)
+                return False
+            if gone is False:
+                logger.warning(
+                    "App %s: a descendant outlived its exited backend root (pid %d) and "
+                    "survived the drain; the stop is reported as successful, as an "
+                    "ordinary stop tolerates",
+                    app_name,
+                    ap.proc.pid,
+                )
     elif not ap.proc and ap.port:
         # Adopted process (proc=None) — kill only PIDs we recorded at adoption
         if not ap.adopted_pids:
@@ -3850,6 +4128,20 @@ def _restart_exited_backend(ap: AppProcess, returncode: int | None) -> bool:
             return settlement == "return_true"
 
         _forget_app_pid_if(app_name, ap.pid, ap.pid_start_time)
+        # The dead root's tree goes before its replacement is spawned: a launcher
+        # whose forked server outlived it would otherwise keep the app's files (and
+        # possibly its port) while a second server comes up beside it. Same drain
+        # as the stop path; a root that took its whole tree with it costs one probe.
+        if proc is not None and (
+            _drain_exited_root_tree(app_name, proc, ap.pid_start_time, ap.spawn_instance)
+            is False
+        ):
+            logger.warning(
+                "App %s: a descendant of the exited backend root (pid %d) survived the "
+                "drain; the replacement is spawned beside it",
+                app_name,
+                proc.pid,
+            )
         if ap.log_fh:
             try:
                 ap.log_fh.close()

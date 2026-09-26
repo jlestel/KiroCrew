@@ -879,6 +879,55 @@ signalled at all — instead the sweep returns and the stops finish in the
 background. The sweep is not gated on the lifecycle dispatcher being
 initialized, and one app's failing stop does not skip the rest.
 
+**Every exit that signals a spawned backend reaches its whole tree, root alive or
+not.** A backend launcher is free to fork its real server and return -- the
+reported shape is a Python launcher that starts a Node process and exits 0 -- and
+the tree it leaves is the gateway's to end at three exits: the startup-survival
+failure branch (the launcher died inside the bind window, before any `AppProcess`
+or pidfile row existed), the retired-spawn branch, and `stop_app_backend`
+(disable, uninstall, repair/update, ceiling revocation, gateway shutdown) -- for a
+root that is still alive AND for a tracked root that exited after startup while
+the server it forked kept serving, which the live-root group signal cannot reach;
+the health supervisor's restart drains that same dead root's tree before it spawns
+the replacement, so a second server never comes up beside the one the launcher
+left holding the app's files.
+POSIX reaches a live root's tree through the process group the leader led, and
+that path is unchanged; an exited root's tree cannot use `kill_process_tree`
+(`getpgid` raises for a reaped leader), so both dead-root exits take the
+stale-reap's route -- members vouched by the spawn's `KIROCREW_SPAWN_INSTANCE`,
+which `AppProcess.spawn_instance` carries beside `pid_start_time`, signalled
+pinned to their own identity, then an unconditional SIGKILL pass after
+`_REAP_SIGTERM_GRACE` that is also the FINAL census (the opening one cannot
+contain a replacement the SIGTERM handler forked into the group), with the
+conclusion read off that final reading plus `pgroup_exists`, never off an empty
+census; nothing is signalled off Linux where the vouch cannot be read. The drain
+reports what may be concluded -- gone, a positive survivor, or nothing -- and
+`stop_app_backend` under a withdrawn ceiling (`_retry_if_serving`) refuses and
+restores tracking on a positive survivor, settles an inconclusive drain by the same
+port probe the live-root branch uses, and tolerates a survivor on an ordinary stop
+exactly as that branch does. Windows has no group: `taskkill /T /PID
+<root>` walks FROM the root and reaches nothing once the root has exited, which is
+how the surviving server became unmanaged. So the spawn reads the root's creation
+identity (`_proc_start_time`) BEFORE the survival check, while the `Popen` still
+pins the process object, and every Windows exit drains through
+`platform_compat.kill_process_tree_pinned(root_pid, start_time, ...)` -- the
+exact-handle drain from `platform-compat.md` §"Windows session-tree teardown",
+keyed on the identity `AppProcess.pid_start_time` records -- instead of the
+numeric `taskkill`. The live stops fall back to the numeric `taskkill` when the
+pinned path declines (no recorded identity, identity unpinnable, cleanup capacity
+refused, drain raised), so a stop is never weaker than it was; the failure branch
+does not, because the root that fallback would walk from is the exited one -- a
+refusal there is logged and the tree is left to the cleanup registry's
+maintenance, exactly as the stale-reap treats one. Adopted records (`proc is
+None`) have no spawned root and are never tree-drained. Out of scope, settled by
+the design that landed the drain: a descendant that `setsid`s out of the POSIX
+group, and a kill-on-close Job Object.
+
+Writers: `apps/backend.py::_drain_exited_root_tree`, `_signal_backend_tree`,
+`_start_app_backend_body` (identity capture, `AppProcess.spawn_instance`),
+`stop_app_backend`, `_restart_exited_backend`, `_terminate_retired_spawn`. Pinned by
+`test/test_app_backend_launcher_tree_drain.py`.
+
 The routes' async `app_lifecycle_lock` serializes route handlers only and does
 not imply exclusive backend-lifecycle ownership; any new lifecycle path must
 advance the generation through the public `start_app_backend` or
