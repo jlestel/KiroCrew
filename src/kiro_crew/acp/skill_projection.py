@@ -94,13 +94,6 @@ _PROJECTION_PRUNE_WORK_LIMIT = 4096
 # that is unreclaimable costs a full classification and never increments it,
 # which is why the section carries its own budget below.
 _PRUNE_MAX_RECLAIMS_PER_RUN = 64
-# The budget for one call's classification work, and a BETWEEN-candidate one: it
-# bounds how many candidates are walked, not how long any single one takes, and
-# the directory enumeration that precedes the walk is outside it. Sized well under
-# _PROJECTION_LOCK_TIMEOUT_SECS and sharing that ceiling with the publication
-# writes in the same section -- two atomic writes per alias plus the settings
-# commit -- so it has to leave room for those, not merely fit under the ceiling.
-_PRUNE_MAX_SECONDS_PER_RUN = 0.4
 # The boot drain runs the per-spawn prune in a loop, so each batch holds the
 # publication lock at most as long as one spawn's prune does. The pause between
 # batches lets a waiting spawn take the lock: a blocked acquire polls with
@@ -137,6 +130,22 @@ _PROJECTION_METADATA_DIR_NAME = ".kirocrew-skill-projection-metadata"
 # jitter and short Windows rename retries without inheriting the generic five-minute
 # lock ceiling on the native startup path.
 _PROJECTION_LOCK_TIMEOUT_SECS = 2.0
+# The share of that ceiling the prune walk must leave to the rest of its locked
+# section: the publication writes (two atomic writes per alias plus the settings
+# commit) and scheduler jitter. The lease scan's budget is taken out on its own.
+_PROJECTION_PUBLICATION_RESERVE_SECS = 1.2
+
+
+def _prune_budget_within(ceiling: float) -> float:
+    """The walk's share of ``ceiling`` once the lease scan and publication reserve are out."""
+    return ceiling - _PROJECTION_PUBLICATION_RESERVE_SECS - _PROJECTION_LEASE_SCAN_MAX_SECONDS
+
+
+# The budget for one call's classification work, and a BETWEEN-candidate one: it
+# bounds how many candidates are walked, not how long any single one takes, and
+# the directory enumeration that precedes the walk is outside it. Derived from the
+# lock ceiling, so retuning the ceiling moves the budget and keeps the reserve.
+_PRUNE_MAX_SECONDS_PER_RUN = _prune_budget_within(_PROJECTION_LOCK_TIMEOUT_SECS)
 
 # Generated specs stay in Kiro's shared agents directory, so metadata identifies
 # them for direct scanners and scopes cleanup to the owning Kiro Crew data home.

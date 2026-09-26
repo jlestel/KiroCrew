@@ -255,47 +255,56 @@ this agents directory sees the same eviction-then-republish rather than the
 home-scoped skip a recorded alias gets. Every other gate still applies to it:
 this run's own set, live in-process projections and held leases are all checked
 first, and removal is identity-checked against the bytes and inode just read.
-The prune runs while the publication lock is held, which is what keeps a deletion
-from landing on an alias a publisher that takes the same lock is writing. That
-lock's acquisition ceiling is fixed. Reclaims, stale-candidate work, and total
-traversal have separate PER RUN ceilings, and classification carries a time
-budget on top of them. The reclaim cap is a ceiling and never a floor, and it
-bounds no part of the section on its own — a yielded candidate that turns out
-not to be reclaimable costs a classification and never increments it. Leases are read by ONE
-bounded scan per prune rather than one probe per candidate. Candidate discovery
+The prune runs while the publication lock is held, which is what keeps a
+deletion from landing on an alias a publisher that takes the same lock is
+writing. What one call bounds is the section it holds, not the pile it works on.
+Reclaims, stale-candidate work, and total traversal have separate PER RUN
+ceilings. Leases are read by ONE bounded scan per prune, taken before the walk.
+A lease is only created under this same lock, so none appears mid-walk; one
+released mid-walk (its finalizer takes no lock) still reads as held, which keeps
+its aliases one call longer and never frees one early. Candidate discovery
 streams the directory under an entry-walk limit: retained aliases do not consume
 the stale-work budget, but every directory entry consumes the separately bounded
-traversal budget, and skip credit is capped at one work-limit, so arbitrary
-padding and a large live set cannot extend the enumeration. Only the candidates
-that bounded walk yields are materialized. The time budget is a
-BETWEEN-candidate budget: it is read before each candidate, so it limits how many
-are walked and not how long any single one takes. Each call starts at a rotating
-offset into the bounded candidate list: a budgeted walk from a fixed start
-examines the same prefix every time, so entries that are kept at the front would
-hide the reclaimable remainder of the window behind them permanently. The offset
-is drawn per call rather than remembered, since the workload this bounds spawns a
-fresh process per run and a process-local cursor would restart at zero every
-time; reach within the window across successive spawns is therefore probabilistic
-rather than scheduled. The rotation covers the bounded window only: stable
-padding can keep aliases beyond the entry-walk limit deferred, so the ceiling
-guarantees bounded entry traversal rather than eventual drain. Reaching the entry-walk
-limit is logged at INFO, the same way the lease-scan ceiling is, so that
-deferral is visible without the doctor census.
-An accumulated backlog is cleared by a
-gateway-boot drain (`drain_stale_aliases`, reached from the boot janitor
-through the `agent_sdk.drivers.acp` seam): it runs that same per-spawn prune
-under the publication lock in a loop, pausing between batches for longer than
-the lock's poll cap so a waiting spawn can take the lock. A batch that cannot
-take the lock counts as one that reclaimed nothing. It stops after
-`_DRAIN_IDLE_BATCHES` consecutive batches that reclaim nothing, each from a
-fresh start offset, or at `_DRAIN_MAX_BATCHES`. A reclaim
+traversal budget, and skip credit is capped at one work-limit, so padding and a
+large live set cannot extend the enumeration. Reaching that limit is logged at
+INFO, the same way the lease-scan ceiling is. Classification then runs under
+`_PRUNE_MAX_SECONDS_PER_RUN`, a BETWEEN-candidate budget: it limits how many
+candidates are walked, not how long any single one takes. It is derived from the
+lock's acquisition ceiling -- the ceiling minus the lease scan's budget minus
+`_PROJECTION_PUBLICATION_RESERVE_SECS`, the share kept for the publication
+writes in the same section -- so retuning the ceiling moves the budget with it.
+Reclaims are capped at `_PRUNE_MAX_RECLAIMS_PER_RUN` plus the aliases the call
+publishes. That cap is a ceiling and never a floor: a candidate that proves
+unreclaimable costs a full classification without counting toward it, so a call
+can spend its whole budget and reclaim nothing. Each call starts its walk at an
+offset drawn at random into the bounded candidate list, because the workload
+spawns a fresh process per run and a remembered cursor would restart at zero
+every time; across spawns an entry inside that window is reached with some
+probability, never on a schedule, and entries beyond the entry-walk limit stay
+deferred while stable padding sits ahead of them, so the ceiling guarantees
+bounded entry traversal rather than eventual drain. So one call guarantees a
+bounded locked section and at most a capped number of reclaims. No call
+guarantees the pile is smaller afterwards. The pile shrinks only while aliases
+are reclaimed faster than callers mint new ones, and the mint rate is a property
+of the workload -- how often agents are spawned with views that differ -- not of
+this code: the budget sets how much work a call may do, not whether that work
+outpaces the callers. A gateway-boot drain (`drain_stale_aliases`, reached from
+the boot janitor through the `agent_sdk.drivers.acp` seam) runs that same
+per-spawn prune under the publication lock in a loop, pausing between batches
+for longer than the lock's poll cap so a waiting spawn can take the lock. A
+batch that cannot take the lock counts as one that reclaimed nothing. It stops
+after `_DRAIN_IDLE_BATCHES` consecutive batches that reclaim nothing, each from
+a fresh start offset, or at `_DRAIN_MAX_BATCHES`, and it removes what those
+batches reach; it does not promise an empty directory. A reclaim
 the filesystem itself refuses -- a read-only mount, an agents directory this
 process cannot write -- is reported as a warning naming the directory, the
 operation and the errno, at most once per interval with the count of refusals
 it stands for; only `EACCES`, `EPERM` and `EROFS` are diagnosed as an unwritable
 directory, and any other errno (`ENOENT` from a concurrent prune elsewhere,
 `EMFILE`) is reported by name with no such diagnosis. Every other `False`
-from the unlink is a deliberate keep and stays at debug. Projected agent JSON contains only fields accepted by Kiro's strict
+from the unlink is a deliberate keep and stays at debug.
+
+Projected agent JSON contains only fields accepted by Kiro's strict
 schema; lifecycle ownership lives in the non-spec
 `.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's
 exact byte digest, so a stale or replaced sidecar cannot authorize deletion of a

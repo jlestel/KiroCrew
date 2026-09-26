@@ -2368,6 +2368,7 @@ def test_prune_scans_the_lease_directory_once_for_many_candidates(native_tree, m
     """
     _home, agents, _project = native_tree
     candidates = [_legacy_alias(agents, f"{index:024x}") for index in range(4)]
+    walked = [_legacy_alias(agents, f"{index:024x}") for index in range(100, 104)]
     external = projection._acquire_projection_lease(agents, {p.stem for p in candidates})
     lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
     normalized_lease_dir = os.path.normcase(os.path.normpath(os.fspath(lease_dir)))
@@ -2397,6 +2398,46 @@ def test_prune_scans_the_lease_directory_once_for_many_candidates(native_tree, m
 
     assert scandir_calls == 1, "the lease directory must be scanned once, not once per candidate"
     assert all(p.exists() for p in candidates)
+    assert not any(p.exists() for p in walked), "unleased candidates are walked and reclaimed"
+
+
+def test_a_lease_released_during_the_walk_keeps_its_aliases_for_that_call(native_tree, monkeypatch):
+    """A release races the snapshot lock-free, so a stale snapshot may only keep.
+
+    The lease is closed after the one scan and before the walk; the aliases it
+    named survive this call, and an unleased stale alias beside them is still
+    reclaimed, so the walk did run.
+    """
+    _home, agents, _project = native_tree
+    leased = [_legacy_alias(agents, f"{index:024x}") for index in range(3)]
+    free = _legacy_alias(agents, "f" * 24)
+    lease = projection._acquire_projection_lease(agents, {p.stem for p in leased})
+    real_candidates = projection._projection_prune_candidates
+
+    def release_then_enumerate(directory, skip):
+        lease.close()
+        return real_candidates(directory, skip)
+
+    monkeypatch.setattr(projection, "_projection_prune_candidates", release_then_enumerate)
+    reclaimed = projection._prune_stale_managed_aliases(
+        agents, projection.data_home().absolute().as_posix(), keep=set()
+    )
+
+    assert all(p.exists() for p in leased), "a lease released mid-walk must still keep its aliases"
+    assert not free.exists() and reclaimed == 1
+
+
+@pytest.mark.parametrize("ceiling", [projection._PROJECTION_LOCK_TIMEOUT_SECS, 1.7, 4.0])
+def test_prune_budget_follows_the_lock_ceiling_and_keeps_the_publication_reserve(ceiling):
+    """The walk budget is the ceiling minus the lease scan and a named reserve."""
+    budget = projection._prune_budget_within(ceiling)
+    reserve = projection._PROJECTION_PUBLICATION_RESERVE_SECS
+    scan = projection._PROJECTION_LEASE_SCAN_MAX_SECONDS
+    assert reserve > 0
+    assert budget + scan + reserve <= ceiling + 1e-9
+    assert budget == pytest.approx(ceiling - scan - reserve)
+    shipped = projection._prune_budget_within(projection._PROJECTION_LOCK_TIMEOUT_SECS)
+    assert projection._PRUNE_MAX_SECONDS_PER_RUN == shipped > 0
 
 
 def test_prune_skips_all_candidate_deletion_when_lease_scan_is_uncertain(native_tree, monkeypatch):
