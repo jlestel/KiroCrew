@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.label_guard import looks_like_prose
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -71,6 +72,11 @@ def _build_link_summary_prompt(links: list[dict]) -> str:
 # not serve it.
 _LINK_SUMMARY_MODEL = "auto"
 
+#: A leading list enumerator the model adds on its own ("1. ", "2) "). It is
+#: stripped from the label, and its presence tells a refusal line apart from
+#: narration around the list -- see ``_resolve_link_summaries``.
+_ENUMERATOR_RE = re.compile(r"^\d{1,2}[.)]\s+")
+
 
 async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> list[str]:
     """Generate summaries for a batch of links using the background session."""
@@ -81,11 +87,14 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
         state.sessions, prompt, model=_LINK_SUMMARY_MODEL, sel_source="chat_nav"
     )
 
-    # Parse: one label per line
-    lines = [re.sub(r'^\d{1,2}[.)]\s+', '', ln.strip()) for ln in text.strip().splitlines() if ln.strip()]
-    # Redact each label
+    # Parse: one label per line. The frontend merges the reply POSITIONALLY
+    # (label i -> link i), so alignment matters as much as content.
     results: list[str] = []
-    for ln in lines:
+    for raw_line in text.strip().splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        ln, enumerated = _ENUMERATOR_RE.subn("", raw_line)
         ln, redacted_url = redact_exfiltration_urls(ln)
         ln, redacted_cred = redact_credentials(ln)
         if redacted_url or redacted_cred:
@@ -94,6 +103,19 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
                 source="chat_nav", outcome="redacted",
                 metadata={"redacted_url": bool(redacted_url), "redacted_cred": bool(redacted_cred)},
             )
+        if looks_like_prose(ln):
+            # The model narrated instead of labeling ("I cannot access these
+            # links."). The prompt is a list of URLs and the turn is tool-free,
+            # so this is the same refusal the dashboard title discards; never
+            # store it as a chip. An ENUMERATED refusal ("2. I cannot access
+            # this link") still occupies its slot, so an empty label keeps the
+            # later labels on their own links; an unnumbered one is narration
+            # around the list ("Here are the labels:") and is dropped, because
+            # keeping it would shift every later label onto the wrong link.
+            logger.info("Link summary reply is prose, discarding: %r", ln[:120])
+            if enumerated:
+                results.append("")
+            continue
         results.append(ln[:80])
     return results
 

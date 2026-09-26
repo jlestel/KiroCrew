@@ -25,6 +25,11 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE, DashboardState, _ChatSlot
 from kiro_crew.execution_context import canonical_memory_mode, stricter_memory_mode
 from kiro_crew.history import is_incognito_transcript
+from kiro_crew.label_guard import (
+    is_verdict_reply,
+    looks_like_prose,
+    unspaced_script_chars,
+)
 from kiro_crew.llm_helpers import background_turn, run_bg_oneliner
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -224,168 +229,18 @@ _TITLE_LANGUAGE_TEMPLATE = (
     "ASCII SKIP, never a translation of it.\n\n"
 )
 
-# A title is 3-6 words by contract. Anything materially longer is the model
-# answering instead of naming, so the ceiling sits above any plausible real
-# title and below a sentence.
-_TITLE_MAX_WORDS = 12
-
-#: Codepoint ranges of scripts written WITHOUT spaces between words: kana, Han
-#: (+ extension A and the compatibility block) and Thai. A title in one of them
-#: is a single whitespace token, so ``_TITLE_MAX_WORDS`` can never fire for it —
-#: it needs the character ceiling below instead. Hangul and Cyrillic are
-#: deliberately absent: Korean and Russian do space their words, so the word
-#: ceiling bounds a long sentence in them. A SHORT Korean refusal clears that
-#: ceiling, so it is caught by sentence shape instead -- see
-#: ``_TITLE_KO_SENTENCE_ENDINGS``.
-_UNSPACED_SCRIPT_RANGES = (
-    (0x0E00, 0x0E7F),  # Thai
-    (0x3040, 0x30FF),  # Hiragana + Katakana
-    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
-    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
-    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
-)
-
-#: Ceiling on characters of unspaced script in a title. The prompt asks for
-#: ~4-14 characters in those languages, so this leaves headroom for a long name
-#: while a refusal or an answer runs well past it. Counting only the unspaced
-#: characters (not the whole string) keeps latin identifiers free: "修复
-#: PrivacyPanel 的动态键" spends 8 against the budget, not 24.
-_TITLE_MAX_UNSPACED_CHARS = 24
-
-#: Sentence terminators that are NOT followed by a space in the scripts that use
-#: them, so the ASCII rule's whitespace requirement would never fire on them.
-_TITLE_WIDE_TERMINATORS = "。！？"
-
 #: Punctuation an LLM wraps a name in, or ends it with. The full-width and CJK
 #: quote forms matter because titles are generated in the UI language: a zh/ja
 #: reply wraps in 「」 or “” and ends with 。, none of which an ASCII-only strip
 #: removes, so those titles would reach the sidebar still quoted.
 _TITLE_WRAP_CHARS = "\"'“”‘’「」『』《》.。．"
 
-# Openers that mark the reply as prose about the model rather than a name. The
-# observed failure was a pasted URL producing "I cannot access external URLs
-# like Quip documents. Based solely on the message c…" as the session name.
-_TITLE_PROSE_OPENERS = (
-    "i cannot",
-    "i can not",
-    "i can't",
-    "i cant",
-    "i am unable",
-    "i'm unable",
-    "i am not able",
-    "i'm not able",
-    "i do not have",
-    "i don't have",
-    "i dont have",
-    "i was unable",
-    "i will not",
-    "i won't",
-    "i need ",
-    "i would need",
-    "unable to",
-    "cannot access",
-    "can't access",
-    "cannot fetch",
-    "can't fetch",
-    "sorry",
-    "apologies",
-    "unfortunately",
-    "as an ai",
-    "based solely",
-    "based on the",
-    "it seems",
-    "it looks like",
-    "here is",
-    "here's",
-    "the conversation",
-    "this conversation",
-    "note:",
-)
-
-#: Korean refusal/prose shape. Hangul spaces its words, so the word ceiling
-#: bounds a long Korean sentence -- but a refusal is SHORT (five words in the
-#: observed case), and ``_TITLE_PROSE_OPENERS`` is English-only, so a short
-#: Korean refusal clears every other check. Korean
-#: is SOV: the verb that marks a sentence as a sentence comes LAST, so prefix
-#: openers cannot catch it -- match the sentence-final conjugation instead.
-#: The polite declarative endings close the sentence forms a titling model
-#: actually emits: "-nida" (U+B2C8 U+B2E4, the hamnida/seumnida/imnida
-#: family) and the informal-polite "-eoyo"/"-ayo"/"-haeyo" (U+C5B4/U+C544/
-#: U+D574 + U+C694). A noun-phrase title carries none of them; a plain-form
-#: (banmal) refusal stays a documented false negative. The one useful prefix
-#: is "joesong" (U+C8C4 U+C1A1, "sorry"), the apology opener. Both signals
-#: trade deliberately toward rejection: a sentence-form Korean title ("the
-#: login does not work") loses to the fallback name, which is the cheaper
-#: failure -- a fallback name is still the user's own words, a refusal stored
-#: as the name is the bug. Escapes keep the source ASCII; the runtime values
-#: are the Hangul strings.
-_TITLE_KO_PROSE_OPENERS = ("\uc8c4\uc1a1",)
-_TITLE_KO_SENTENCE_ENDINGS = (
-    "\ub2c8\ub2e4",
-    "\uc5b4\uc694",
-    "\uc544\uc694",
-    "\ud574\uc694",
-)
-
-
-def _unspaced_script_chars(s: str) -> int:
-    """Count characters belonging to a script written without word spaces."""
-    return sum(1 for ch in s if any(lo <= ord(ch) <= hi for lo, hi in _UNSPACED_SCRIPT_RANGES))
-
-
-def _looks_like_prose(title: str) -> bool:
-    """True when an LLM title reply is a sentence about the task, not a name.
-
-    The titling call is tool-free by contract (``run_bg_oneliner`` rejects every
-    permission request), so a message containing a URL can make the model
-    narrate the denial instead of naming the chat — and that narration was being
-    persisted as the session title. Prompt wording alone cannot guarantee the
-    shape of a generation, so the reply is also validated here and treated as
-    SKIP when it fails, which routes to the existing fallback title.
-
-    Five signals, each independently sufficient:
-
-    - a refusal/narration opener (see ``_TITLE_PROSE_OPENERS``);
-    - more words than any real title carries;
-    - more unspaced-script characters than any real title carries. Chinese,
-      Japanese and Thai put no spaces between words, so a whole sentence in them
-      is ONE word by ``str.split`` and slips past the word ceiling entirely;
-    - sentence-terminating punctuation with text after it. The ASCII terminator
-      must be followed by whitespace so "Node.js upgrade plan" and "Ship v1.2 to
-      prod" stay valid; the full-width forms must not, because the scripts that
-      use them do not space after punctuation.
-    - Korean sentence shape (see ``_TITLE_KO_SENTENCE_ENDINGS``). Hangul spaces
-      its words, but a refusal is short enough to clear the word ceiling, and a
-      prefix opener cannot catch an SOV language whose refusal verb comes last
-      -- so the sentence-final polite conjugation is matched instead, a grammar
-      fact rather than a phrase list.
-
-    Known false negative: a SHORT refusal in an unspaced script with no
-    terminator ("无法访问该链接") clears every ceiling and lands as the title.
-    That class is inherent to matching prose by shape — the openers list is the
-    only signal that catches it, and maintaining one per shipped locale is
-    whack-a-mole. It fails to a wrong-but-short name, never to a paragraph.
-    """
-    stripped = title.strip()
-    if not stripped:
-        return False
-    lowered = stripped.lower()
-    if lowered.startswith(_TITLE_PROSE_OPENERS):
-        return True
-    if stripped.startswith(_TITLE_KO_PROSE_OPENERS):
-        return True
-    if stripped.endswith(_TITLE_KO_SENTENCE_ENDINGS):
-        return True
-    if len(stripped.split()) > _TITLE_MAX_WORDS:
-        return True
-    if _unspaced_script_chars(stripped) > _TITLE_MAX_UNSPACED_CHARS:
-        return True
-    for index, char in enumerate(stripped[:-1]):
-        if char in ".!?" and stripped[index + 1].isspace():
-            return True
-        if char in _TITLE_WIDE_TERMINATORS:
-            return True
-    return False
+# The refusal/prose and verdict checks are shared with every other label path
+# (Slack/Telegram title, nav link chips, session summary) so they cannot drift;
+# the private names are kept because the reveal and the tests use them.
+_unspaced_script_chars = unspaced_script_chars
+_looks_like_prose = looks_like_prose
+_is_verdict_reply = is_verdict_reply
 
 
 def _strip_markdown_images(content: str, *, drop_trailing_partial: bool = False) -> str:
@@ -903,48 +758,6 @@ async def _reveal_title(
             return
         state.push_slot_title(slot.key, prefix, full=False)
         await asyncio.sleep(_TITLE_REVEAL_STEP_SECS)
-
-
-#: Characters that read as a verdict-reason separator right after a control
-#: word ("SKIP: too vague", "SKIP (too vague)"). Deliberately NOT every
-#: non-alphanumeric: "-" and "." separate only when spaced away from the next
-#: word, so identifier titles the prompt tells the model to keep verbatim
-#: ("KEEP-ALIVE header bug", "SKIP.md parser fix") survive, and "_" never
-#: separates ("SKIP_TESTS env var flag").
-_TITLE_VERDICT_TRAILERS = ":,;!?("
-
-
-def _is_verdict_reply(title: str, control_words: tuple[str, ...]) -> bool:
-    """True when *title* is a control word, alone or followed by a reason.
-
-    The word is matched case-insensitively on every shape: the words are
-    taught as literal ASCII, but a lowercased echo is still a verdict, with
-    or without a reason attached ("skip", "Skip: greetings only", "keep - the
-    title still fits"). What separates a verdict-plus-reason from a real
-    title OPENING with the word is the separator: punctuation (or a spaced
-    dash / spaced period) means verdict, while a plain following word or an
-    identifier joiner means title ("SKIP and KEEP handling", "Keep alive
-    timer bug", "SKIPPED frames in reveal", "KEEP-ALIVE header bug").
-    """
-    upper = title.upper()
-    if upper in control_words:
-        return True
-    for word in control_words:
-        if not upper.startswith(word):
-            continue
-        rest = title[len(word) :]
-        head = rest.lstrip()
-        spaced = len(head) != len(rest)
-        if not head:
-            return True
-        char = head[0]
-        if char in _TITLE_VERDICT_TRAILERS:
-            return True
-        if char == "-" and (spaced or len(head) < 2 or head[1].isspace()):
-            return True
-        if char == "." and (len(head) < 2 or head[1].isspace()):
-            return True
-    return False
 
 
 def _validate_title_reply(

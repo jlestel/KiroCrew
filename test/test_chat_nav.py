@@ -114,6 +114,104 @@ class TestResolveLinkSummaries:
         )
         assert result == ["2024 Design Roadmap", "3-phase rollout plan"]
 
+    @staticmethod
+    def _state_replying(text: str):
+        """A state whose background session answers *text* to any prompt."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
+
+        class FakeEvent:
+            def __init__(self, kind, text=""):
+                self.kind = kind
+                self.text = text
+
+        class FakeClient:
+            async def prompt(self, prompt):
+                yield FakeEvent(EVENT_TEXT_CHUNK, text)
+                yield FakeEvent(EVENT_COMPLETE)
+
+            async def reject_tool(self, rid):
+                pass
+
+            async def destroy(self):
+                pass
+
+        class FakeSessions:
+            async def get_bg_session(self):
+                return FakeClient()
+
+        class FakeState:
+            sessions = FakeSessions()
+
+        return FakeState()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "I cannot access these links.",
+            "Sorry, I am unable to open external URLs",
+            "Unable to fetch the linked pages without tool access",
+        ],
+    )
+    async def test_a_refusal_is_never_stored_as_a_chip_label(self, reply):
+        """#10375: the prompt is a list of URLs and the turn is tool-free, so
+        the model narrates the denial; that sentence became a 28-character
+        nav chip. Mutation: drop the ``looks_like_prose`` branch -- red."""
+        result = await _resolve_link_summaries(
+            self._state_replying(reply),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_an_enumerated_refusal_keeps_its_slot(self):
+        """Labels are merged positionally (label i -> link i). A refusal for
+        link 2 in a numbered reply must leave an EMPTY slot 2, so label 3 stays
+        on link 3. Mutation: ``continue`` without appending -- red (the third
+        label shifts onto the second link)."""
+        result = await _resolve_link_summaries(
+            self._state_replying(
+                "1. Nav Panel Feature CR\n"
+                "2. I cannot access this link.\n"
+                "3. Memory V2 Design Doc\n"
+            ),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}, {"url": "https://c.com"}],
+        )
+        assert result == ["Nav Panel Feature CR", "", "Memory V2 Design Doc"]
+
+    @pytest.mark.asyncio
+    async def test_leading_narration_does_not_shift_the_labels(self):
+        """An unnumbered sentence AROUND the list ("Here are the labels:") is
+        not a slot: keeping it (even as "") would put every later label on the
+        wrong link. Mutation: append "" for every prose line -- red."""
+        result = await _resolve_link_summaries(
+            self._state_replying(
+                "Here are the labels for your links:\n"
+                "1. Nav Panel Feature CR\n"
+                "2. Memory V2 Design Doc\n"
+            ),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert result == ["Nav Panel Feature CR", "Memory V2 Design Doc"]
+
+    @pytest.mark.asyncio
+    async def test_legitimate_short_labels_still_pass(self):
+        """The guard must not eat real labels: identifier dots, the prompt's
+        own URL-type fallback, a CJK name and a label that opens with a digit."""
+        reply = (
+            "1. Node.js upgrade CR\n2. Doc dVbcAXW3\n3. 记忆 V2 设计文档\n4. 2024 Design Roadmap\n"
+        )
+        result = await _resolve_link_summaries(
+            self._state_replying(reply),
+            [{"url": f"https://{i}.com"} for i in range(4)],
+        )
+        assert result == [
+            "Node.js upgrade CR",
+            "Doc dVbcAXW3",
+            "记忆 V2 设计文档",
+            "2024 Design Roadmap",
+        ]
+
 
 class TestApiEndpoint:
     @pytest.mark.asyncio

@@ -76,6 +76,7 @@ from kiro_crew.history import (
     transcript_stems,
     transcript_withholds_derivation,
 )
+from kiro_crew.label_guard import is_verdict_reply, looks_like_prose
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.mcp_discovery import sync_discovered_servers
 from kiro_crew.messaging.link import _in_namespace, canonical_key
@@ -1561,6 +1562,11 @@ _SUMMARIZE_MSG_LIMIT = 12  # messages fed to the summarizer per session
 _SUMMARIZE_TIMEOUT_SECS = (
     30  # per-session deadline so one stalled prompt can't pin the shared _bg session
 )
+# Prose ceilings for the refusal guard, scaled to this prompt's 18-word contract
+# the way the title's ceilings (12 words / 24 chars) sit above its 3-6 word
+# contract: a legitimate long summary clears them, a refusal paragraph does not.
+_SUMMARIZE_PROSE_MAX_WORDS = 36
+_SUMMARIZE_PROSE_MAX_UNSPACED_CHARS = 72
 _SUMMARIZE_PROMPT = (
     "Summarize the following conversation in ONE terse line (max 18 words), "
     "describing what the user and assistant are working on. No preamble, no "
@@ -1657,10 +1663,21 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
         logger.debug("Session summary generation failed for %s", key, exc_info=True)
         return ""
     summary = text.strip().strip('"').strip("'").strip(".")
-    if not summary or summary.upper() == "SKIP":
+    if not summary or is_verdict_reply(summary, ("SKIP",)):
         return ""
     summary, _ = redact_exfiltration_urls(summary)
     summary, _ = redact_credentials(summary)
+    if looks_like_prose(
+        summary,
+        max_words=_SUMMARIZE_PROSE_MAX_WORDS,
+        max_unspaced_chars=_SUMMARIZE_PROSE_MAX_UNSPACED_CHARS,
+    ):
+        # The model refused or narrated instead of summarizing. Return "" so the
+        # caller falls back to the stored title, and -- crucially -- do NOT reach
+        # the sidecar write below: a cached refusal would be served on every
+        # later list until the transcript changes.
+        logger.info("Session summary reply is prose, discarding for %s", key)
+        return ""
     summary = summary[:200]
     # Revalidate only after the model call has returned: model latency must never
     # block a transcript writer. Keep the hold through the sidecar write so a

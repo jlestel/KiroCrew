@@ -269,3 +269,46 @@ class TestSessionsSummarizeHandler:
             "Discarding summary for alpha: the transcript became restricted during "
             "summarisation" in caplog.text
         )
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "I cannot summarize this conversation without more context",
+            "Sorry, the transcript does not contain enough information",
+            "As an AI, I do not have access to the linked document",
+            "SKIP, the topic is unclear",
+            "SKIP - only a greeting so far",
+        ],
+    )
+    async def test_a_refusal_or_verdict_reason_is_not_served_or_cached(self, tmp_path, reply):
+        """#10375: the session summary tested only ``summary.upper() == "SKIP"``
+        and then persisted the reply through the sidecar cache, so one refusal
+        sentence (or ``SKIP, <reason>``) was served on every later list until
+        the transcript changed. Neither may be returned NOR cached. Mutation:
+        drop the ``looks_like_prose`` branch / restore the exact-equality test
+        -- red on the response AND on the cache read."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "help me tune the redis timeout")
+        created: list = []
+        async with TestClient(TestServer(_make_app(log, reply, created))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert resp.status == 200
+            assert (await resp.json())["summaries"] == {}
+        assert created, "the model was consulted"
+        assert not log.get_cached_summary("alpha")
+
+    @pytest.mark.asyncio
+    async def test_a_legitimate_long_summary_is_still_stored(self, tmp_path):
+        """The summary contract is 18 words, three times the title's, so the
+        title's 12-word ceiling must NOT apply here. Mutation: call the guard
+        with its title defaults -- red."""
+        reply = (
+            "User and assistant tune the redis client timeout, add retry with "
+            "backoff and verify against staging"
+        )
+        assert 12 < len(reply.split()) <= 18
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "help me tune the redis timeout")
+        async with TestClient(TestServer(_make_app(log, reply, []))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert (await resp.json())["summaries"]["alpha"] == reply
+        assert log.get_cached_summary("alpha") == reply

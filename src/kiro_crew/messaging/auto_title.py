@@ -67,6 +67,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, NamedTuple
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
+from kiro_crew.label_guard import is_verdict_reply, looks_like_prose
 from kiro_crew.llm_helpers import background_turn
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -193,13 +194,23 @@ def clean_title(raw: str) -> str:
     HTML, and a title is rendered as-is on both), then redacts and caps. Returns
     ``""`` for an empty reply or the SKIP verdict, which the caller treats as
     "not nameable yet" rather than as a failure.
+
+    The verdict is recognised alone or with a reason attached ("SKIP - too
+    vague"), and a reply shaped like a sentence about the task ("I cannot
+    access that link") is discarded the same way -- the same two checks the
+    dashboard title runs, from :mod:`kiro_crew.label_guard`. This name is
+    written to the Slack thread itself when a ``set_channel_title`` hook is
+    passed, so a refusal stored here renames a conversation other people see.
     """
     title = raw.split("\n")[0].strip("\"'. \t")
     title = title.replace("<", "").replace(">", "")
-    if not title or title.upper() == TITLE_SKIP_VERDICT:
+    if not title or is_verdict_reply(title, (TITLE_SKIP_VERDICT,)):
         return ""
     title, _ = redact_exfiltration_urls(title)
     title, _ = redact_credentials(title)
+    if looks_like_prose(title):
+        logger.info("Auto-title reply is prose, discarding: %r", title[:120])
+        return ""
     return title[:TITLE_MAX_CHARS]
 
 

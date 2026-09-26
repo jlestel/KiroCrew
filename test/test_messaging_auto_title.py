@@ -1129,6 +1129,62 @@ class TestCleaning:
         """Mutation: drop the ``[:TITLE_MAX_CHARS]`` slice — red."""
         assert len(auto_title.clean_title("z" * 500)) == auto_title.TITLE_MAX_CHARS
 
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "I cannot access that link",
+            "Sorry, I can't see the linked document",
+            "Unfortunately the URL is not reachable from here",
+            "Based on the message, I cannot determine a topic",
+            "The user asked me to open a link. I could not open it",
+            "the quick brown fox jumps over the lazy dog again and again today",
+        ],
+    )
+    def test_a_refusal_or_sentence_is_not_stored_as_the_name(self, reply):
+        """#10375: the Slack/Telegram namer stored a model refusal as the
+        conversation name -- and Slack writes that name to the thread other
+        people see. The same prose guard the dashboard title has run since #1106
+        now applies here. Mutation: drop the ``looks_like_prose`` branch -- red
+        on every row (each is a sentence by opener, terminator or word count)."""
+        assert auto_title.clean_title(reply) == ""
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "SKIP - the topic is not clear yet",
+            "SKIP: greetings only",
+            "SKIP (too vague)",
+            "skip, nothing to name",
+        ],
+    )
+    def test_a_one_line_verdict_with_a_reason_means_no_title(self, reply):
+        """#10375: ``"SKIP - THE TOPIC IS NOT CLEAR YET" != "SKIP"``, so the
+        exact-equality test stored the verdict line as the name. Mutation:
+        restore ``title.upper() == TITLE_SKIP_VERDICT`` -- red on every row."""
+        assert auto_title.clean_title(reply) == ""
+
+    @pytest.mark.parametrize(
+        "reply, expected",
+        [
+            ("Node upgrade plan", "Node upgrade plan"),
+            ("Node.js upgrade plan", "Node.js upgrade plan"),
+            ("Ship v1.2 to prod", "Ship v1.2 to prod"),
+            ("SKIP and KEEP handling", "SKIP and KEEP handling"),
+            ("Skipped frames in reveal", "Skipped frames in reveal"),
+            ("SKIP-list parser fix", "SKIP-list parser fix"),
+            ("修复登录页面", "修复登录页面"),
+        ],
+    )
+    def test_a_legitimate_short_title_is_still_stored(self, reply, expected):
+        """The guard must not eat real names: identifier dots, version numbers,
+        a title that merely OPENS with the control word, and a short CJK name
+        all survive. Mutation: make the guard reject everything -- red."""
+        assert auto_title.clean_title(reply) == expected
+
+    def test_the_multi_line_verdict_still_means_no_title(self):
+        """The first-line reduction #10207 praised is unchanged."""
+        assert auto_title.clean_title("SKIP\n\nThe topic is unclear.") == ""
+
 
 # ──────────────────────────────────────────────────────────────────────
 # The per-loop lock
