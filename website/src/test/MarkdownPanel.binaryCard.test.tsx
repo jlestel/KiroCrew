@@ -160,7 +160,7 @@ describe('MarkdownPanel binary gate', () => {
     await userEvent.click(screen.getByRole('menuitem', { name: /refresh/i }))
     await waitFor(() => expect(onDiskContent).toHaveBeenCalled())
     // Empty buffer, not the envelope JSON, AND the verdict alongside it.
-    expect(onDiskContent).toHaveBeenCalledWith('', true)
+    expect(onDiskContent).toHaveBeenCalledWith('', true, false)
   })
 
   it('reports a text refresh as not-binary, so a stale true cannot stick', async () => {
@@ -186,7 +186,7 @@ describe('MarkdownPanel binary gate', () => {
     await userEvent.click(screen.getByTestId('markdown-panel-more-options'))
     await userEvent.click(screen.getByRole('menuitem', { name: /refresh/i }))
     await waitFor(() => expect(onDiskContent).toHaveBeenCalled())
-    expect(onDiskContent).toHaveBeenCalledWith('# now text', false)
+    expect(onDiskContent).toHaveBeenCalledWith('# now text', false, false)
   })
 
   it('reports a failed Refresh instead of doing nothing visible', async () => {

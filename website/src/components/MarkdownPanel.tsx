@@ -25,8 +25,9 @@ import { findBestOccurrence } from '../hooks/useMarkdownCommentHighlights'
 import { detectFileType, BinaryFileCard } from './FileRenderers'
 import { ContentRenderer, MD_EXTS, extOf, langFor, wrapCode } from './ContentRenderer'
 import { api } from '../api/client'
-import { fileReadUrl, downloadFileToDisk } from '../utils/fileReadUrl'
-import { fetchFileRead, fileReadQueryKey } from '../utils/fileReadQuery'
+import { fileReadUrl, downloadFileToDisk, downloadFileName } from '../utils/fileReadUrl'
+import { downloadBlob } from '../utils/download'
+import { fetchFileRead, fileReadQueryKey, isPartialRead } from '../utils/fileReadQuery'
 import { documentBodyEpochNow } from '../hooks/usePanelTabs'
 import { loadCommentDrafts, saveCommentDrafts, setCommentsForFile } from '../utils/commentDrafts'
 import { copyToClipboard } from '../utils/clipboard'
@@ -275,6 +276,14 @@ interface Props {
    *  (image, pdf, video, …) keep their own viewer — they are binary too, and
    *  they read the file through `/api/file-raw`, not through this buffer. */
   binary?: boolean
+  /** The read that filled the buffer did not hand over the whole file -- cut at
+   *  the gateway's cap (`X-Truncated`) or with credentials redacted
+   *  (`X-Redacted`). Host-owned like `binary`, for the same reason: the seed
+   *  read that fills a tab runs before any panel mounts, and the body cannot
+   *  tell about itself (a whole file may quote the redaction tag). Decides only
+   *  WORDS and a file name once the file is gone: the banner and the close
+   *  prompt say "only part of it", and a download of it is named `.partial`. */
+  partial?: boolean
   onContentChange: (c: string) => void
   /** Disk-originated content (file watch, Refresh). Document tabs restamp
    *  their saved baseline here so a re-open still treats the tab as clean;
@@ -286,8 +295,9 @@ interface Props {
    *  output, a checkout, an agent write), and patching the buffer while leaving
    *  the verdict at its hydrated value leaves the editor live over bytes it
    *  cannot represent — where a save would overwrite them. `undefined` means
-   *  the caller has no verdict to report and the stored one stands. */
-  onDiskContent?: (c: string, binary?: boolean) => void
+   *  the caller has no verdict to report and the stored one stands. `partial`
+   *  travels the same way, for the same read. */
+  onDiskContent?: (c: string, binary?: boolean, partial?: boolean) => void
   onSave: (filePath: string, content: string) => Promise<void>
   onClose: () => void
   liveWatch?: boolean
@@ -386,7 +396,10 @@ const BYTE_BACKED_FILE_TYPES = new Set(['image', 'pdf', 'sheet', 'office', 'vide
  *  `superseded` means a newer read of this panel started before this one
  *  answered, or the panel moved to another path: apply nothing, say nothing. */
 type DiskRead =
-  | { kind: 'ok'; text: string; binary: boolean }
+  | { kind: 'ok'; text: string; binary: boolean; partial: boolean }
+  /** The file is not on disk (404): a real answer, rendered as the same
+   *  placeholder the chip click and the cold-tab hydration show for it. */
+  | { kind: 'missing' }
   | { kind: 'failed' }
   | { kind: 'superseded' }
 
@@ -407,6 +420,15 @@ function CommentHint({ onDismiss }: { onDismiss: () => void }) {
 }
 
 const HINT_KEY = 'kirocrew:comment-hint-dismissed'
+
+/** How often a visible tab whose file is gone asks the disk whether it is
+ *  back: `api_file_watch`'s own poll cadence (1 s), so a recreated file lands
+ *  as fast as a change would through the stream the tab cannot hold meanwhile. */
+const MISSING_FILE_RETRY_MS = 1_000
+/** The ceiling the retry backs off to: each attempt doubles the wait, so a
+ *  file that stays gone costs one GET (and one SEL `not_found` record) every
+ *  30 s, not every second, until the tab is hidden or the file is back. */
+const MISSING_FILE_RETRY_MAX_MS = 30_000
 
 /** Report a failure to the panel, which renders it through the shared
  *  ErrorNotice (replacing the blocking `alert()` these paths used to raise). */
@@ -527,13 +549,17 @@ function KnowledgeToggleIconButton({ state }: { state: ReturnType<typeof useFile
 // the cap instead of being clipped by it.
 const menuRowCls = 'flex items-center gap-2 w-full min-w-0 overflow-hidden px-3 py-1.5 text-[13px] text-text cursor-pointer border-none bg-transparent text-left whitespace-nowrap hover:bg-bg-hover focus-visible:bg-bg-hover focus:outline-hidden'
 
-export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDisabled, refreshTitle, onFullscreen, fullscreen, onSnapshot, snapshotting, wordWrap, onToggleWordWrap, lineNums, onToggleLineNums, collapseUnchanged, onToggleCollapseUnchanged, diffSplit, onToggleDiffSplit }: {
+export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDisabled, refreshTitle, onFullscreen, fullscreen, onSnapshot, snapshotting, wordWrap, onToggleWordWrap, lineNums, onToggleLineNums, collapseUnchanged, onToggleCollapseUnchanged, diffSplit, onToggleDiffSplit, onDownload }: {
   filePath: string; content: string
   /** Where a failed row action (add to knowledge, promote, snapshot, save,
    *  download, open/reveal, an app-contributed row's dispatch) is reported: the
    *  panel renders it through the shared ErrorNotice. The menu itself closes on
    *  select, so it cannot host the notice. */
   onError: ReportError
+  /** What the Download row does instead of fetching the path: the panel passes
+   *  its buffer download while the file is gone from disk, where the fetch
+   *  would only answer 404 for the one file the banner just said to keep. */
+  onDownload?: () => void
   /** View actions folded in from the old header row (side-panel revamp): the
    *  ⋯ menu is the single home for everything that isn't a mode toggle. */
   onRefresh?: () => void; refreshDisabled?: boolean; refreshTitle?: string
@@ -722,7 +748,7 @@ export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDis
           <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { copyToClipboard(content); setOpen(false) }}>
             {i18nT('components.markdownPanel.copy_content')}
           </button>
-          <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void downloadFile(filePath, onError); setOpen(false) }}>
+          <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { if (onDownload) onDownload(); else void downloadFile(filePath, onError); setOpen(false) }}>
             {i18nT('components.markdownPanel.download')}
           </button>
           {/* App-contributed rows (`contributes.fileMenuItems`, surface
@@ -940,6 +966,30 @@ function useFileArtifactState(filePath: string, content: string, onError: Report
  * listener already picks up — no editor-specific selection bridge needed. */
 /** Diff mode with nothing to show: the file matches its baseline, so the diff
  *  canvas would render empty. Say so and offer the way out. */
+/** What a tab shows while its file is not on disk: a banner OVER the document,
+ *  never in place of it. The buffer underneath may be the only copy left of a
+ *  file deleted outside the dashboard, so the last copy stays on screen and the
+ *  banner says what it is -- and carries the two ways to keep it, because a
+ *  sentence that says "copy it or save it elsewhere" without them leaves the
+ *  reader guessing which toolbar icon it means. Both act on the BUFFER: the ⋯
+ *  menu's Download fetches the path, which a gone file answers 404, so this
+ *  Download hands the browser the text on screen under the file's name, and
+ *  Copy content puts it on the clipboard. A PARTIAL buffer -- a read the
+ *  gateway cut at 512 000 characters or redacted -- says so instead, and never
+ *  calls itself the only remaining version. Same band and the same action
+ *  styles as the unsaved-changes banner, so the two conditions the tab can be
+ *  in read alike. */
+function MissingFileBanner({ onDownload, onCopy, copied, partial }: { onDownload: () => void; onCopy: () => void; copied: boolean; partial: boolean }) {
+  return (
+    <div data-testid="markdown-panel-missing-file" role="status" className="flex flex-wrap items-center gap-2 min-h-[40px] px-3 py-2 bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] border-b border-[color-mix(in_srgb,var(--warn)_30%,transparent)] shrink-0">
+      <TriangleAlert size={13} className="text-warn shrink-0" />
+      <span className="flex-1 basis-[12rem] min-w-0 text-[12px] text-text">{i18nT(partial ? 'components.markdownPanel.file_not_found_partial_copy' : 'components.markdownPanel.file_not_found_last_copy')}</span>
+      <button className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium text-muted hover:text-text border border-border bg-transparent cursor-pointer transition-colors shrink-0" onClick={onCopy}>{copied ? i18nT('components.markdownPanel.copied') : i18nT('components.markdownPanel.copy_content')}</button>
+      <button className="px-3 h-[26px] rounded-md text-[11.5px] font-semibold border border-accent text-accent-fg bg-accent cursor-pointer hover:bg-accent-hover transition-all shrink-0" onClick={onDownload}>{i18nT('components.markdownPanel.download')}</button>
+    </div>
+  )
+}
+
 function ZeroDiffNotice({ onExitDiff, message }: { onExitDiff: () => void; message?: string }) {
   return (
     <div className="h-full flex flex-col items-center justify-center gap-2.5 text-muted px-6 text-center">
@@ -1009,14 +1059,16 @@ const CommentOverlayBlock = memo(function CommentOverlayBlock({ onSubmitComments
  *  control can't bypass the "Discard unsaved changes?" confirmation. */
 export interface MarkdownPanelHandle {
   requestClose: () => void
-  /** Run `nav` unless the buffer is dirty, in which case ask first. For an
-   *  external control that REPLACES this panel's file (the browser rail's tree
-   *  click re-targets the tab in place), which destroys the buffer just as a
-   *  close does but reaches none of the close paths. */
+  /** Run `nav` with a predicate that says whether this buffer may be replaced
+   *  in place. For an external control that REPLACES this panel's file (the
+   *  browser rail's tree click re-targets the tab in place), which destroys the
+   *  buffer just as a close does but reaches none of the close paths. Asks the
+   *  disk first, the way the close does, so a file deleted under a live stream
+   *  is found before the buffer -- then its only copy -- is replaced. */
   requestNavigate: (nav: (stillClean: () => boolean) => void) => void
 }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, binary, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, connected = true, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, binary, partial, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, connected = true, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
   const qc = useQueryClient()
@@ -1071,6 +1123,12 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // the moment they are about to discard the buffer.
   const dirtyRef = useRef(dirty)
   dirtyRef.current = dirty
+  // The same mirrors for the buffer and its verdict: a disk read that lands
+  // after its await compares against what the tab shows NOW.
+  const contentRef = useRef(content)
+  contentRef.current = content
+  const binaryRef = useRef(!!binary)
+  binaryRef.current = !!binary
   const { confirm, confirmDialog, confirmOpen } = useConfirm()
   // When a saved baseline is provided (inline preview), keep `dirty` derived
   // from content-vs-disk so a RESTORED draft is dirty and the close guard fires.
@@ -1392,13 +1450,28 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
 
   /** Read the file as it is now, with the verdict the read produced.
    *
-   * Refresh, Cancel and the file watch all go through here, and only the
-   * NEWEST of this panel's reads may land: each read aborts the one before it
-   * and answers `superseded` if a later one started while it was in flight, so
-   * an older re-read cannot put back bytes -- or a verdict -- that a newer one
-   * has already replaced. Reporting stays with each caller because only it
-   * knows whether a human is waiting on the result. */
+   * ALWAYS a fresh fetch of the disk. That is the one rule every read of this
+   * panel rests on -- the catch-up on a mount, a remount or a return, the
+   * post-edit read a save or an undo starts, Refresh, Cancel, the watch's
+   * re-read: each exists to see the file as it is NOW, and any body that is
+   * not this fetch's can predate the change it must find. Not the read that
+   * opened the tab (a file deleted between that GET and the mount left the tab
+   * counted as caught up while its stream 404'd into a silent terminal error,
+   * and the edit and save that followed recreated the deleted file from the
+   * stale copy); not a `['file-read', path]` entry still inside its 10 s
+   * window (after a save it holds the pre-save body); not a fetch already in
+   * flight for an older moment. The mount right after a chip open costs one
+   * GET again -- the price of a buffer the disk vouches for.
+   *
+   * Only the NEWEST of this panel's reads may land: each read aborts the one
+   * before it and answers `superseded` if a later one started while it was in
+   * flight, so an older re-read cannot put back bytes -- or a verdict -- that
+   * a newer one has already replaced. Reporting stays with each caller because
+   * only it knows whether a human is waiting on the result. */
   const diskReadAbortRef = useRef<AbortController | null>(null)
+  /** Reads of this panel not yet settled. The watch consults it: an equal frame
+   *  is quiet only when no read is in flight (see the callback). */
+  const diskReadsInFlightRef = useRef(0)
 
   const readFromDisk = useCallback(async (): Promise<DiskRead> => {
     diskReadAbortRef.current?.abort()
@@ -1408,12 +1481,16 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     // start and finish makes this read's bytes stale under the pass now in
     // force: superseded, never applied. The tab rehydrates through a fresh read.
     const epoch = documentBodyEpochNow()
+    diskReadsInFlightRef.current++
     try {
       const r = await fetchFileRead(filePath, ac.signal)
       if (ac.signal.aborted || documentBodyEpochNow() !== epoch) return { kind: 'superseded' }
-      return r.ok ? { kind: 'ok', text: r.text, binary: r.binary } : { kind: 'failed' }
+      if (r.ok) return { kind: 'ok', text: r.text, binary: r.binary, partial: isPartialRead(r) }
+      return r.status === 404 ? { kind: 'missing' } : { kind: 'failed' }
     } catch {
       return ac.signal.aborted ? { kind: 'superseded' } : { kind: 'failed' }
+    } finally {
+      diskReadsInFlightRef.current--
     }
   }, [filePath])
 
@@ -1424,48 +1501,292 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     diskReadAbortRef.current = null
   }, [filePath])
 
-  /** Apply a disk read to the tab: buffer, saved baseline and verdict together.
-   *  The `['file-read', path]` cache entry is dropped rather than rewritten, so a
-   *  reopen inside its 10 s window refetches instead of rehydrating a verdict
-   *  this read has just made stale. */
-  const applyDiskRead = useCallback((disk: { text: string; binary: boolean }) => {
+  /** The file is not on disk (a read answered 404), whatever the buffer holds.
+   *  This is what parks the stream (a 404 stream closes for good) and runs the
+   *  retry, so a recreated file lands even when the buffer is empty or the
+   *  host's placeholder. Whether the buffer is a LAST COPY worth a banner and a
+   *  close guard is a separate question, answered by `lastCopy` below. Cleared
+   *  by any read that finds the file, and by a re-target of the tab. */
+  const [missingOnDisk, setMissingOnDisk] = useState(false)
+  useEffect(() => { setMissingOnDisk(false) }, [filePath])
+  /** Whether the buffer holds only PART of the file: the read that filled it
+   *  was cut at the gateway's cap or had credentials redacted. The verdict is
+   *  the host's (`partial`), stamped from the read's headers by whichever read
+   *  filled the buffer -- the opening read before this panel mounted as much as
+   *  the panel's own -- and never guessed from the body: a whole file may quote
+   *  the redaction tag, and a guess about it could only be wrong. Such a buffer
+   *  is not the whole file: the banner and the close prompt say so instead of
+   *  calling it the file's remaining contents, and a download of it is named
+   *  `.partial`. That is ALL the verdict changes -- words and a file name. The
+   *  guard, the banner and the exits stand for a partial buffer exactly as for
+   *  a whole one: it is the most of the file that survives. */
+  const partialCopy = !!partial
+  const partialCopyRef = useRef(partialCopy)
+  partialCopyRef.current = partialCopy
+  /** Whether the buffer IS a copy worth keeping once the file is gone: text the
+   *  disk once vouched for. Not the "file not found" sentence the host seeds
+   *  into a tab opened on a path already missing (`openFile`, the cold-tab
+   *  hydration), not a binary tab's empty text buffer, not an empty file --
+   *  a banner over those would offer to download the placeholder prose, or
+   *  nothing, under the file's name. Judged by the buffer, not by whether THIS
+   *  panel instance has seen a successful read: a panel remounted after the
+   *  side panel was collapsed carries the tab store's copy of a file deleted
+   *  meanwhile -- a real last copy with no successful read behind it here. */
+  const bufferIsLastCopy = useCallback(() =>
+    !binaryRef.current && contentRef.current !== '' &&
+    contentRef.current !== i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or'), [])
+  /** The banner and the close guard: the file is gone AND the buffer is a copy
+   *  worth keeping. Rendered as a banner OVER the document, never in the
+   *  buffer: `content` and its saved baseline keep the last text on screen. */
+  const lastCopy = missingOnDisk && !binary && content !== '' &&
+    content !== i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
+  /** The banner's two exits, on the BUFFER: a gone file has no path to fetch,
+   *  so the browser is handed the text on screen, under the file's name. The
+   *  copy answers: "Copied" on the button for a moment, or the panel's action
+   *  notice when the clipboard refused -- a silent miss here would sit right
+   *  next to the invitation to discard the only copy. */
+  const downloadLastCopy = useCallback(() => {
+    // A partial copy goes out under a name that says so, never under the
+    // file's own: with the original gone, that would pass a prefix off as it.
+    downloadBlob(new Blob([content], { type: 'text/plain;charset=utf-8' }), downloadFileName(filePath) + (partialCopy ? '.partial' : ''))
+  }, [content, filePath, partialCopy])
+  const [lastCopyCopied, setLastCopyCopied] = useState(false)
+  const lastCopyCopiedTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
+  useEffect(() => () => clearTimeout(lastCopyCopiedTimer.current), [])
+  const copyLastCopy = useCallback(async () => {
+    if (!(await copyToClipboard(content))) { reportActionError(i18nT('components.markdownPanel.copy_failed')); return }
+    setLastCopyCopied(true)
+    clearTimeout(lastCopyCopiedTimer.current)
+    lastCopyCopiedTimer.current = setTimeout(() => setLastCopyCopied(false), 1500)
+  }, [content, reportActionError])
+
+  /** Drop the `['file-read', path]` cache entry rather than rewrite it, so a
+   *  reopen inside its 10 s window refetches instead of rehydrating a body a
+   *  disk read has just proven stale -- open, then save within the window, is
+   *  exactly that. Every read this panel makes drops it, restamped or not. */
+  const evictFileRead = useCallback(() => {
     qc.removeQueries({ queryKey: fileReadQueryKey(filePath), exact: true })
-    if (onDiskContent) onDiskContent(disk.text, disk.binary)
+  }, [qc, filePath])
+
+  /** Apply a disk read to the tab: buffer, saved baseline and verdict together,
+   *  with the cache entry dropped. A body landed, so the file is there. */
+  const applyDiskRead = useCallback((disk: { text: string; binary: boolean; partial: boolean }) => {
+    evictFileRead()
+    setMissingOnDisk(false)
+    if (onDiskContent) onDiskContent(disk.text, disk.binary, disk.partial)
     else onContentChange(disk.text)
-  }, [qc, filePath, onDiskContent, onContentChange])
+  }, [evictFileRead, onDiskContent, onContentChange])
 
 
+  /** The catch-up latch: where this tab stands against its file since it last
+   *  became visible. `due` -- a read has to run at the next clean moment: the
+   *  tab is hidden, the user has edited a clean buffer (handleChange), the tab
+   *  has left edit mode (the stretch it held no stream for), or the read it
+   *  started was overtaken by the user's typing and dropped. `reading`
+   *  -- one is in flight, and a re-render starts no second one. `done` --
+   *  nothing to do until the tab is hidden or edited again: a read applied, or
+   *  failed and was reported. Every mount starts `due`, a visible one too: the
+   *  buffer a remounted tab is handed is the tab store's copy, which may
+   *  predate a change made while the panel was unmounted, and the re-armed
+   *  stream's first frame does not cover a file emptied meanwhile
+   *  (`api_file_watch` emits only when content differs from its initial empty
+   *  string). One GET per mount of the visible tab buys a buffer the disk
+   *  vouches for. */
+  const catchUpRef = useRef<'due' | 'reading' | 'done'>('due')
+
+  /** Adopt the disk truth: THE catch-up procedure, shared by the activation
+   *  effect, the watch and every clean moment that owes a read.
+   *
+   * One procedure, one rule. The read is always `readFromDisk` -- a fresh fetch
+   * of the file as it is now, never the read that opened the tab, never a
+   * cached body, never skipped for a mount, a remount or an edit edge -- and
+   * the tab counts as caught up only inside the branch that adopts THAT
+   * fetch's answer, right here. Nothing else writes `done`: the effect below
+   * and the edit fences only ever move the latch to `due` or `reading`.
+   *
+   * A change on disk IS the truth, so it goes through onDiskContent when the
+   * host can restamp its saved baseline; falling back to onContentChange keeps
+   * non-tab hosts unchanged. Three results are dropped rather than applied:
+   * superseded by a later read, or the user started typing while it was in
+   * flight -- two ways this result has nothing to say -- and an unreadable file,
+   * which is NOT quiet: the panel is then showing a revision it knows is
+   * superseded and cannot describe the current one, which the user has to be
+   * told rather than left to infer from a document that stopped changing.
+   *
+   * The catch-up latch moves on the read's OUTCOME, here, never on its start.
+   * Only an applied read makes the tab current, so `reading` becomes `done`
+   * once the bytes are on screen. A read the typing overtook puts the tab
+   * back to `due`: the buffer it would have replaced is dirty now, and once
+   * those edits are undone it is a clean buffer at the pre-change revision,
+   * which a later save would write over the newer file -- so the next clean
+   * moment re-reads instead of trusting it. A superseded read says nothing;
+   * the newer read that overtook it decides. A failed read is reported, and
+   * counts as this return's attempt (`done`) rather than staying `due`: the
+   * host hands the panel fresh callbacks on every render, so a tab left `due`
+   * would re-read and re-report as fast as the host renders. The next return
+   * tries again.
+   *
+   * A file that is gone (404) is not a failure: it is a real answer, and the
+   * chip click, the cold-tab hydration and the reload all render a tab opened
+   * on a missing path as a placeholder -- so the catch-up says so too, quietly,
+   * instead of raising the read-failure notice on every return to that tab. As
+   * a STATE, not as content: the buffer and its saved baseline keep the last
+   * text, which may be the only copy left of a file deleted outside the
+   * dashboard, and that copy stays on screen under a banner that says what it
+   * is and carries the two ways to keep it. Only when the buffer IS such a copy
+   * (bufferIsLastCopy): a tab seeded with the host's placeholder sentence, or
+   * a binary tab, has nothing the banner could truthfully call a last copy. A
+   * read that finds the file again clears the banner. */
+  const adoptDisk = useCallback(async (opts?: { quietFailure?: boolean }): Promise<DiskRead['kind']> => {
+    const disk = await readFromDisk()
+    if (disk.kind === 'superseded') return disk.kind
+    // Whatever this read answered, the shared cache entry for the path does
+    // not outlive it: a body older than the disk (open, then save within the
+    // 10 s window) would rehydrate on a reopen, and a cached 404 or failure
+    // would answer the next open.
+    evictFileRead()
+    // `missingOnDisk` is a fact about the FILE, not an edit to the buffer, so
+    // it is recorded before the dirty early-return below: a 404 latches it and
+    // a body clears it, dirty or not. The early-return protects the EDITS --
+    // a dirty tab adopts nothing -- and the flag touches none of them; left
+    // false for a dirty tab, the banner that names the gone file and the
+    // Download that keeps the edits would both stay off exactly when the
+    // buffer is the only place those edits exist.
+    if (disk.kind === 'missing') setMissingOnDisk(true)
+    else if (disk.kind === 'ok') setMissingOnDisk(false)
+    if (dirtyRef.current) { catchUpRef.current = 'due'; return disk.kind }
+    if (disk.kind === 'failed') {
+      if (catchUpRef.current === 'reading') catchUpRef.current = 'done'
+      // The retry reports its first failure and is quiet after: the banner
+      // already stands, and a notice per tick would only repeat it.
+      if (!opts?.quietFailure) reportActionError(i18nT('components.markdownPanel.cannot_read_file'))
+      return disk.kind
+    }
+    // The disk says what the tab already shows -- the common outcome of a
+    // mount or a return to an unchanged file: current, nothing to restamp.
+    if (disk.kind === 'ok' && (disk.text !== contentRef.current || disk.binary !== binaryRef.current || disk.partial !== partialCopyRef.current)) applyDiskRead(disk)
+    // Not unconditionally `done`: a landing after the tab was hidden again
+    // finds the latch back at `due`, and the next return must read afresh.
+    if (catchUpRef.current === 'reading') catchUpRef.current = 'done'
+    return disk.kind
+  }, [applyDiskRead, evictFileRead, readFromDisk, reportActionError])
+  const adoptDiskRef = useRef(adoptDisk)
+  adoptDiskRef.current = adoptDisk
+
+  // The watch tracks the disk for a clean, non-editing tab -- and ONLY the tab
+  // the user can see. Every open tab used to arm its own watch, and each watch
+  // is one EventSource: one HTTP/1.1 connection held open for as long as the
+  // tab exists. Chromium allows six connections per host, so six idle tabs
+  // starved every other request the dashboard makes -- uploads, chat sends,
+  // polls -- for as long as the streams stayed open (#14236). A hidden tab holds
+  // no stream; it catches up in the effect below when it comes back. Nor does a
+  // tab whose file is gone: `api_file_watch` answers 404 for a missing path and
+  // `useFileWatch` closes such a stream for good, so a watch armed while the
+  // file was gone would never see it recreated. The retry below covers that
+  // stretch, and the read that finds the file again arms the stream afresh.
+  const watchArmable = !!liveWatch && !editing && !dirty && !missingOnDisk
   useFileWatch(
-    liveWatch && !editing && !dirty ? filePath : null,
-    // A watch-fired change IS the disk truth, so route it through
-    // onDiskContent when the host can restamp its saved baseline; falling
-    // back to onContentChange keeps non-tab hosts unchanged.
+    watchArmable && active ? filePath : null,
+    // The event's own `content` is never APPLIED. `/api/file-watch` decodes
+    // with `errors="replace"` and carries no binary verdict, so a file replaced
+    // on disk by binary bytes would push U+FFFD into the buffer AND leave the
+    // card decision at its hydrated value — editor live, save destructive. The
+    // event says "it changed"; the re-read says what it now is, and if the
+    // re-read cannot answer then NOTHING is applied: the buffer stays at the
+    // last revision whose verdict is known, which is stale but honest, where
+    // the event body would be new content under an old verdict.
     //
-    // The event's own `content` is deliberately NOT used, in either direction.
-    // `/api/file-watch` decodes with `errors="replace"` and carries no binary
-    // verdict, so a file replaced on disk by binary bytes would push U+FFFD into
-    // the buffer AND leave the card decision at its hydrated value — editor
-    // live, save destructive. The event says "it changed"; the re-read says what
-    // it now is, and if the re-read cannot answer then NOTHING is applied: the
-    // buffer stays at the last revision whose verdict is known, which is stale
-    // but honest, where the event body would be new content under an old
-    // verdict. One extra GET per actual change of the one file on screen, on a
-    // subscription only armed while the panel is clean and not editing.
-    useCallback(() => {
-      void (async () => {
-        const disk = await readFromDisk()
-        // Superseded by a later read, or the user started typing while it was
-        // in flight — two ways this result must be dropped with nothing to say.
-        if (disk.kind === 'superseded' || dirtyRef.current) return
-        // An unreadable re-read is the third, and it is NOT quiet: the panel is
-        // now showing a revision it knows is superseded and cannot describe the
-        // current one, which the user has to be told rather than left to infer
-        // from a document that stopped changing.
-        if (disk.kind === 'failed') { reportActionError(i18nT('components.markdownPanel.cannot_read_file')); return }
-        applyDiskRead(disk)
-      })()
-    }, [applyDiskRead, readFromDisk, reportActionError]),
+    // It IS compared. The backend starts a stream from mtime 0, so a re-armed
+    // stream's first poll tick always writes a frame with the whole body, and
+    // on an activation that frame arrives beside the catch-up read; re-reading
+    // on it made every tab switch two GETs. A frame whose text equals the clean
+    // buffer says nothing the tab does not already show and costs no read --
+    // unless a read is still in flight: that read may land with OLDER bytes
+    // than this frame (the file changed and changed back between the two), and
+    // equality with the displayed text would let the stale landing become the
+    // baseline, so the frame supersedes the read instead. Any difference
+    // re-reads -- a real change, a CRLF file (the stream's text-mode read
+    // normalizes newlines, the re-read does not), a body past the stream's
+    // cap -- and so does every frame on a binary tab, whose text buffer is
+    // empty: equality with no read pending is the ONLY case skipped, and equal
+    // text is nothing to adopt. One GET per activation of the one file on
+    // screen, on a subscription only armed while the panel is visible, clean
+    // and not editing.
+    useCallback((frameText: string) => {
+      if (diskReadsInFlightRef.current === 0 && !binaryRef.current && frameText === contentRef.current) return
+      void adoptDisk()
+    }, [adoptDisk]),
   )
+
+  // The catch-up for a parked watch: a tab that was hidden re-reads its file
+  // when it becomes the visible one, so a change made while it held no stream
+  // lands the moment the user can see the tab, not never -- silently stale
+  // would be the failure, because the saved baseline still looks current. The
+  // same guards as the watch apply through adoptDisk: a dirty tab keeps its
+  // edits and does not re-read (the edits are the user's work), and a read
+  // that typing or a newer read has overtaken is dropped. `editing` gates the
+  // stream, not this read: a live push would land under the user's cursor, but
+  // a tab that was hidden has no cursor in it, and a clean editor buffer left
+  // stale is exactly what a later save would write over the newer file. The
+  // tab counts as caught up only once a read has APPLIED -- adoptDisk settles
+  // the latch, this effect only starts the read: one that comes back with
+  // unsaved edits reads nothing, and reads the moment those edits are undone,
+  // saved or discarded while it is visible -- undone in particular, since that
+  // leaves a clean buffer showing the pre-change revision -- and so does one
+  // whose read the user's typing overtook. A mount reads too (the latch starts
+  // `due`; see it). Leaving edit mode while visible re-arms the watch, and
+  // re-arms this read as well: a clean editor buffer held no stream while it
+  // was being edited, so a change made then reached the tab only through the
+  // re-armed stream's connect-time frame -- and there is no such frame for a
+  // file emptied meanwhile (`api_file_watch` compares against its initial
+  // empty string). The read does not wait for the re-armed stream to say
+  // anything: a saturated connection budget is exactly what delays that
+  // stream, and the tab must be current whether or not its stream connects.
+  const catchUpArmable = !!liveWatch && !dirty
+  const wasEditingRef = useRef(editing)
+  useEffect(() => {
+    if (wasEditingRef.current && !editing) catchUpRef.current = 'due'
+    wasEditingRef.current = editing
+    if (!active) { catchUpRef.current = 'due'; return }
+    if (catchUpRef.current !== 'due' || !catchUpArmable) return
+    catchUpRef.current = 'reading'
+    void adoptDisk()
+  }, [active, editing, catchUpArmable, adoptDisk])
+
+  // While the file is gone, the stream cannot stand in for the disk (see the
+  // watch above), so the visible tab asks the disk itself, on the cadence the
+  // backend's own watch polls at. The retry runs only while the banner shows,
+  // the tab is on screen and the buffer is clean -- a dirty buffer is the
+  // user's work, and adoptDisk would drop the result anyway -- and the read
+  // that finds the file clears `missingOnDisk`, which ends the retry and arms
+  // the stream again. One GET a second for the one deleted file on screen: the
+  // alternative is a banner that keeps saying "not found" over a buffer a save
+  // would write over the recreated file. Each retry is scheduled only once the
+  // previous read has SETTLED, never on a fixed interval: a read slower than
+  // the cadence would otherwise be aborted by the next tick, every tick, and a
+  // recreated file would never land.
+  useEffect(() => {
+    if (!missingOnDisk || !active || !catchUpArmable) return
+    let stopped = false
+    let delay = MISSING_FILE_RETRY_MS
+    let reported = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const tick = async () => {
+      // Never over a read already out -- the activation catch-up, the close
+      // guard, the watch: starting one would abort it. Skip the tick instead.
+      // Through a ref: the host hands the panel fresh callbacks on every
+      // render, and an effect keyed on adoptDisk itself would restart before
+      // its first read went out.
+      if (diskReadsInFlightRef.current === 0) {
+        const verdict = await adoptDiskRef.current({ quietFailure: reported })
+        if (verdict === 'failed') reported = true
+      }
+      delay = Math.min(delay * 2, MISSING_FILE_RETRY_MAX_MS)
+      if (!stopped) timer = setTimeout(() => { void tick() }, delay)
+    }
+    timer = setTimeout(() => { void tick() }, delay)
+    return () => { stopped = true; clearTimeout(timer) }
+  }, [missingOnDisk, active, catchUpArmable])
 
 
   // Detect if file has uncommitted changes and pre-fetch HEAD content
@@ -1558,8 +1879,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         const disk = await readFromDisk()
         // A newer read owns the answer; this one has nothing to add or report.
         if (disk.kind === 'superseded') return
-        // A click that produces nothing reads as a broken button, so the
-        // human-initiated paths report through the panel's own action notice.
+        // A click that produces nothing reads as a broken button. A file that
+        // is gone produces the banner -- the verdict has its own place, with
+        // the exits that keep the buffer -- so only a read that could not
+        // answer at all goes through the panel's action notice.
+        if (disk.kind === 'missing') { setMissingOnDisk(true); return }
         if (disk.kind === 'failed') { reportActionError(i18nT('components.markdownPanel.cannot_read_file')); return }
         // The read is async, and the dirty check above ran at click time:
         // anything typed while it was in flight made the buffer dirty, and
@@ -1593,10 +1917,13 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         // clean and let a close discard that work.
         const disk = await readFromDisk()
         if (disk.kind === 'superseded') return
-        // Cancel means "match the disk". If the disk could not be read, the
-        // buffer still holds the edits -- so the dirty flag MUST stay set, or a
-        // later close discards work the panel just claimed was safe. Report and
-        // leave the user exactly where they were.
+        // Cancel means "match the disk". If the disk could not be read -- or the
+        // file is gone -- the buffer still holds the edits, so the dirty flag
+        // MUST stay set, or a later close discards work the panel just claimed
+        // was safe. A gone file is said by the banner, over the edits it now
+        // offers to keep; a read that could not answer is reported. Either way
+        // the user is left exactly where they were.
+        if (disk.kind === 'missing') { setMissingOnDisk(true); return }
         if (disk.kind === 'failed') { reportActionError(i18nT('components.markdownPanel.cannot_read_file')); return }
         applyDiskRead(disk)
       }
@@ -2032,12 +2359,30 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     }
   }, [comments, displayContent, editing, fullscreen, removeCommentTooltip, flashCommentRow])
 
+  /** Bumped by every local edit (handleChange). A save clears `dirty` only if
+   *  no edit landed while its write was in flight: the file holds `content` as
+   *  of the keypress, and a keystroke typed before the write round-trips is not
+   *  in it. Marking that buffer clean misfiles the keystroke -- and, with the
+   *  catch-up latch left `due` by the first edit, the clean flip would start a
+   *  read that puts the just-written text back over it. */
+  const editGenRef = useRef(0)
   const handleSave = useCallback(async () => {
     setSaving(true); setSaveError(null)
-    try { await onSave(filePath, content); setDirty(false); qc.invalidateQueries({ queryKey: ['file-diff', filePath] }) }
+    const editGen = editGenRef.current
+    try {
+      await onSave(filePath, content)
+      // The disk now holds `content`, so whatever the shared `['file-read',
+      // path]` entry holds predates it: dropped, not rewritten. This panel puts
+      // no body into the shared cache -- it only reads the disk -- and a
+      // consumer opening the path inside the window refetches. The post-save
+      // catch-up read is a fresh fetch either way (see readFromDisk).
+      evictFileRead()
+      if (editGenRef.current === editGen) setDirty(false)
+      qc.invalidateQueries({ queryKey: ['file-diff', filePath] })
+    }
     catch (err) { setSaveError(err instanceof Error ? err.message : i18nT('components.markdownPanel.save_failed')) }
     finally { setSaving(false) }
-  }, [filePath, content, onSave, qc])
+  }, [filePath, content, onSave, qc, evictFileRead])
 
   const handleSaveRef = useRef(handleSave)
   useEffect(() => { handleSaveRef.current = handleSave }, [handleSave])
@@ -2053,13 +2398,74 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [])
 
   const guardedClose = useCallback(async () => {
-    // An open comment draft is unsaved work too: closing discards it. The
-    // prompt names what is at risk — file edits take precedence when both are.
-    if (dirty && !(await confirm({
-      title: i18nT('components.markdownPanel.discard_unsaved_changes'),
-      confirmLabel: i18nT('components.markdownPanel.discard_changes_button'),
-    }))) return
-    if (!dirty && composerDraftRef.current) {
+    // A buffer whose file is gone from disk is the only copy there is, edited
+    // or not, so the file being gone decides the prompt: "Discard unsaved
+    // changes?" would imply a saved version survives the close, and none does.
+    // Same stakes as unsaved edits, same prompt shape, same precedence over a
+    // comment draft. A live-watched tab asks the disk first, dirty or not:
+    // `api_file_watch` polls on silently through a FileNotFoundError, so a file
+    // deleted while its tab was on screen has told the panel nothing (and a
+    // dirty tab reads nothing on its own), and the close is the last moment
+    // the copy can still be kept. A PARTIAL buffer (a truncated or redacted
+    // read) is guarded exactly the same -- it is the most of the file that
+    // survives -- and only the prompt's words change: the partial verdict is a
+    // guess from the body's shape, and a guess may add a caveat but must never
+    // lift the guard, or the sole copy of a whole file that happens to contain
+    // the redaction tag would close unasked.
+    let gone = lastCopy
+    let unverified = false
+    if (!gone && liveWatch) {
+      // Quiet: whatever this read cannot answer, the dialog below says, so a
+      // notice as well would tell it twice and outlive a Cancel.
+      const verdict = await adoptDisk({ quietFailure: true })
+      // The user may have typed while the read was out (which also aborts it):
+      // `dirty` captured above is stale, so nothing below trusts it, and an
+      // overtaken read closes nothing -- the next Escape asks again. A read
+      // that FAILED could not say whether the file is there: that is a
+      // question for the user, not a silent refusal (a gateway that is down
+      // would otherwise make the tab impossible to close).
+      if (verdict === 'superseded') return
+      // ...and only when there is a copy the answer could protect: an empty
+      // buffer, the seeded "file not found" sentence or a binary tab's empty
+      // text buffer would be told it "may hold the only remaining version" of
+      // nothing.
+      unverified = verdict === 'failed' && bufferIsLastCopy()
+      gone = verdict === 'missing' && bufferIsLastCopy()
+    }
+    const dirtyNow = dirtyRef.current
+    const partialNow = partialCopyRef.current
+    const name = downloadFileName(filePath)
+    // The rescue rides in the dialog: the body names Download and carries it,
+    // so keeping the copy is one click there, not cancel-then-hunt.
+    const rescue = (text: string) => (
+      <span className="flex flex-wrap items-center gap-2">
+        <span>{text}</span>
+        <button type="button" data-testid="markdown-panel-dialog-download" className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium border border-border bg-transparent text-text hover:bg-bg-hover cursor-pointer transition-colors shrink-0" onClick={downloadLastCopy}>{i18nT('components.markdownPanel.download')}</button>
+      </span>
+    )
+    if (gone) {
+      const body = partialNow
+        ? (dirtyNow ? 'components.markdownPanel.close_partial_copy_dirty_body' : 'components.markdownPanel.close_partial_copy_body')
+        : (dirtyNow ? 'components.markdownPanel.close_last_copy_dirty_body' : 'components.markdownPanel.close_last_copy_body')
+      if (!(await confirm({
+        title: i18nT('components.markdownPanel.close_last_copy'),
+        body: rescue(i18nT(body, { name })),
+        confirmLabel: i18nT('components.markdownPanel.close_last_copy_button'),
+      }))) return
+    } else if (unverified) {
+      if (!(await confirm({
+        title: i18nT('components.markdownPanel.close_unverified'),
+        body: rescue(i18nT(dirtyNow ? 'components.markdownPanel.close_unverified_dirty_body' : 'components.markdownPanel.close_unverified_body', { name })),
+        confirmLabel: i18nT('components.markdownPanel.close_unverified_button'),
+      }))) return
+    } else if (dirtyNow) {
+      // An open comment draft is unsaved work too: closing discards it. The
+      // prompt names what is at risk — file edits take precedence when both are.
+      if (!(await confirm({
+        title: i18nT('components.markdownPanel.discard_unsaved_changes'),
+        confirmLabel: i18nT('components.markdownPanel.discard_changes_button'),
+      }))) return
+    } else if (composerDraftRef.current) {
       if (!(await confirm({
         title: i18nT('components.markdownPanel.discard_unsaved_comment'),
         confirmLabel: i18nT('components.markdownPanel.discard_comment_button'),
@@ -2067,8 +2473,12 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       clearActiveDraftSlot()
     }
     onClose()
-  }, [dirty, onClose, confirm, clearActiveDraftSlot])
-  const guardedNavigate = useCallback((nav: (stillClean: () => boolean) => void) => {
+  }, [lastCopy, liveWatch, filePath, adoptDisk, bufferIsLastCopy, downloadLastCopy, onClose, confirm, clearActiveDraftSlot])
+  // Mirrors `lastCopy` for the navigate predicate below, which the host asks
+  // after its own await.
+  const lastCopyRef = useRef(lastCopy)
+  lastCopyRef.current = lastCopy
+  const guardedNavigate = useCallback(async (nav: (stillClean: () => boolean) => void) => {
     // Navigation never destroys this buffer, so there is nothing to confirm: a
     // dirty tab is left exactly as it is and the new file opens as its own tab.
     // Only a CLEAN tab is re-targeted in place. Closing still asks, because
@@ -2076,13 +2486,30 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     //
     // A tab with an open comment draft is not clean either: re-targeting it
     // would leave the draft (and the anchor it was resolved against) hanging
-    // over a different file, so the next file opens beside it instead.
+    // over a different file, so the next file opens beside it instead. Nor is
+    // a tab whose buffer is the last copy of a file that is gone: re-targeting
+    // it in place would discard that copy as surely as closing it.
+    //
+    // Whether it IS such a copy is asked of the disk first, the way the close
+    // asks: a file deleted while its tab was on screen has told the panel
+    // nothing (the watch polls on silently), so a clean tab's stored verdict
+    // can be stale, and a re-target on it would discard the only copy with no
+    // word. The read is the close path's own -- one fresh GET, the missing
+    // verdict latched, the buffer left alone -- and a read that could not
+    // answer (failed, or overtaken by typing) spares the tab too: opening
+    // beside costs nothing, discarding on a guess costs the copy.
     //
     // The predicate is what decides between those two outcomes, and the caller
     // re-asks it after its file read: the user can start typing during the read,
     // so an answer computed here would already be stale.
-    nav(() => !dirtyRef.current && !composerDraftRef.current)
-  }, [])
+    let unsure = false
+    if (liveWatch && !dirtyRef.current && !composerDraftRef.current && !lastCopyRef.current) {
+      const verdict = await adoptDisk({ quietFailure: true })
+      unsure = verdict !== 'ok' && verdict !== 'missing'
+      if (verdict === 'missing' && bufferIsLastCopy()) unsure = true
+    }
+    nav(() => !unsure && !dirtyRef.current && !composerDraftRef.current && !lastCopyRef.current)
+  }, [liveWatch, adoptDisk, bufferIsLastCopy])
 
   // Expose the guarded close so an external control (e.g. the Files-tab inline
   // preview's "Back to files" bar) routes through the same dirty confirmation
@@ -2090,8 +2517,9 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // `requestClose` deliberately swallows guardedClose's promise: the handle's
   // contract is fire-and-forget (() => void), and an imperative caller that
   // received the promise could `act()` on it un-awaited and wedge React's act
-  // scope in tests — the close outcome is observable via onClose only.
-  useImperativeHandle(ref, () => ({ requestClose: () => { void guardedClose() }, requestNavigate: guardedNavigate }), [guardedClose, guardedNavigate])
+  // scope in tests — the close outcome is observable via onClose only. The
+  // same for `requestNavigate`: its outcome is the `nav` call.
+  useImperativeHandle(ref, () => ({ requestClose: () => { void guardedClose() }, requestNavigate: (nav) => { void guardedNavigate(nav) } }), [guardedClose, guardedNavigate])
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -2128,7 +2556,22 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     return () => document.removeEventListener('keydown', h)
   }, [active, guardedClose, editing, dirty, fullscreen, confirmOpen])
 
-  const handleChange = useCallback((v: string) => { onContentChange(v); setDirty(true) }, [onContentChange])
+  // The first edit of a clean buffer fences the disk. A read still in flight
+  // describes a buffer the user has now typed into: if the user saves before it
+  // lands, `dirty` is clear again when it does and it would restamp the
+  // just-saved text with the older revision -- and a read that Refresh had
+  // already overtaken would otherwise leave the catch-up latch at `reading`
+  // with no landing left to move it. Withdrawing the read makes it
+  // `superseded`, which applies nothing and says nothing; `due` makes the next
+  // clean moment -- save, undo or discard -- start a post-edit read. Only the
+  // first edit: while the buffer is dirty the one read that can be in flight
+  // is Cancel's, and Cancel means match the disk. Synchronous with the edit,
+  // before the buffer moves, so no landing can slip between the two.
+  const handleChange = useCallback((v: string) => {
+    editGenRef.current++
+    if (!dirtyRef.current) { diskReadAbortRef.current?.abort(); catchUpRef.current = 'due' }
+    onContentChange(v); setDirty(true)
+  }, [onContentChange])
 
   // Lock body scroll when fullscreen overlay is open
   useEffect(() => {
@@ -2224,7 +2667,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
                 aria-pressed={!!railOpen}
               ><Folders size={14} /></button>
             )}
-            <OverflowMenu filePath={filePath} content={content} onError={reportActionError}
+            <OverflowMenu filePath={filePath} content={content} onError={reportActionError} onDownload={lastCopy ? downloadLastCopy : undefined}
               onRefresh={handleRefresh} refreshDisabled={refreshing || dirty} refreshTitle={dirty ? i18nT('components.markdownPanel.save_or_discard_changes_first') : i18nT('components.markdownPanel.refresh_file_re_read_from_disk')}
               onFullscreen={() => { void guardDraft(() => setFullscreen(f => !f)) }} fullscreen={fullscreen}
               onSnapshot={artifactState.existing && !showBinaryCard ? handleSnapshot : undefined} snapshotting={artifactState.snapshotting}
@@ -2266,6 +2709,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               </div>
             </div>
           </div>
+          {lastCopy && <MissingFileBanner onDownload={downloadLastCopy} onCopy={() => { void copyLastCopy() }} copied={lastCopyCopied} partial={partialCopy} />}
           {/* In markdown preview the scroll box runs flush to the panel's right
               border so the overlay scrollbar and outline rail share that edge;
               pr-6 keeps the text clear of the ticks. */}
@@ -2340,12 +2784,13 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               return <KnowledgeToggleIconButton state={knowledge} />
             })()}
             {editorToolbarButtons}
-            <OverflowMenu filePath={filePath} content={content} onError={reportActionError} />
+            <OverflowMenu filePath={filePath} content={content} onError={reportActionError} onDownload={lastCopy ? downloadLastCopy : undefined} />
             <button className="p-1.5 rounded-md border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all" onClick={() => { void guardDraft(() => setFullscreen(false)) }} title={i18nT('components.markdownPanel.exit_full_screen_esc')} aria-label={i18nT('components.markdownPanel.exit_full_screen')}><Minimize2 size={14} /></button>
           </div>
         </div>
         {panelNotices && <div className="px-16">{panelNotices}</div>}
         {isMarkdown && !editing && onSubmitComments && !hintDismissed && <div className="px-16"><CommentHint onDismiss={dismissHint} /></div>}
+        {lastCopy && <div className="px-4 sm:px-16"><MissingFileBanner onDownload={downloadLastCopy} onCopy={() => { void copyLastCopy() }} copied={lastCopyCopied} partial={partialCopy} /></div>}
         {/* Body */}
         <div data-mc-mdpanel className="relative flex-1 overflow-hidden min-h-0">
           {findBar}

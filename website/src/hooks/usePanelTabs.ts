@@ -117,6 +117,15 @@ export interface PanelTab {
    *  `content` whose absence it explains, and re-established by the same
    *  hydration read that refills the buffer. */
   binary?: boolean
+  /** The read that filled this buffer did not hand over the whole file: the
+   *  gateway cut it at its cap (`X-Truncated`) or rewrote credentials in it
+   *  (`X-Redacted`). Owned HERE, not derived from the body, so it survives a
+   *  panel remount and a file deleted meanwhile is offered for download as
+   *  the partial copy it is, never under the file's own name as if whole.
+   *  TRANSIENT like `binary`: stripped in `serializeBucket`, re-established by
+   *  the hydration read that refills the buffer, and moved by every
+   *  disk-originated refresh alongside `content`. */
+  partial?: boolean
   original?: string
   modified?: string
   /** Last selected working-tree diff view for file tabs. Persisted with the
@@ -581,7 +590,7 @@ export function purgeDocumentBodiesForRedactionChange(qc: { resetQueries: (f: { 
 function serializeBucket(b: Bucket): string {
   const tabs = b.tabs
     .filter(t => t.kind !== 'diff' && t.kind !== 'app')
-    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.binary; delete copy.revealLine; return copy })
+    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.binary; delete copy.partial; delete copy.revealLine; return copy })
   // If the focused tab was a DROPPED diff/app tab, refocus a surviving tab.
   // Only then: a focus that names no stored tab at all is one of the host's
   // leading tabs (`usePanelTabs(…, { leadingIds })` — the Crewmates page's Notes /
@@ -827,7 +836,7 @@ export function usePanelTabs(
     })
   }, [update, leadingIds, defaultLeadingId])
 
-  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean }) => {
+  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean; partial?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:
     // `upsert` merges onto an existing tab with a spread, which only overwrites
     // keys the incoming object HAS. Omitting it would leave a previous chip's
@@ -864,6 +873,7 @@ export function usePanelTabs(
         // existing tab, so omitting it would leave a previous read's verdict on
         // a tab whose file has since been replaced by a text one.
         binary: opts?.binary,
+        partial: opts?.partial,
         revealLine: reveal,
         ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
       }, opts?.replaceId)

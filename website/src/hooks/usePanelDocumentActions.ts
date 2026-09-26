@@ -5,7 +5,7 @@ import { api } from '../api/client'
 import { clearInlineDraft, getInlineDraft, type usePanelTabs } from './usePanelTabs'
 import { i18nT } from '../i18n/t'
 import type { Artifact } from '../types'
-import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS } from '../utils/fileReadQuery'
+import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS, isPartialRead } from '../utils/fileReadQuery'
 import { errMessage } from '../utils/thunkError'
 import { optsForReplace } from '../pages/chat/replaceGuard'
 
@@ -55,7 +55,7 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
     // switched to mid-load.
     const slot = slotRef.current ?? null
     try {
-      const [{ text, ok, status, binary }] = await Promise.all([
+      const [read] = await Promise.all([
         queryClient.fetchQuery({
           queryKey: fileReadQueryKey(filePath),
           // The shared fetch carries the backend's binary verdict with the text
@@ -69,6 +69,7 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
           queryFn: () => api.fileDiff(filePath),
         }),
       ])
+      const { text, ok, status, binary } = read
       if (!ok && status !== 404) {
         // Read failure — nothing in the viewer to lose, so the notice hands off.
         showActionError(i18nT('pages.chatPage.could_not_read_file_reason', { path: filePath, reason: i18nT('pages.chatPage.http_status', { status }) }))
@@ -76,8 +77,11 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
       }
       // A 404 is a real answer about the file (it is not on disk), so the
       // panel shows that placeholder. Any other failure was reported above.
+      // The read's partial verdicts travel with its text: this is the seed
+      // read that fills the tab before any panel mounts, so a verdict left
+      // behind here would be lost to the panel for good.
       const body = ok ? text : i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
-      tabsCtl.openFile(filePath, body, slot, { ...optsForReplace(opts), binary: ok && binary })
+      tabsCtl.openFile(filePath, body, slot, { ...optsForReplace(opts), binary: ok && binary, partial: ok && isPartialRead(read) })
       onOpened?.()
     } catch (e) {
       // The read itself threw (network, aborted). Reported above the composer

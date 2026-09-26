@@ -2767,12 +2767,14 @@ class _TextRead(NamedTuple):
     ``invalid`` (validation refused), ``dir`` / ``missing`` (nothing to read),
     ``file`` (``content`` is the capped text) or ``read_failed``. ``path`` is the
     validated path, or ``""`` for ``invalid`` -- the raw input is the caller's to
-    log, as before.
+    log, as before. ``lossy`` says the UTF-8 decode had to substitute
+    replacement characters, so ``content`` is not the file as written.
     """
 
     kind: str
     path: str
     content: str
+    lossy: bool = False
 
 
 #: How much of a file the binary sniff reads before deciding, in BYTES. 8 KiB is
@@ -2880,7 +2882,14 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
             data = checked.file.read(read_cap * 4)
         if b"\x00" in data[:_FILE_READ_SNIFF_BYTES]:
             return _TextRead("binary", checked.path, "")
-        return _TextRead("file", checked.path, data.decode("utf-8", errors="replace")[:read_cap])
+        try:
+            return _TextRead("file", checked.path, data.decode("utf-8")[:read_cap])
+        except UnicodeDecodeError:
+            # A text file the UTF-8 decode cannot render faithfully -- Latin-1,
+            # one stray byte, a codepoint split at the snapshot bound. The
+            # replacement characters make this body NOT the file as written,
+            # and the viewer must know before it offers the body as a copy.
+            return _TextRead("file", checked.path, data.decode("utf-8", errors="replace")[:read_cap], True)
     except OSError:
         with contextlib.suppress(Exception):
             checked.file.close()
@@ -3145,6 +3154,7 @@ async def api_file_read(request: web.Request) -> web.Response:
         # other opener in this module is ``api_file_diff``, which feeds the SAME
         # panel the ``original`` this buffer is compared against; the outbox
         # flagged-file check and the upload gates keep the unconditional ``redact``.
+        as_written = content
         if await _owner_view_bypasses_credential_pass(request):
             content = redact_owner_view_via_context(content)
         else:
@@ -3152,7 +3162,20 @@ async def api_file_read(request: web.Request) -> web.Response:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_read", outcome="success", resources=path
         )
-        headers = {"X-Truncated": "true"} if truncated else {}
+        # All three headers say the same thing to the viewer: this body is not
+        # the file as written. The panel keeps the last copy of a file deleted
+        # outside the dashboard and offers to download it; a capped, redacted
+        # or lossily decoded body must not be offered under the file's own
+        # name as if it were whole. The verdict rides in headers because
+        # nothing in the body can carry it: a file may quote the redaction tag
+        # verbatim, or contain the replacement character itself.
+        headers = {}
+        if truncated:
+            headers["X-Truncated"] = "true"
+        if content != as_written:
+            headers["X-Redacted"] = "true"
+        if outcome.lossy:
+            headers["X-Lossy-Decode"] = "true"
         # Pick a sensible content_type per file extension so browsers and
         # debuggers (DevTools "Response" preview, curl) interpret the body
         # correctly. JSON files in particular benefit from application/json

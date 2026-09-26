@@ -1,4 +1,5 @@
 import { i18nT } from '../i18n/t'
+import { downloadBlob } from './download'
 
 /** Append resolve=1 for relative paths. The backend resolves such paths
  * against KIROCREW_PROJECT_DIR; absolute and ~-paths pass through unchanged. */
@@ -90,19 +91,19 @@ export async function downloadFileToDisk(
       return
     }
     const blob = await res.blob()
-    const a = document.createElement('a')
-    const url = URL.createObjectURL(blob)
-    a.href = url
-    a.download = filePath.split('/').pop() || 'download'
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    setTimeout(() => URL.revokeObjectURL(url), 2_000)
+    downloadBlob(blob, downloadFileName(filePath))
   } catch (err) {
     // eslint-disable-next-line no-console -- surface download failures for diagnostics
     console.error('downloadFileToDisk failed', err)
     onError(i18nT('components.markdownPanel.download_failed'))
   }
+}
+
+/** The name a download of `filePath` lands under: its last segment. Shared by
+ *  the fetch above and by the side panel's last-copy download, which hands the
+ *  buffer of a file no longer on disk to `downloadBlob` under the same name. */
+export function downloadFileName(filePath: string): string {
+  return filePath.split('/').pop() || 'download'
 }
 
 /** Build the /api/file-stream URL — Range-capable audio/video serving.

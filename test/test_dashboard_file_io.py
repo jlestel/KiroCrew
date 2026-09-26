@@ -285,6 +285,48 @@ class TestFileRead:
             assert len(await resp.text()) == 512_000
 
     @pytest.mark.asyncio
+    async def test_read_announces_a_redacted_body_in_a_header(self, tmp_path, mock_sel, home_patch):
+        # The viewer keeps the last copy of a file deleted outside the dashboard
+        # and offers it for download; a body the credential pass rewrote is not
+        # the file as written, and only a header can say so -- a file may quote
+        # the redaction tag itself. A synthetic key shape, never a real secret.
+        import hashlib
+
+        key = "A" + "KIA" + hashlib.sha256(b"kc-file-read-header").hexdigest().upper()[:16]
+        f = tmp_path / "notes.txt"
+        f.write_text(f"token = {key}\n", encoding="utf-8")
+        plain = tmp_path / "plain.txt"
+        plain.write_text("nothing to hide here\n", encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            assert resp.status == 200
+            assert resp.headers["X-Redacted"] == "true"
+            assert key not in await resp.text()
+            resp = await client.get(f"/api/file-read?path={plain}")
+            assert resp.status == 200
+            assert "X-Redacted" not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_read_announces_a_lossy_decode_in_a_header(self, tmp_path, mock_sel, home_patch):
+        # A Latin-1 text file passes the extension check and the NUL sniff and
+        # decodes with a replacement character: shown as text, but not the file
+        # as written -- which the viewer must know before offering the body as
+        # the last copy of a deleted file, or downloading it under its own name.
+        f = tmp_path / "latin1.txt"
+        f.write_bytes(b"caf\xe9 au lait\n")
+        plain = tmp_path / "utf8.txt"
+        plain.write_text("café au lait\n", encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            assert resp.status == 200
+            assert resp.headers["X-Lossy-Decode"] == "true"
+            assert "\ufffd" in await resp.text()
+            resp = await client.get(f"/api/file-read?path={plain}")
+            assert resp.status == 200
+            assert "X-Lossy-Decode" not in resp.headers
+            assert await resp.text() == "café au lait\n"
+
+    @pytest.mark.asyncio
     async def test_read_head_on_binary_still_answers_from_the_stat(
         self, tmp_path, mock_sel, home_patch
     ):
