@@ -2216,7 +2216,7 @@ and let a sub-agent's card land in its parent's slot.
 **Return a session directive and let the session-aware consumer apply it.** This
 is what the `ask_question` MCP tool itself now does, along with `monitor_start`,
 `monitor_watch`, `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`
-and `suggest_followup`, `reset_conversation` and `chat_tag`
+and `suggest_followup`, `reset_conversation`, `chat_tag` and `goal`
 (`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
 returns a human-readable confirmation plus a marker line carrying the validated
 payload and **no session key**. `dashboard/chat_runner`'s tool-result handler
@@ -2225,6 +2225,47 @@ strips the marker from the stored transcript. Sub-agent isolation is therefore
 structural rather than cryptographic: a sub-agent's tool result flows through the
 sub-agent's own runner, so it can only bind to the sub-agent's session. There is
 no walk to get wrong.
+
+`goal` automates the existing `/goal` behavior. Its mutations are directives;
+`inspect` is a strict session-bound read of the existing session-monitor
+endpoint and emits no directive. That endpoint, also used by `monitor_inspect`,
+uses `goal_actions.goal_loop_for_session`, the same singular owner resolver as
+goal mutations. It collects the authenticated session's exact binding and live
+dashboard slots explicitly linked to it; each candidate must match its stored
+key exactly. A retained dashboard alias is therefore readable after trusted
+channel reconciliation. A normalized name alone grants no ownership. Multiple
+owned records return HTTP 409 `ambiguous_session_automation` without selecting
+one or reporting an empty session.
+During directive replay, inspection performs
+no gateway call. The host resolves the target, checks human/self-wake provenance
+and the current turn, then persists through the existing auto-nudge service.
+Updates and completion require the current goal id and generation; completion
+also requires evidence. Changing the objective or criteria requires a human
+request, including a confirmed consumed human steer. Supplying either field in
+a nonhuman mutation refuses the entire patch before metadata or status changes.
+Generic `monitor_stop` and `autonudge_stop` cannot remove a typed goal and direct
+the caller to the goal controls instead.
+The acknowledgment says a change was requested, and
+inspection confirms the applied state.
+Static per-turn goal guidance requires inspection before state-dependent actions
+and contains no retained goal snapshot. Inspection failures mean unknown state.
+The existing directive fallback can still request a mutation without strict MCP
+identity, but it cannot supply a read result: recovering an unknown goal id and
+generation requires strict inspection to become available. No lenient identity
+fallback or prompt snapshot substitutes for that read.
+`GOAL_MAX_OBJECTIVE_CHARS` limits retained objectives to 16,000 characters after
+redaction, including updates and reloads. Overflow is rejected without mutation
+or truncation; accepted manual objectives retain their full text in the existing
+loop state. Both goal tool schemas also cap the raw objective at 16,000
+characters. These field bounds are not an aggregate delivery guarantee: every
+MCP mutation, including with strict session identity, passes through
+`session_directive.encode` before marker or out-of-band delivery.
+`MAX_DIRECTIVE_CHARS` bounds the complete encoded envelope, including JSON
+escaping, all fields and acknowledgment text. Oversize calls return an explicit
+refusal and apply nothing. Use concise wording that preserves the full requested
+outcome. Criteria, progress and evidence remain bounded. An update that omits the
+objective preserves it without carrying that text through the directive envelope
+again.
 
 The directive marker is model-visible, since it comes back as tool-result text,
 so the consumer defends against forgery by honoring a directive only when the

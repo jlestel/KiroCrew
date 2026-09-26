@@ -81,6 +81,30 @@ time-to-first-token: `build_session_context` stamps `_mark(...)` per group
 `thread_history`, `stop_notes`, `memory`, `skills`, `lessons`, `provenance`,
 `finalize`) and `_emit_context_section_timings` logs and histograms them.
 
+Each supported goal session receives a per-turn `[GOAL PURSUIT]` block when the
+auto-nudge service is available. It supplies static automatic intent guidance,
+without reading or interpolating retained goal data. It adds no classifier
+network call or separate persistence. Follow-up constraints revise the current
+goal; status questions leave it intact. The block precedes the current request and respects
+`includeCrewContext: false`. Its opener and closer participate in prompt
+metering and untrusted-marker neutralization. Runtime provenance, rather than
+this prose, authorizes creation and resume.
+
+The guidance directs state-dependent goal actions through `goal(action="inspect")`.
+That authenticated tool read resolves exact ownership, including explicit retained
+dashboard links, through the same singular resolver as mutations. Conflicting
+records and read failures leave state unknown; they never imply permission to
+start or replace automation. Inspection supplies the current goal id and
+generation, and the host rechecks both when applying a mutation.
+
+The trusted block contains no objective, criteria, progress, evidence, stored id
+or stop reason. Goal data remains in the existing store, inspection result and UI.
+The canonical continuation includes objective and criteria as ordinary turn text
+and passes through `build_message`'s normal neutralization; its exact host-message
+authorization binding remains unchanged. If strict MCP identity or the gateway
+read is unavailable, this static block cannot recover a goal's id and generation.
+The agent must report that limitation rather than infer absent state.
+
 ### What memory contributes at session start
 
 `build_session_context` calls `MemoryStore.get_context` with

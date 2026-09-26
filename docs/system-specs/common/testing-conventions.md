@@ -37,6 +37,10 @@ valid member or template identity. Session context doubles implement the async
 `memory_mode_for_session()` accessor and return a concrete retention mode.
 Session-start collector tests declare their
 MCP roster explicitly rather than inheriting the installed agent's tools.
+`SessionManager.stop_turn` doubles declare `goal_state` explicitly when their
+callers supply it. Assert the exact dashboard-state identity, including the
+keyword's presence when the expected value is `None`; preserve the soft/hard
+callbacks and their existing behavior assertions instead of accepting `**kwargs`.
 
 ```python
 @pytest.mark.asyncio
@@ -113,6 +117,19 @@ Cancellation-during-persistence tests must wait for a worker-entered handshake
 before cancelling, not infer entry from a short sleep. Keep the worker's wait
 bounded, release it in `finally`, and await the cancelled task's write drain;
 assertions must still prove the lock stays held and the real write completes.
+
+SQLite contention tests open the writer's own connection before taking the holder's
+transaction, observe its actual `BEGIN IMMEDIATE`, and require completion to remain
+pending while the lock is held. Release the holder before awaiting completion and
+assert the persisted row: `sync` can swallow a failed write. Do not compare a real
+clock delta with the requested sleep duration. Bound every handshake and join, release
+the holder in `finally`, and close each thread's connection on that thread.
+
+A delayed executable fixture must be absent or ready to execute at its public path.
+Write and chmod a private sibling first, then atomically rename it into place. Writing
+the public path before chmod exposes a non-executable file to the real child; EACCES
+must remain terminal, not become another retry case. Assert initial absence and the
+child's successful exit, and cancel/join the publisher and reap the child on failure.
 
 The same handshake applies when the cancel comes from a PRODUCTION deadline rather
 than the test. `run_with_recall_deadline` arms its timer the moment it is awaited;
