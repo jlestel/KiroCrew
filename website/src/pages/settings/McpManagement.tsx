@@ -71,6 +71,66 @@ type GatewayStatus = {
   running: boolean
   ping_ok: boolean
   supported: boolean
+  // Stubbed servers whose launch the gateway refused to run outside the session
+  // sandbox, keyed by name. Optional: an older gateway does not send it.
+  launch_refused?: Record<string, LaunchRefusal>
+}
+
+/** Why a stubbed server's launch waits for the operator, and what approving it runs. */
+type LaunchRefusal = {
+  reason: 'added_outside_dashboard' | 'changed_needs_reapproval'
+  // Every launch the approve button covers, one per launch the server resolves to.
+  commands?: string[][]
+  // The declared environment of each launch, index-aligned with `commands`.
+  envs?: string[][]
+  // Present only when every launch above can be shown; approval needs it.
+  expected_launch?: string
+}
+
+/** Each launch a refusal covers: its command and its declared environment. */
+function refusalLaunches(refusal: LaunchRefusal): { argv: string[]; env: string[] }[] {
+  return (refusal.commands ?? [])
+    .map((argv, i) => ({ argv, env: refusal.envs?.[i] ?? [] }))
+    .filter((launch) => launch.argv.length > 0)
+}
+
+const REFUSAL_REASON_KEY: Record<LaunchRefusal['reason'], string> = {
+  added_outside_dashboard: 'pages.mcpManagement.reapproval_reason_added_outside_dashboard',
+  changed_needs_reapproval: 'pages.mcpManagement.reapproval_reason_changed',
+}
+
+/**
+ * The state pill's label. A refused launch has two causes, and the pill names
+ * which one, so a changed command is not read as a server never approved.
+ */
+function stateLabelKey(state: McpRowState, refusal?: LaunchRefusal): string {
+  if (state === 'needs_reapproval' && refusal?.reason === 'changed_needs_reapproval') {
+    return 'pages.mcpManagement.state_command_changed'
+  }
+  return STATE_LABEL_KEY[state]
+}
+
+function stubErrorKey(error: unknown): string {
+  if (!(error instanceof ApiError)) return 'pages.mcpManagement.stub_failed'
+  let code: unknown
+  try {
+    code = JSON.parse(error.body)?.code
+  } catch {
+    return 'pages.mcpManagement.stub_failed'
+  }
+  if (error.status === 409 && code === 'launch_changed_since_display') {
+    return 'pages.mcpManagement.stub_error_launch_changed'
+  }
+  if (error.status === 409 && code === 'launch_unresolved') {
+    return 'pages.mcpManagement.stub_error_launch_unresolved'
+  }
+  if (error.status === 409 && code === 'launch_over_cap') {
+    return 'pages.mcpManagement.stub_error_launch_over_cap'
+  }
+  if (error.status === 503 && code === 'approval_write_failed') {
+    return 'pages.mcpManagement.stub_error_approval_write_failed'
+  }
+  return 'pages.mcpManagement.stub_failed'
 }
 
 /** The two sub-views: the decisions, and the evidence behind them. */
@@ -125,10 +185,11 @@ const REASON_LABEL_KEY: Record<string, string> = {
  * the assessment count with nothing for `tsc` to catch. This PR renamed one of
  * these keys once already. A discriminant makes the same mistake a type error.
  */
-type McpRowState = 'no_stub' | 'direct_env' | 'shared' | 'stub' | 'direct'
+type McpRowState = 'no_stub' | 'needs_reapproval' | 'direct_env' | 'shared' | 'stub' | 'direct'
 
 const STATE_LABEL_KEY: Record<McpRowState, string> = {
   no_stub: 'pages.mcpManagement.state_no_stub',
+  needs_reapproval: 'pages.mcpManagement.state_needs_reapproval',
   direct_env: 'pages.mcpManagement.state_direct_env',
   shared: 'pages.mcpManagement.state_shared',
   stub: 'pages.mcpManagement.state_stub',
@@ -148,8 +209,16 @@ const STATE_LABEL_KEY: Record<McpRowState, string> = {
  * these states is the defect this change exists to remove: one copy gets corrected
  * and the other keeps saying `shared`.
  */
-function rowState(s: McpManagedServer, sharingOn: boolean): McpRowState {
+function rowState(
+  s: McpManagedServer,
+  sharingOn: boolean,
+  refused?: Record<string, LaunchRefusal>,
+): McpRowState {
   if (!s.can_stub) return 'no_stub'
+  // Outranks every other stubbed state: the gateway will not run this launch
+  // outside the sandbox until the operator approves its command, so the session
+  // launches the server itself whatever the other fields say.
+  if (s.stub && refused?.[s.name]) return 'needs_reapproval'
   // The rewriter's decision outranks allowlist membership and the global switch,
   // but only for a row the operator opted IN, because that is the only row whose
   // state would otherwise be reported as shared.
@@ -209,8 +278,12 @@ const CONTRARY_STRENGTHS = new Set(['refuted', 'disqualified'])
  * warning icon on the row and the count the assessment view sends the operator
  * over to find.
  */
-function sharedWithoutSupport(s: McpManagedServer, sharingOn: boolean): boolean {
-  if (rowState(s, sharingOn) !== 'shared') return false
+function sharedWithoutSupport(
+  s: McpManagedServer,
+  sharingOn: boolean,
+  refused?: Record<string, LaunchRefusal>,
+): boolean {
+  if (rowState(s, sharingOn, refused) !== 'shared') return false
   const rec = s.recommendation
   if (!rec) return false
   return CONTRARY_STRENGTHS.has(rec.strength)
@@ -322,9 +395,11 @@ function ReasonLine({ reason }: { reason: McpShareReason }) {
 function AssessmentRow({
   server,
   sharingOn,
+  refused,
 }: {
   server: McpManagedServer
   sharingOn: boolean
+  refused?: Record<string, LaunchRefusal>
 }) {
   const rec: McpShareRecommendation | undefined = server.recommendation
   const strengthKey = rec ? STRENGTH_LABEL_KEY[rec.strength] : undefined
@@ -335,7 +410,7 @@ function AssessmentRow({
   const reasons = (rec?.reasons ?? []).filter(
     (r, _i, all) => r.code !== 'no_objection_found' || all.length === 1,
   )
-  const unsupported = sharedWithoutSupport(server, sharingOn)
+  const unsupported = sharedWithoutSupport(server, sharingOn, refused)
   return (
     <tr className="border-t border-[var(--border)]">
       <td className="px-4 py-3 align-top font-mono text-[13px] text-[var(--text)]">
@@ -378,7 +453,7 @@ function AssessmentRow({
               to a screen reader because the row's Assessment cell already states
               the verdict in words. */}
           {unsupported && <AlertTriangle size={11} aria-hidden="true" />}
-          {i18nT(STATE_LABEL_KEY[rowState(server, sharingOn)])}
+          {i18nT(stateLabelKey(rowState(server, sharingOn, refused), refused?.[server.name]))}
         </span>
       </td>
     </tr>
@@ -524,6 +599,7 @@ function MeasureControl({ unmeasuredCount }: { unmeasuredCount: number }) {
 function AssessmentView({
   servers,
   sharingOn,
+  refused,
   loading,
   isError,
   onOpenServers,
@@ -532,6 +608,7 @@ function AssessmentView({
 }: {
   servers: McpManagedServer[]
   sharingOn: boolean
+  refused?: Record<string, LaunchRefusal>
   loading: boolean
   isError: boolean
   onOpenServers: () => void
@@ -613,7 +690,7 @@ function AssessmentView({
           </thead>
           <tbody>
             {servers.map(s => (
-              <AssessmentRow key={s.name} server={s} sharingOn={sharingOn} />
+              <AssessmentRow key={s.name} server={s} sharingOn={sharingOn} refused={refused} />
             ))}
             {isError && (
               <tr className="border-t border-[var(--border)]">
@@ -701,15 +778,15 @@ export function McpManagement() {
   }
 
   const setStub = useMutation({
-    mutationFn: ({ name, stub }: { name: string; stub: boolean }) =>
-      api.mcpGatewaySetStub(name, stub),
+    mutationFn: ({ name, stub, expectedLaunch }: { name: string; stub: boolean; expectedLaunch?: string }) =>
+      api.mcpGatewaySetStub(name, stub, expectedLaunch),
     // A 200 means the config was persisted, NOT that the broker reached the
     // wanted state. A stub change is never applied in place -- the daemon's
     // routing is built with the agent-spec rewrite at startup -- so the normal
     // outcome is `restart_required`, which is pending information rather than a
     // failure. `applied: false` with no restart hint is the real fault case:
     // the gateway never wired the apply callback, so nothing was recorded.
-    onSuccess: res => {
+    onSuccess: (res) => {
       invalidate()
       if (res && res.restart_required) {
         setRestartNotice(i18nT('pages.mcpManagement.stub_restart_required'))
@@ -717,7 +794,10 @@ export function McpManagement() {
         setError(i18nT('pages.mcpManagement.stub_not_live'))
       }
     },
-    onError: onApplyError('pages.mcpManagement.stub_failed'),
+    onError: (error, vars) => {
+      invalidate()
+      setError(i18nT(stubErrorKey(error), { name: vars.name }))
+    },
   })
 
   const setSharing = useMutation({
@@ -797,8 +877,9 @@ export function McpManagement() {
   // Shared by the tab badge, the confirm dialog and the assessment banner, so
   // the three can never disagree about how many rows are flagged.
   const unsupportedCount = useMemo(
-    () => servers.filter(s => sharedWithoutSupport(s, !!status?.enabled)).length,
-    [servers, status?.enabled],
+    () =>
+      servers.filter(s => sharedWithoutSupport(s, !!status?.enabled, status?.launch_refused)).length,
+    [servers, status?.enabled, status?.launch_refused],
   )
   // What turning sharing ON would put into that state, which is a different
   // question from what is in it now: nothing is shared until the switch is on.
@@ -994,6 +1075,7 @@ export function McpManagement() {
         <AssessmentView
           servers={servers}
           sharingOn={!!status?.enabled}
+          refused={status?.launch_refused}
           loading={serversQ.isLoading}
           isError={serversQ.isError}
           onOpenServers={() => setView('servers')}
@@ -1243,12 +1325,13 @@ export function McpManagement() {
               // operator scanning the column by colour reads the old answer every
               // visit -- so a second spelling of "is shared" here would rebuild the
               // divergence one state later.
-              const state = rowState(s, !!status?.enabled)
+              const state = rowState(s, !!status?.enabled, status?.launch_refused)
               const shared = state === 'shared'
               const directEnv = state === 'direct_env'
+              const refusal = state === 'needs_reapproval' ? status?.launch_refused?.[s.name] : undefined
               // The assessment view's warning sends the operator here, so the
               // rows it counted have to be findable without memorising names.
-              const flagged = sharedWithoutSupport(s, !!status?.enabled)
+              const flagged = sharedWithoutSupport(s, !!status?.enabled, status?.launch_refused)
               return (
                 <tr key={s.name} className="border-t border-[var(--border)]">
                   <td
@@ -1270,15 +1353,17 @@ export function McpManagement() {
                         // beside the single-line `shared` and `direct` pills, and
                         // every shipped locale is longer than the English.
                         'inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 font-mono text-[11px]',
-                        flagged
+                        flagged || refusal?.reason === 'changed_needs_reapproval'
                           ? 'border border-[var(--danger)] text-[var(--danger)]'
+                          : refusal
+                          ? 'border border-[var(--warn)] text-[var(--warn)]'
                           : shared
                           ? 'bg-[var(--accent-subtle,transparent)] text-[var(--accent)]'
                           : 'border border-[var(--border)] text-[var(--muted)]',
                       ].join(' ')}
                     >
-                      {flagged && <AlertTriangle size={11} aria-hidden="true" />}
-                      {i18nT(STATE_LABEL_KEY[state])}
+                      {(flagged || refusal) && <AlertTriangle size={11} aria-hidden="true" />}
+                      {i18nT(stateLabelKey(state, refusal))}
                     </span>
                     {/* Only on a row the operator opted in, and it carries ONLY what
                         the legend cannot: that the opt-in on the lit toggle beside it
@@ -1296,6 +1381,69 @@ export function McpManagement() {
                       <span className="mt-1 block text-[11px] leading-snug text-[var(--muted)]">
                         {i18nT('pages.mcpManagement.state_direct_env_reason')}
                       </span>
+                    )}
+                    {refusal && (
+                      <div className="mt-1.5 space-y-1.5">
+                        <span className="block text-[11px] leading-snug text-[var(--muted)]">
+                          {i18nT(REFUSAL_REASON_KEY[refusal.reason] ?? REFUSAL_REASON_KEY.changed_needs_reapproval)}
+                        </span>
+                        <span className="block text-[11px] leading-snug text-[var(--muted)]">
+                          {i18nT('pages.mcpManagement.reapproval_optin_kept')}
+                        </span>
+                        {/* Where the command comes from, so the operator can check
+                            the launch against its source before trusting it. */}
+                        {s.agents.length > 0 && (
+                          <span className="block text-[11px] leading-snug text-[var(--muted)]">
+                            {i18nT('pages.mcpManagement.reapproval_declared_by', {
+                              agents: s.agents.join(', '),
+                            })}
+                          </span>
+                        )}
+                        <span className="block text-[11px] leading-snug text-[var(--muted)]">
+                          {i18nT('pages.mcpManagement.approval_consequence')}
+                        </span>
+                        {refusalLaunches(refusal).map((launch, i) => (
+                          <div key={i}>
+                            <span className="block text-[11px] font-medium text-[var(--muted)]">
+                              {i18nT('pages.mcpManagement.approval_command')}
+                            </span>
+                            <code className="mt-0.5 block break-words rounded border border-[var(--border)] bg-[var(--surface-2,transparent)] px-1.5 py-1 font-mono text-[11px] text-[var(--text)]">
+                              {launch.argv.join(' ')}
+                            </code>
+                            {/* The environment is part of what approval runs: a
+                                changed value with the same command still counts. */}
+                            {launch.env.length > 0 && (
+                              <>
+                                <span className="mt-1 block text-[11px] font-medium text-[var(--muted)]">
+                                  {i18nT('pages.mcpManagement.reapproval_env')}
+                                </span>
+                                <code className="mt-0.5 block whitespace-pre-wrap break-words rounded border border-[var(--border)] bg-[var(--surface-2,transparent)] px-1.5 py-1 font-mono text-[11px] text-[var(--text)]">
+                                  {launch.env.join('\n')}
+                                </code>
+                              </>
+                            )}
+                          </div>
+                        ))}
+                        {refusal.expected_launch && (
+                        <Btn
+                          type="button"
+                          disabled={busy}
+                          aria-label={i18nT('pages.mcpManagement.reapprove_aria', { name: s.name })}
+                          onClick={() => {
+                            setError(null)
+                            setRestartNotice(null)
+                            setStub.mutate({
+                              name: s.name,
+                              stub: true,
+                              expectedLaunch: refusal.expected_launch as string,
+                            })
+                          }}
+                          className="px-2 py-0.5 text-[12px]"
+                        >
+                          {i18nT('pages.mcpManagement.reapprove_action', { name: s.name })}
+                        </Btn>
+                        )}
+                      </div>
                     )}
                   </td>
                   <td className="px-4 py-3 text-right">

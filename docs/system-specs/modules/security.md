@@ -21,6 +21,30 @@ commands: those retain the sandbox chokepoint and the AST routing audit.
 
 Kiro Crew implements defense-in-depth security across multiple layers: OS-level process isolation, credential path protection, input/output validation, authentication, authorization, and audit logging. This document consolidates all security controls and the vulnerabilities they address.
 
+### MCP launch authorization leaves
+
+The crew-home `mcp_launch_approvals.json` file records operator-approved
+fingerprints for stubbed MCP launches. The file-tool gate denies writes, and the
+OS sandbox exposes the file as a read-only, precreated leaf. Empty and absent
+forms both approve nothing. A refusal displays each command with its redacted,
+bounded declared environment. Every identity serialized into `expected_launch`
+has exactly one displayed command and one displayed environment, so the operator
+can approve only launch content that was rendered. Cached recommendation seeding
+can add a stub route, but it does not approve the launch behind that name.
+
+The generated `mcp-gateway/agents/` overlays and `mcp-gateway/stubs/` sidecars
+influence the command and declared environment gatewayd receives. The
+`mcp/resolved/` tree supplies the executable substituted for a resolved npm
+launcher. All three directories are file-tool write-protected, OS-sandbox
+read-only, and strict no-symlink mount targets. Linux precreates each directory
+before bind mounting it, so a fresh data home has the same disposition as one
+that already contains generated files. Their writers are gateway-side. The
+resolve-once npm child stays sandboxed and installs into a private directory
+under the sealed `run/` parent. The existing validated runtime carve-out grants
+that child write access to only the random staging directory; it cannot cover
+`record.json` or another resolution. After validating the tree, the gateway
+process renames it into `mcp/resolved/` and writes `record.json`.
+
 ### Member memory boundaries
 
 Cold subagent continuation restores app ownership from the canonical

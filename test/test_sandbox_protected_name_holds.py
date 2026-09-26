@@ -290,7 +290,18 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   refresh-chain state is never listable from inside the namespace;
     #: * ``redaction-allow`` -- the reader's allowed link hosts, sealed read-only
     #:   so an agent cannot allow the host it wants to send conversation data to.
-    EXPECTED: dict[str, int] = {"standard": 244, "cc": 251, "strict": 252}
+    #:
+    #: Four more hold what the MCP gateway launches outside the sandbox, twelve
+    #: entries per tier. ``mcp_launch_approvals.json`` sits at the data-home root,
+    #: so leaf-only is the only hold. The three nested directories sit beside
+    #: live siblings the agent must keep writing, so no parent stand-in can hold
+    #: them either:
+    #:
+    #: * ``mcp_launch_approvals.json`` -- the owner's approved launch fingerprints;
+    #: * ``mcp-gateway/agents`` and ``mcp-gateway/stubs`` -- the overlays and
+    #:   sidecars the gateway reads the launch command and environment from;
+    #: * ``mcp/resolved`` -- the executables substituted for an approved launch.
+    EXPECTED: dict[str, int] = {"standard": 256, "cc": 263, "strict": 264}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

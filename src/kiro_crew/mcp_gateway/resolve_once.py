@@ -267,6 +267,11 @@ def spec_dir(data_home: str, spec: NpmSpec) -> str:
     return os.path.join(store_root(data_home), spec.digest)
 
 
+def _staging_spec_dir(data_home: str, spec: NpmSpec) -> str:
+    """Private install root inside the sandbox-sealed runtime parent."""
+    return os.path.join(data_home, "run", "mcp-resolve", spec.digest)
+
+
 def _record_file(directory: str) -> str:
     return os.path.join(directory, "record.json")
 
@@ -668,16 +673,18 @@ async def install(
         _RESOLUTION_PREFIX, int(time.time() * 1000), os.getpid(), secrets.token_hex(3)
     )
     target = os.path.join(spec_root, resolution)
+    staging_spec_root = _staging_spec_dir(data_home, spec)
+    staging_target = os.path.join(staging_spec_root, resolution)
     try:
-        await asyncio.to_thread(functools.partial(os.makedirs, target, exist_ok=True))
+        await asyncio.to_thread(functools.partial(os.makedirs, staging_target, exist_ok=False))
     except OSError:
-        logger.debug("resolve-once: cannot create %s", target, exc_info=True)
+        logger.debug("resolve-once: cannot create %s", staging_target, exc_info=True)
         return None
     # Hand npm the fully-resolved prefix. npm records each package's location
     # relative to the prefix it was given, so a prefix reached through a symlink
     # makes it compute a traversing path instead of a plain ``node_modules/x``.
     # One install could absorb that, but a clean tree costs nothing.
-    real_target = os.path.realpath(target)
+    real_target = os.path.realpath(staging_target)
 
     argv = [
         npm_cmd,
@@ -707,7 +714,11 @@ async def install(
     # one that is not is unreachable for those too, where the fallback lands
     # anyway.
     wrapped_argv, spawn_env, sandbox_cleanup = await sandboxed_spawn_argv_async(
-        argv, mode="standard", strip_python_env=True, _prepare=sandboxed_spawn_argv
+        argv,
+        mode="standard",
+        strip_python_env=True,
+        extra_writable_dirs=(real_target,),
+        _prepare=sandboxed_spawn_argv,
     )
     try:
         # Limits are applied AFTER exec by the spawn shim rather than by a
@@ -732,7 +743,7 @@ async def install(
     except OSError:
         logger.debug("resolve-once: could not start npm for %s", spec.package, exc_info=True)
         _drop_sandbox_launcher(sandbox_cleanup)
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         return None
 
     try:
@@ -747,7 +758,7 @@ async def install(
             timeout_secs,
         )
         _drop_sandbox_launcher(sandbox_cleanup)
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         return None
     except asyncio.CancelledError:
         # Broker shutdown cancels the prefetch task. Without this the install and
@@ -755,7 +766,7 @@ async def install(
         # asked for them, still writing into a tree nothing will ever commit.
         await _reap_install_tree(proc)
         _drop_sandbox_launcher(sandbox_cleanup)
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         raise
     finally:
         # The temp launcher/profile is only needed while the child runs; the
@@ -769,19 +780,30 @@ async def install(
             proc.returncode,
             (output or b"").decode("utf-8", "replace").strip()[:400],
         )
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         return None
 
-    described = await asyncio.to_thread(_describe_tree, spec_root, resolution, spec.package)
+    described = await asyncio.to_thread(_describe_tree, staging_spec_root, resolution, spec.package)
     if described is None:
         logger.warning(
             "resolve-once: %s installed but exposes nothing runnable; leaving it to npx",
             spec.package,
         )
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         return None
 
     entrypoint, version = described
+    try:
+        await asyncio.to_thread(functools.partial(os.makedirs, spec_root, exist_ok=True))
+        # Both roots are below the data home, so this publish is one rename.
+        # The validated runtime carve-out can cover only this private staging
+        # directory, never record.json or an already-published resolution.
+        await asyncio.to_thread(os.replace, staging_target, target)
+    except OSError:
+        logger.debug("resolve-once: could not publish tree for %s", spec.package, exc_info=True)
+        await _rmtree_off_loop(staging_target)
+        return None
+
     record = ResolvedRecord(
         package=spec.package,
         entrypoint=entrypoint,

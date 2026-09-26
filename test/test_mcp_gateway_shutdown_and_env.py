@@ -854,6 +854,60 @@ class TestPrivateBackendDeclaredEnv:
         # The pooled path keeps only the key every co-tenant agrees on.
         assert gatewayd._declared_env_to_forward(key) == {"REGION": "us-west-2"}
 
+    def test_private_backend_approval_binds_secret_prefixed_values(self, tmp_path, monkeypatch):
+        from kiro_crew.mcp_gateway import launch_approval
+
+        approved = {"AWS_SECRET_ACCESS_KEY": "first", "REGION": "us-west-2"}
+        key = _pool_key(server="gh-mcp", agent="dev")
+        key = TestDeclaredEnvForwarding._write_sidecar(tmp_path, monkeypatch, approved, key)
+        approved_hash = launch_approval.env_fingerprint(approved)
+        monkeypatch.setattr(
+            launch_approval,
+            "launch_approved",
+            lambda _server, _command, env_hash: env_hash == approved_hash,
+        )
+
+        assert gatewayd._declared_env_for_private_backend(key) == approved
+
+        sidecar = env_sidecar_dir(resolve_overlay_dir()) / env_sidecar_name(
+            key.agent_name, key.server_name
+        )
+        changed = {**approved, "AWS_SECRET_ACCESS_KEY": "second"}
+        sidecar.write_text(json.dumps(changed), encoding="utf-8")
+        assert gatewayd._declared_env_for_private_backend(key) == {}
+
+    def test_target_resolver_binds_secret_prefixed_values(self, tmp_path, monkeypatch):
+        import shlex
+        import sys
+
+        from kiro_crew.mcp_gateway import launch_approval
+        from kiro_crew.mcp_gateway.hashing import hash_command
+
+        approved = {"AWS_SESSION_TOKEN": "first", "REGION": "us-west-2"}
+        key = _pool_key(server="gh-mcp", agent="dev")
+        key = TestDeclaredEnvForwarding._write_sidecar(tmp_path, monkeypatch, approved, key)
+        command = sys.executable
+        monkeypatch.setenv("KIROCREW_MCP_TARGET_GH_MCP", shlex.quote(command))
+        approvals = launch_approval.LaunchApprovals()
+        approvals.approved_pairs["GH_MCP"] = {
+            launch_approval.launch_pair(
+                hash_command(command, []), launch_approval.env_fingerprint(approved)
+            )
+        }
+        previous = gatewayd._LAUNCH_APPROVAL_SNAPSHOT.get()
+        gatewayd._LAUNCH_APPROVAL_SNAPSHOT.set(approvals)
+        try:
+            assert gatewayd.env_target_resolver(key) is not None
+
+            sidecar = env_sidecar_dir(resolve_overlay_dir()) / env_sidecar_name(
+                key.agent_name, key.server_name
+            )
+            changed = {**approved, "AWS_SESSION_TOKEN": "second"}
+            sidecar.write_text(json.dumps(changed), encoding="utf-8")
+            assert gatewayd.env_target_resolver(key) is None
+        finally:
+            gatewayd._LAUNCH_APPROVAL_SNAPSHOT.set(previous)
+
     def test_incoherent_sidecar_still_yields_nothing(self, tmp_path, monkeypatch):
         """The coherence gate is not a co-tenancy filter and still applies: a
         spec edited after this session started must not reach the backend under a

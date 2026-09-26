@@ -1309,8 +1309,10 @@ describe('request bodies with conditionally-omitted keys', () => {
   it('mcpGatewaySetStub has a single and a batch form', async () => {
     await api.mcpGatewaySetStub('fs', true)
     expect(call().body).toEqual({ name: 'fs', stub: true })
+    await api.mcpGatewaySetStub('fs', true, 'command-hash:env-hash')
+    expect(call(1).body).toEqual({ name: 'fs', stub: true, expected_launch: 'command-hash:env-hash' })
     await api.mcpGatewaySetStubMany(['fs', 'git'], false)
-    expect(call(1).body).toEqual({ names: ['fs', 'git'], stub: false })
+    expect(call(2).body).toEqual({ names: ['fs', 'git'], stub: false })
   })
 
   it('createTagColumn/updateTagColumn pass the filter mode straight through', async () => {

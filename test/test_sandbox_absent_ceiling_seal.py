@@ -192,6 +192,16 @@ class TestSealAppliesToAPreviouslyAbsentCeiling:
             assert str(path) in created
             assert path.is_dir()
             assert stat.S_IMODE(path.stat().st_mode) == 0o700
+            if "/" in leaf:
+                assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+    def test_a_nested_ceiling_refuses_a_symlinked_parent(self, crew_home, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (crew_home / "mcp-gateway").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
 
     def test_the_hidden_records_dir_is_materialised(self, crew_home):
         """The MASK's counterpart to the ceiling case above.

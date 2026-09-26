@@ -716,6 +716,22 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # mutators via the dashboard/CLI) runs unsandboxed. Absent-file coverage
     # mirrors the sidecar's own entry via the pre-create list.
     "agent_model_state.json.lock",
+    # The operator's approved MCP launch fingerprints (``mcp_gateway.launch_approval``).
+    # An input to a decision that runs a program OUTSIDE the sandbox: gatewayd
+    # spawns a stubbed server's backend as the user, and this record is what says
+    # which command a stubbed name may run. A sandboxed writer could approve its own
+    # command. Read-only, not hidden: it holds hashes and server names, no secret.
+    # Every writer (the dashboard stub toggle, the gateway's rewrite pass) runs in
+    # the gateway process, outside the sandbox.
+    "mcp_launch_approvals.json",
+    # Gateway-generated agent overlays and env sidecars influence the launch
+    # gatewayd executes outside the sandbox. Keep them readable by sessions but
+    # deny every in-sandbox write path, including shell and open().
+    "mcp-gateway/agents",
+    "mcp-gateway/stubs",
+    # Gateway resolve-once artifacts choose the entry point substituted for an
+    # approved npm launcher. The installer runs in the unsandboxed gateway.
+    "mcp/resolved",
 )
 
 #: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is
@@ -947,6 +963,14 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # markup reaching the operator's dashboard), and the read-only seal above is what
     # answers it.
     "panel-templates",
+    # Launch fingerprints and server names: no credential, and the decision it
+    # feeds is made by gatewayd outside any sandbox, never by a child reading it.
+    "mcp_launch_approvals.json",
+    # Launch trees and records contain no credential. Their integrity is enforced
+    # by the read-only mount; foreign harnesses may read the resolved package tree.
+    "mcp-gateway/agents",
+    "mcp-gateway/stubs",
+    "mcp/resolved",
 )
 
 
@@ -1433,6 +1457,11 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # the adapter so the directory is a read-only mountpoint before ANY sandbox starts,
     # including the first pi spawn on a fresh install.
     "pi-gate",
+    # Empty directories are absent-equivalent to the overlay and sidecar readers.
+    # Pre-creation gives Linux concrete bind targets on a fresh install.
+    "mcp-gateway/agents",
+    "mcp-gateway/stubs",
+    "mcp/resolved",
 )
 #: Read-only directory leaves whose NAME must remain the mounted name. A resolving
 #: symlink is unsafe here: the mount follows its target and leaves the lexical name
@@ -1447,6 +1476,9 @@ _CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = (
     "decisions",
     "redaction-allow",
     "pi-gate",
+    "mcp-gateway/agents",
+    "mcp-gateway/stubs",
+    "mcp/resolved",
 )
 assert set(_CREW_NOFOLLOW_READONLY_DIR_LEAVES) <= set(_CREW_PRECREATE_READONLY_DIR_LEAVES)
 #: Read-only FILE leaves whose NAME must remain the sealed name, for the same reason
@@ -1506,6 +1538,18 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
     "pi-gate": (
         "sealed pi gate runtime",
         "the agent could plant the launcher a later pi session execs out of",
+    ),
+    "mcp-gateway/agents": (
+        "sealed MCP gateway overlays",
+        "the agent could replace the command the gateway launches outside the sandbox",
+    ),
+    "mcp-gateway/stubs": (
+        "sealed MCP gateway sidecars",
+        "the agent could replace the environment the gateway forwards outside the sandbox",
+    ),
+    "mcp/resolved": (
+        "sealed resolved MCP launches",
+        "the agent could replace the executable the gateway substitutes for an approved launch",
     ),
 }
 assert set(_DELEGATED_OVERLAP_LEAF_REASONS) == set(_CREW_NOFOLLOW_READONLY_FILE_LEAVES) | set(
@@ -1582,6 +1626,11 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     # stop. An empty lock file is absent-equivalent by definition: its content
     # is never read, only its identity is locked.
     "agent_model_state.json.lock",
+    # Criterion 1: ``launch_approval.load_approvals`` reads an empty document as
+    # approving nothing, exactly as it reads an absent one. Criterion 2: no
+    # sandboxed reader acts on it -- gatewayd and the gateway read it outside the
+    # sandbox -- so a stale sealed view cannot widen anything.
+    "mcp_launch_approvals.json",
 )
 
 #: The one masked leaf that carries its own argument (see the sibling-gap note
@@ -2302,6 +2351,44 @@ def _publish_empty_ceiling(
                 os.unlink(tmp)
 
 
+def _materialize_sealable_parent_dirs(target: str, leaf: str) -> None:
+    """Create a nested ceiling's parents without following aliases.
+
+    ``leaf`` is the full relative entry from the strict no-follow list. Each
+    intermediate component gets the same owner-only mode and post-race
+    validation as the final directory. The data-home root itself is never
+    created here.
+    """
+    relative = os.path.normpath(leaf)
+    suffix = os.sep + relative
+    normalized = os.path.normpath(target)
+    if not normalized.endswith(suffix):
+        raise SandboxCeilingUnsealable(
+            f"cannot derive the data home for nested governance ceiling {target}"
+        )
+    data_home = normalized[: -len(suffix)]
+    parent_relative = os.path.dirname(relative)
+    if not parent_relative or parent_relative == "." or not os.path.isdir(data_home):
+        return
+
+    current = data_home
+    for component in parent_relative.split(os.sep):
+        current = os.path.join(current, component)
+        _refuse_if_dangling_symlink(current)
+        _refuse_if_symlink_leaf(current)
+        if os.path.exists(current):
+            _require_real_dir_nofollow(current)
+            continue
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            _require_real_dir_nofollow(current)
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot create the governance ceiling parent {current}: {exc}"
+            ) from exc
+
+
 def _materialize_sealable_ceilings() -> list[str]:
     """Create every absent sealable ceiling; return the paths actually created.
 
@@ -2344,7 +2431,18 @@ def _materialize_sealable_ceilings() -> list[str]:
     dir_targets, file_targets = _sealable_absent_ceilings()
 
     for target in dir_targets:
-        strict_nofollow = os.path.basename(target) in _CREW_NOFOLLOW_READONLY_DIR_LEAVES
+        normalized = os.path.normpath(target)
+        strict_leaf = next(
+            (
+                leaf
+                for leaf in _CREW_NOFOLLOW_READONLY_DIR_LEAVES
+                if normalized.endswith(os.sep + os.path.normpath(leaf))
+            ),
+            None,
+        )
+        strict_nofollow = strict_leaf is not None
+        if strict_leaf is not None:
+            _materialize_sealable_parent_dirs(target, strict_leaf)
         _refuse_if_dangling_symlink(target)
         # BEFORE the warn-and-continue below: for a protected leaf an alias is a
         # refusal, and reaching `_warn_if_alias_backed` would log that the path was

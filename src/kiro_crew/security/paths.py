@@ -995,6 +995,27 @@ _WRITE_PROTECTED_HOME_PATHS += [
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
+    # MCP launch approval and the gateway's own launch artifacts. gatewayd spawns
+    # a stubbed server's backend OUTSIDE the sandbox, as the user.
+    # ``mcp_launch_approvals.json`` is the operator's record of which launch each
+    # stubbed name may run (``mcp_gateway.launch_approval``); the overlay agents
+    # and the env sidecars under ``mcp-gateway/stubs`` are the rewriter's output
+    # that the stub and gatewayd read that launch back from. The ``mcp/resolved``
+    # tree is written by the gateway's resolve-once installer and supplies the
+    # executable entry point substituted for an approved npm launcher. None holds anything
+    # an agent needs to author, and every writer -- the dashboard stub toggle,
+    # the rewrite pass -- runs in the gateway, which does not route through this
+    # gate. Readable, because reading them decides nothing.
+    f"{prefix}/{leaf}"
+    for prefix in _CREW_HOME_PREFIXES
+    for leaf in (
+        "mcp_launch_approvals.json",
+        "mcp-gateway/agents",
+        "mcp-gateway/stubs",
+        "mcp/resolved",
+    )
+]
+_WRITE_PROTECTED_HOME_PATHS += [
     # The cloud launcher's LAUNCH RECORD (``cloud/launch_state.py``): the profile, region
     # and tag the last launch decided. WRITE-protected on the same footing as
     # ``cloud.json`` above, and for a reason that is specific rather than inherited: the

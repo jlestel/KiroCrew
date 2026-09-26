@@ -50,6 +50,7 @@ import sys
 import time
 import traceback
 from collections import OrderedDict, deque
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection, Iterator, Mapping, NoReturn, Optional
@@ -70,7 +71,14 @@ from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
 from kiro_crew.mcp_caller import new_tenant_nonce
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
-from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, tool_surface, transport
+from kiro_crew.mcp_gateway import (
+    credwatch,
+    hazards,
+    launch_approval,
+    socketsec,
+    tool_surface,
+    transport,
+)
 from kiro_crew.mcp_gateway.admission import (
     DEFAULT_CAPACITY,
     DEFAULT_CEILING,
@@ -94,7 +102,7 @@ from kiro_crew.mcp_gateway.backend import (
 )
 from kiro_crew.mcp_gateway.backend_tmp import sweep_all_backend_tmp
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
-from kiro_crew.mcp_gateway.hashing import hash_effective_env, non_secret_env
+from kiro_crew.mcp_gateway.hashing import hash_command, hash_effective_env, non_secret_env
 from kiro_crew.mcp_gateway.host_budget import (
     HostBudget,
     HostBudgetExhausted,
@@ -677,6 +685,13 @@ TargetResolver = Callable[
     [PoolKey],
     Optional[tuple[str, list[str], dict[str, str], str]],
 ]
+
+# One acquisition's immutable approval snapshot is propagated into each worker
+# thread that resolves its command and declared env. Direct synchronous callers
+# see ``None`` and retain the public helper's load-on-call behavior.
+_LAUNCH_APPROVAL_SNAPSHOT: ContextVar[Optional[launch_approval.LaunchApprovals]] = ContextVar(
+    "mcp_gateway_launch_approval_snapshot", default=None
+)
 
 
 # --- Public API -------------------------------------------------------------
@@ -1857,21 +1872,12 @@ def _declared_non_secret_env(pool_key: PoolKey) -> dict[str, str]:
     }
 
 
-def _declared_env_pairs(pool_key: PoolKey, identity_keys: Collection[str]) -> dict[str, str]:
-    """Return the declared env sidecar's contents for ``pool_key``, or ``{}``.
+def _read_declared_env_sidecar(pool_key: PoolKey) -> Optional[dict[str, str]]:
+    """Return the raw declared env sidecar for ``pool_key``, or ``None``.
 
-    Unfiltered, but coherence-gated: a sidecar whose contents no longer hash to
-    ``pool_key.effective_env_hash`` yields ``{}``. Callers apply whatever
-    co-tenancy filtering their acquisition path requires.
-
-    ``identity_keys`` is REQUIRED rather than read here, so the caller's ONE
-    snapshot of ``pool_identity_env_keys()`` governs both the hash recomputed
-    below and whatever filtering the caller then applies. Reading it here as well
-    would make those two decisions two different observations of a file an
-    operator can edit at any moment: the gate could accept a sidecar under one
-    set while the caller filtered under another, and the wider of the two would
-    decide what reaches the backend. Passing it in makes that mismatch
-    unrepresentable instead of merely unlikely.
+    ``None`` means no readable JSON object exists. The values are unfiltered and
+    ungated; :func:`_declared_env_pairs` and :func:`env_target_resolver` apply
+    their own checks.
 
     BLOCKING: reads a file. Callers must run it off the event loop.
     """
@@ -1887,16 +1893,39 @@ def _declared_env_pairs(pool_key: PoolKey, identity_keys: Collection[str]) -> di
         raw = path.read_text(encoding="utf-8")
     except OSError:
         # No sidecar for this key: the server declared no env. Not an error.
-        return {}
+        return None
     try:
         decoded = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
         logger.warning("declared-env: sidecar %s is not valid JSON; ignoring", path)
-        return {}
+        return None
     if not isinstance(decoded, dict):
         logger.warning("declared-env: sidecar %s is not a JSON object; ignoring", path)
+        return None
+    return {str(k): str(v) for k, v in decoded.items() if k}
+
+
+def _declared_env_pairs(pool_key: PoolKey, identity_keys: Collection[str]) -> dict[str, str]:
+    """Return the declared env sidecar's contents for ``pool_key``, or ``{}``.
+
+    Unfiltered, but coherence-gated: a sidecar whose contents do not hash to
+    ``pool_key.effective_env_hash`` yields ``{}``. Callers apply whatever
+    co-tenancy filtering their acquisition path requires.
+
+    ``identity_keys`` is REQUIRED rather than read here, so the caller's ONE
+    snapshot of ``pool_identity_env_keys()`` governs both the hash recomputed
+    below and whatever filtering the caller then applies. Reading it here as well
+    would make those two decisions two different observations of a file an
+    operator can edit at any moment: the gate could accept a sidecar under one
+    set while the caller filtered under another, and the wider of the two would
+    decide what reaches the backend. Passing it in makes that mismatch
+    unrepresentable instead of merely unlikely.
+
+    BLOCKING: reads a file. Callers must run it off the event loop.
+    """
+    pairs = _read_declared_env_sidecar(pool_key)
+    if pairs is None:
         return {}
-    pairs = {str(k): str(v) for k, v in decoded.items() if k}
     # COHERENCE GATE — the invariant that makes forwarding safe must be
     # ENFORCED, not assumed. The stub hashed the sidecar as it read it at ITS
     # start; this read happens later, at cold spawn. An operator editing
@@ -1925,6 +1954,22 @@ def _declared_env_pairs(pool_key: PoolKey, identity_keys: Collection[str]) -> di
         logger.warning(
             "declared-env: sidecar for %r no longer matches the PoolKey it was "
             "hashed under (the spec was edited after this session started); "
+            "skipping forwarding for this backend",
+            pool_key.server_name,
+        )
+        return {}
+    # APPROVAL GATE. The coherence gate above compares the sidecar with a hash
+    # the STUB reported, and both are agent-writable, so together they prove
+    # only that two agent-controlled inputs agree. The env forwarded here runs
+    # outside the sandbox, so it must be one the gateway derived from an
+    # operator-approved launch (``launch_approval``). Fails closed.
+    if not _launch_approved_from_snapshot(
+        pool_key.server_name,
+        pool_key.command_args_hash,
+        launch_approval.env_fingerprint(pairs),
+    ):
+        logger.warning(
+            "declared-env: sidecar for %r does not match an approved launch; "
             "skipping forwarding for this backend",
             pool_key.server_name,
         )
@@ -1977,11 +2022,6 @@ def _declared_env_to_forward(pool_key: PoolKey) -> dict[str, str]:
     return _declared_non_secret_env(pool_key)
 
 
-#: The canonical target-env prefix. ``MC_MCP_TARGET_`` is the legacy spelling
-#: :func:`env_target_resolver` still accepts, so both normalize to this stem set.
-_TARGET_ENV_PREFIXES = ("KIROCREW_MCP_TARGET_", "MC_MCP_TARGET_")
-
-
 def resolvable_target_stems(env: Optional[dict[str, str]] = None) -> list[str]:
     """The set of target-env STEMS this daemon can resolve, sorted.
 
@@ -2002,19 +2042,44 @@ def resolvable_target_stems(env: Optional[dict[str, str]] = None) -> list[str]:
     that collision). Both sides comparing stems needs no such guess.
     """
     source = os.environ if env is None else env
-    stems: set[str] = set()
-    for key in source:
-        for prefix in _TARGET_ENV_PREFIXES:
-            if not key.startswith(prefix):
-                continue
-            stem = key[len(prefix) :]
-            # Strip the args-disambiguated suffix so a hashed-only entry still
-            # reports the server it serves.
-            stem = stem.split("__", 1)[0]
-            if stem:
-                stems.add(stem)
-            break
+    # ``target_env_stem`` strips the prefix (canonical or the legacy
+    # ``MC_MCP_TARGET_``) and the args-disambiguated suffix, so a hashed-only
+    # entry still reports the server it serves.
+    stems = {stem for key in source if (stem := launch_approval.target_env_stem(key))}
     return sorted(stems)
+
+
+def _approval_env_identity(pool_key: PoolKey) -> str:
+    """The full-env approval identity of the launch behind ``pool_key``.
+
+    A readable sidecar coherent with ``pool_key.effective_env_hash`` yields the
+    complete declared env's fingerprint, the identity the approval stores. In
+    every other case the PoolKey hash stands, which matches an approval only
+    when that approval's env carried no secret-prefixed key.
+
+    BLOCKING: reads a file. Callers must run it off the event loop.
+    """
+    pairs = _read_declared_env_sidecar(pool_key)
+    if pairs is not None and (
+        hash_effective_env(pairs, identity_keys=pool_identity_env_keys())
+        == pool_key.effective_env_hash
+    ):
+        return launch_approval.env_fingerprint(pairs)
+    return pool_key.effective_env_hash
+
+
+def _launch_approved_from_snapshot(
+    server_name: str,
+    command_hash: str,
+    derived_env_hash: str,
+) -> bool:
+    """Check the acquisition snapshot, loading only for synchronous callers."""
+    approvals = _LAUNCH_APPROVAL_SNAPSHOT.get()
+    if approvals is None:
+        return launch_approval.launch_approved(server_name, command_hash, derived_env_hash)
+    return approvals.admits_launch(
+        launch_approval.target_stem(server_name), command_hash, derived_env_hash
+    )
 
 
 def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dict[str, str], str]]:
@@ -2053,6 +2118,21 @@ def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dic
     if not parts:
         return None
     command, *args = parts
+    # The mapping above is spec-derived; the server name that selected it is
+    # not proof of what it runs. Spawn only a command+args the operator
+    # approved for this name (``launch_approval``). ``None`` is the clean
+    # "no target" rejection, so the stub falls back to a launch inside the
+    # session sandbox. Fails closed on a missing or unreadable store.
+    if not _launch_approved_from_snapshot(
+        pool_key.server_name,
+        hash_command(command, args),
+        _approval_env_identity(pool_key),
+    ):
+        logger.warning(
+            "mcp-gateway: refusing to spawn %r: its launch is not an approved one",
+            pool_key.server_name,
+        )
+        return None
     env = _scrub_sensitive_env(dict(os.environ))
     # A reserved control plane receives the session token only after every
     # launcher-injection namespace is gone. Third-party backends never receive
@@ -4187,6 +4267,31 @@ async def _handle_connection(
                 await writer_task
 
 
+def _call_with_approval_snapshot(
+    callback: Callable[[PoolKey], Any],
+    pool_key: PoolKey,
+    approvals: launch_approval.LaunchApprovals,
+) -> Any:
+    """Run one resolver callback against an immutable approval snapshot."""
+    token = _LAUNCH_APPROVAL_SNAPSHOT.set(approvals)
+    try:
+        return callback(pool_key)
+    finally:
+        _LAUNCH_APPROVAL_SNAPSHOT.reset(token)
+
+
+async def _resolve_target_off_loop(
+    resolver: TargetResolver,
+    pool_key: PoolKey,
+    approvals: Optional[launch_approval.LaunchApprovals] = None,
+) -> Optional[tuple[str, list[str], dict[str, str], str]]:
+    """Resolve one backend target without blocking the gateway event loop."""
+    snapshot = approvals
+    if snapshot is None:
+        snapshot = await asyncio.to_thread(launch_approval.load_approvals)
+    return await asyncio.to_thread(_call_with_approval_snapshot, resolver, pool_key, snapshot)
+
+
 async def _acquire_backend(
     pool: BackendPool,
     pool_key: PoolKey,
@@ -4239,7 +4344,8 @@ async def _acquire_backend(
     :class:`SpawnGateTimeout`, :class:`SpawnGateClosed` and
     :class:`PoolAtCapacity` from the three admission steps.
     """
-    target = resolver(pool_key)
+    approval_snapshot = await asyncio.to_thread(launch_approval.load_approvals)
+    target = await _resolve_target_off_loop(resolver, pool_key, approval_snapshot)
     if target is None:
         raise _TargetUnknown(
             f"no target mapping for server {pool_key.server_name!r}; "
@@ -4329,12 +4435,14 @@ async def _acquire_backend(
         # processing if done inline after a config invalidation.
         declared = dict(
             await asyncio.to_thread(
+                _call_with_approval_snapshot,
                 (
                     _declared_env_for_private_backend
                     if exclusive_stub_uuid
                     else _declared_env_to_forward
                 ),
                 pool_key,
+                approval_snapshot,
             )
         )
         declared_path_key = spec_path_key(declared)

@@ -555,6 +555,22 @@ class TestInstall:
         assert _sandbox_calls[0]["mode"] == "standard"
         assert _sandbox_calls[0]["strip_python_env"] is True
 
+    async def test_install_stages_outside_the_sealed_store_then_publishes(self, tmp_path) -> None:
+        home = str(tmp_path / "home")
+        spec = R.NpmSpec(package="foo@1.0.0", passthrough=())
+
+        rec = await R.install(home, spec, npm=_fake_npm(tmp_path, bin_field="cli.js"))
+
+        assert rec is not None
+        argv = _sandbox_calls[0]["argv"]
+        prefix = argv[argv.index("--prefix") + 1]
+        sealed_store = os.path.realpath(R.store_root(home))
+        assert os.path.commonpath((os.path.realpath(prefix), sealed_store)) != sealed_store
+        assert os.path.join("run", "mcp-resolve") in prefix
+        assert _sandbox_calls[0]["extra_writable_dirs"] == (prefix,)
+        assert not os.path.exists(prefix)
+        assert os.path.isfile(os.path.join(R.spec_dir(home, spec), rec.entrypoint))
+
     async def test_commits_a_record_pointing_at_the_bin(self, tmp_path) -> None:
         home = str(tmp_path / "home")
         spec = R.NpmSpec(package="foo@1.0.0", passthrough=())

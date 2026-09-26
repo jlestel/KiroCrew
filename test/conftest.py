@@ -465,6 +465,36 @@ def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _approve_every_mcp_launch(request, monkeypatch):
+    """Treat every gatewayd launch as operator-approved, except where it is the subject.
+
+    gatewayd refuses a target command or declared env the operator has not
+    approved (``mcp_gateway.launch_approval``), and a hermetic home has no
+    approval store, so every resolver and forwarding test would otherwise
+    exercise the refusal instead of the behaviour it pins. The stub toggle and
+    seeding resolve the launch they approve from the agent specs, which a
+    hermetic home does not carry either, so each name resolves to one stand-in
+    launch. A module that tests the approval itself sets
+    ``ENFORCE_LAUNCH_APPROVAL = True``.
+    """
+    if getattr(request.module, "ENFORCE_LAUNCH_APPROVAL", False):
+        return
+    try:
+        from kiro_crew.mcp_gateway import launch_approval, launch_resolve
+    except ImportError:
+        return
+    monkeypatch.setattr(launch_approval, "launch_approved", lambda *_a, **_k: True)
+
+    def _stand_in_launches(names, **_kwargs):
+        return {
+            n: [launch_approval.ResolvedLaunch(launch_approval.launch_fingerprint(n, []), n, ())]
+            for n in names
+        }
+
+    monkeypatch.setattr(launch_resolve, "resolve_launches", _stand_in_launches)
+
+
+@pytest.fixture(autouse=True)
 def _windows_restrict_to_owner_stub(request, _floor_monkeypatch):
     """On Windows, no-op the secret lockdown for hermetic tests.
 

@@ -175,6 +175,17 @@ def non_secret_env(
     return {k: v for k, v in env_pairs.items() if k in keep or not is_secret_env_key(k)}
 
 
+def hash_declared_env(env_pairs: Mapping[str, str]) -> str:
+    """Sorted ``K=V\\0``-delimited SHA-256 over every declared env pair."""
+    h = hashlib.sha256()
+    for k in sorted(env_pairs):
+        h.update(k.encode("utf-8"))
+        h.update(b"=")
+        h.update(env_pairs[k].encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def hash_effective_env(env_pairs: Mapping[str, str], *, identity_keys: Collection[str] = ()) -> str:
     """Sorted ``K=V\\0``-delimited SHA-256 over the NON-SECRET env pairs.
 
@@ -192,10 +203,4 @@ def hash_effective_env(env_pairs: Mapping[str, str], *, identity_keys: Collectio
     hash the daemon does not reproduce, so forwarding fails closed.
     """
     filtered = non_secret_env(env_pairs, identity_keys=identity_keys)
-    h = hashlib.sha256()
-    for k in sorted(filtered):
-        h.update(k.encode("utf-8"))
-        h.update(b"=")
-        h.update(filtered[k].encode("utf-8"))
-        h.update(b"\0")
-    return h.hexdigest()
+    return hash_declared_env(filtered)

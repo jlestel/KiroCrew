@@ -3128,7 +3128,8 @@ class TestGatewaySetStubBatch:
         )
         assert resp.status == 200
         # The batch form answers with `names`, never a single `name`.
-        assert _payload(resp) == {
+        body = _payload(resp)
+        assert body == {
             "ok": True,
             "names": ["b-mcp", "a-mcp", "a-mcp"],
             "stub": True,
@@ -3197,7 +3198,8 @@ class TestGatewaySetStubBatch:
         resp = await mcp_mod.api_mcp_gateway_set_stub(
             _request({"name": "ok-mcp", "stub": True}, state=SimpleNamespace())
         )
-        assert _payload(resp) == {
+        body = _payload(resp)
+        assert body == {
             "ok": True,
             "name": "ok-mcp",
             "stub": True,

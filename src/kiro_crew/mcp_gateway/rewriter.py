@@ -62,6 +62,12 @@ from kiro_crew.mcp_gateway.hashing import (
     hash_command,
     is_secret_env_key,
 )
+from kiro_crew.mcp_gateway.launch_approval import (
+    LaunchApprovals,
+    env_fingerprint,
+    filter_target_env,
+    launch_fingerprint,
+)
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.sandbox import scrub_agent_denied_env
@@ -1083,8 +1089,14 @@ def _rewrite_single_spec(
     target_env: dict[str, str] | None = None,
     sidecars_written: _SidecarLedger | None = None,
     notes: _RewritePassNotes | None = None,
+    approvals: LaunchApprovals | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Return ``(new_spec, wrapped_count)``. Idempotent.
+
+    ``approvals`` enforces content approval (see
+    :mod:`kiro_crew.mcp_gateway.launch_approval`): a stubbed entry is wrapped
+    only when its resolved launch is approved for its name, and an entry that
+    arrives already wrapped is re-derived rather than trusted.
 
     ``inject_servers`` is a mapping of ``{name: raw_entry}`` of poolable
     servers sourced from the global ``settings/mcp.json`` that must be made
@@ -1122,6 +1134,12 @@ def _rewrite_single_spec(
             # Leave unchanged — these bind to KIROCREW_SESSION_KEY.
             new_servers[name] = entry
             continue
+        if approvals is not None and (
+            entry.get(_WRAPPER_MARKER) is True or entry.get(_WRAPPER_MARKER_LEGACY) is True
+        ):
+            # The marker is spec text, so it cannot vouch for the target it
+            # names. Re-derive the plain entry and let the checks below decide.
+            entry = _unwrapped_from_prewrapped(entry)
         if entry.get(_WRAPPER_MARKER) is True or entry.get(_WRAPPER_MARKER_LEGACY) is True:
             # Already wrapped (idempotency). Upgrade to new marker on re-emit.
             upgraded = dict(entry)
@@ -1235,6 +1253,16 @@ def _rewrite_single_spec(
             )
             new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
             continue
+        if not _admit_launch(
+            approvals,
+            name=name,
+            agent_name=agent_name,
+            entry=entry,
+            resolved_cmd=resolved_cmd,
+            entry_env=entry_env,
+        ):
+            new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
+            continue
         new_servers[name] = _build_stub_entry(
             stubs_dir=stubs_dir,
             server_name=name,
@@ -1342,6 +1370,17 @@ def _rewrite_single_spec(
             )
             new_servers[alias] = {k: v for k, v in entry.items() if k != "poolable"}
             seen_targets.add(inject_sig)
+            continue
+        if not _admit_launch(
+            approvals,
+            name=alias,
+            agent_name=agent_name,
+            entry=entry,
+            resolved_cmd=resolved_cmd,
+            entry_env=entry_env,
+        ):
+            # Not injected at all: kiro-cli's own merge of the real settings
+            # file still gives the session this server, launched in-sandbox.
             continue
         new_servers[alias] = _build_stub_entry(
             stubs_dir=stubs_dir,
@@ -2093,6 +2132,7 @@ def rewrite_agents(
     approval_mode: str = "interactive",
     stub_servers: frozenset[str] | None = None,
     pooling_enabled: bool = True,
+    approvals: LaunchApprovals | None = None,
 ) -> tuple[dict[str, int], dict[str, str]]:
     """Populate ``overlay_dir`` with rewritten copies of ``source_dir/*.json``.
 
@@ -2128,6 +2168,12 @@ def rewrite_agents(
             the stub set: when ``False`` no stub is marked shareable, so each
             connection gets its own backend while the stubs stay in place — the
             state that lets a stubbed server render UI without co-tenancy.
+        approvals: The operator's approved launch fingerprints
+            (:mod:`kiro_crew.mcp_gateway.launch_approval`). When given, only an
+            approved launch is wrapped, a cache-served result that names an
+            unapproved target is discarded for a full pass, and the object
+            records what the pass captured and refused for the caller to
+            persist. ``None`` enforces nothing.
 
     Returns:
         A ``(results, target_env)`` tuple:
@@ -2210,6 +2256,8 @@ def rewrite_agents(
         forward_env=forward_env,
         identity_keys=identity_keys,
     )
+    if approvals is not None:
+        current_inputs["launch_approvals"] = approvals.digest()
     stored = _load_fingerprint(fingerprint_path)
     # One call covers both paths below (cache hit returns early; the full
     # rewrite continues): re-tighten the leftover legacy settings overlay's
@@ -2219,8 +2267,23 @@ def rewrite_agents(
         cached = _cached_rewrite_result(
             stored, overlay_dir=overlay_dir, stubs_dir=stubs_dir
         )
+        if cached is not None and approvals is not None:
+            # The overlays and sidecars behind the cache are files an agent can
+            # edit along with the fingerprint that vouches for them, so the
+            # cached targets are held to the same approval as a fresh pass.
+            _kept, dropped = filter_target_env(cached[1], approvals)
+            if dropped:
+                logger.warning(
+                    "mcp launch approvals: %d cached overlay target(s) are not "
+                    "approved; regenerating the overlays",
+                    len(dropped),
+                )
+                approvals.refused.clear()
+                cached = None
         if cached is not None:
             return cached
+    if approvals is not None:
+        approvals.full_pass = True
 
     written: set[str] = set()
     written_sidecars = _SidecarLedger()
@@ -2480,6 +2543,7 @@ def rewrite_agents(
                 target_env=target_env,
                 sidecars_written=written_sidecars,
                 notes=notes,
+                approvals=approvals,
             )
             _collect_target_env(new_spec.get("mcpServers", {}), target_env)
             target = overlay_dir / overlay_name
@@ -2687,6 +2751,136 @@ def rewrite_agents(
     return results, target_env
 
 
+def _wrapped_target(entry: Mapping[str, Any]) -> tuple[str, list[str]] | None:
+    """The ``(target command, target args)`` a wrapped stub entry launches, or ``None``.
+
+    Same splice and precedence as the stub's parser, so this reads exactly what
+    the stub would hand gatewayd -- and a plain-flag overlay identically.
+    """
+    args = expand_stub_flags(entry.get("args", []) or [])
+    target_cmd: str | None = None
+    target_args_b64: str | None = None
+    target_args_legacy = ""
+    target_args_sep = _TARGET_ARGS_SEP
+    i = 0
+    while i < len(args):
+        token = str(args[i])
+        flag, equals, value = token.partition("=")
+        if flag in {
+            "--target-command", _TARGET_ARGS_FLAG,
+            _TARGET_ARGS_FLAG_LEGACY, "--target-args-sep",
+        }:
+            if not equals:
+                if i + 1 >= len(args):
+                    break
+                i += 1
+                value = str(args[i])
+            if flag == "--target-command":
+                target_cmd = value
+            elif flag == _TARGET_ARGS_FLAG:
+                target_args_b64 = value
+            elif flag == _TARGET_ARGS_FLAG_LEGACY:
+                target_args_legacy = value
+            else:
+                target_args_sep = value
+        i += 1
+    if not target_cmd:
+        return None
+    if target_args_b64 is not None:
+        raw_target_args = decode_target_args(target_args_b64)
+    else:
+        raw_target_args = (
+            target_args_legacy.split(target_args_sep) if target_args_legacy else []
+        )
+    return target_cmd, raw_target_args
+
+
+def _is_managed_launch(name: str, entry: Mapping[str, Any]) -> bool:
+    """Whether *entry* is the managed invocation of a reserved ``kirocrew-*`` name.
+
+    Such a launch is derived by :func:`_repair_control_plane_entry` from Kiro
+    Crew's own install, not from anything agent-writable, so it needs no
+    operator approval of its content.
+    """
+    if name not in KIROCREW_BIN_MCP_SERVERS:
+        return False
+    managed = _managed_invocation(name)
+    if not isinstance(managed, dict) or not managed.get("command"):
+        return False
+    return str(entry.get("command", "")) == str(managed["command"]) and _spec_args(
+        entry
+    ) == _spec_args(managed)
+
+
+def _unwrapped_from_prewrapped(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-derive a plain entry from one that arrived already carrying the wrapper.
+
+    The marker is an input the spec author controls, so it proves nothing: the
+    target it names goes back through the ordinary stub decision instead of
+    being trusted. Its declared env is not recovered -- the ``--env-file`` path
+    is spec-chosen too, and reading it would copy an arbitrary file into a
+    sidecar. An entry whose target cannot be read loses the marker and is left
+    for the session to launch.
+    """
+    kept = {
+        k: v
+        for k, v in entry.items()
+        if k not in ("command", "args", "env", "poolable", _WRAPPER_MARKER, _WRAPPER_MARKER_LEGACY)
+    }
+    try:
+        target = _wrapped_target(entry)
+    except ValueError:
+        target = None
+    if target is None:
+        return {k: v for k, v in entry.items() if k not in (_WRAPPER_MARKER, _WRAPPER_MARKER_LEGACY)}
+    command, args = target
+    kept["command"] = command
+    kept["args"] = list(args)
+    return kept
+
+
+def _admit_launch(
+    approvals: LaunchApprovals | None,
+    *,
+    name: str,
+    agent_name: str,
+    entry: Mapping[str, Any],
+    resolved_cmd: str,
+    entry_env: dict[str, Any],
+) -> bool:
+    """Whether a stubbed entry may be wrapped, i.e. launched by gatewayd outside the sandbox.
+
+    ``approvals`` of ``None`` is a caller that enforces nothing (tests and
+    tools that only render overlays). Otherwise the launch's content must be
+    approved for this server name; a refusal leaves the entry unwrapped, so the
+    session launches it inside its own sandbox.
+    """
+    if approvals is None:
+        return True
+    target_args = _spec_args(entry)
+    fingerprint = launch_fingerprint(resolved_cmd, target_args, entry_env)
+    derived_env_hash = env_fingerprint(_expand_env_map(entry_env))
+    if not approvals.admit(
+        name,
+        fingerprint,
+        managed=_is_managed_launch(name, entry),
+        launch=(resolved_cmd, target_args),
+        # The declared text, not the expansion: placeholders stay unexpanded so a
+        # host secret behind ``${VAR}`` is never rendered on the dashboard.
+        env=entry_env,
+        derived_env_hash=derived_env_hash,
+    ):
+        # Names only: the args and env may carry tokens.
+        logger.warning(
+            "mcp launch approvals: stubbed server %r (agent %r) resolves to a launch "
+            "the operator has not approved; leaving it unwrapped so the session "
+            "launches it inside its sandbox. Re-approve it from the MCP page.",
+            name, agent_name,
+        )
+        return False
+    return True
+
+
 def _collect_target_env(
     mcp_servers: dict[str, Any],
     target_env: dict[str, str],
@@ -2714,44 +2908,9 @@ def _collect_target_env(
         ):
             continue
         env_key = "KIROCREW_MCP_TARGET_" + server_name.replace("-", "_").upper()
-        # Same splice as the stub's parser, so both sides read the flags an
-        # envelope carries -- and a plain-flag overlay -- identically.
-        args = expand_stub_flags(entry.get("args", []) or [])
-        target_cmd: str | None = None
-        target_args_b64: str | None = None
-        target_args_legacy = ""
-        target_args_sep = _TARGET_ARGS_SEP
-        i = 0
-        while i < len(args):
-            token = str(args[i])
-            flag, equals, value = token.partition("=")
-            if flag in {
-                "--target-command", _TARGET_ARGS_FLAG,
-                _TARGET_ARGS_FLAG_LEGACY, "--target-args-sep",
-            }:
-                if not equals:
-                    if i + 1 >= len(args):
-                        break
-                    i += 1
-                    value = str(args[i])
-                if flag == "--target-command":
-                    target_cmd = value
-                elif flag == _TARGET_ARGS_FLAG:
-                    target_args_b64 = value
-                elif flag == _TARGET_ARGS_FLAG_LEGACY:
-                    target_args_legacy = value
-                else:
-                    target_args_sep = value
-            i += 1
-        if target_cmd:
-            # Same precedence and decode as the stub: both sides must hash
-            # identical argv for daemon target lookup to find the backend.
-            if target_args_b64 is not None:
-                raw_target_args = decode_target_args(target_args_b64)
-            else:
-                raw_target_args = (
-                    target_args_legacy.split(target_args_sep) if target_args_legacy else []
-                )
+        target = _wrapped_target(entry)
+        if target is not None:
+            target_cmd, raw_target_args = target
             # This is a matched quote/split codec, never a shell command.
             spec = " ".join(shlex.quote(p) for p in [target_cmd, *raw_target_args])
             # Bare server-name key: first-wins fallback. Two DISTINCT server
