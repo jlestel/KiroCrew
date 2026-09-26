@@ -2368,6 +2368,51 @@ status plus one `readiness:` label**.
   naming an earlier head is not an answer for this one). Readiness lists an owing
   lane as a named **pending** that re-running that lane clears, never a red: a
   `failed` there would publish a BLOCK verdict no reviewer reached (#13363).
+- **It also reports a verdict this head's own re-sample replaced.** A review
+  lane's marker comment is ONE slot keyed on the lane, never on the head, so a
+  second sample at one head overwrites the first and the board keeps only the
+  survivor. Every body the slot ever held survives in GraphQL
+  `userContentEdits`, so readiness runs `pr_status.py --supersession-gate` and
+  folds each lane where a replaced sample BLOCKED this head, while the body now
+  presented does not, into its blocking list. A sample blocks in either spelling
+  the lanes use: `[BLOCK-MERGE] <head>`, which GPT and Opus write, or a
+  `<Lane>-Verdict: BLOCK` line from Design, UX or First Principles, which never
+  write that marker at all. The history read is a cheap question first — how
+  many bodies has this slot held — and pays for the bodies themselves only when
+  that count exceeds one, because a slot holding one body has nothing that could
+  have been superseded. An unreadable count is not zero.
+- **A sanctioned clear is read where a model cannot write, and only on the one
+  lane that has one.** Adjudication and `/ai-review override` clear a GPT block
+  by rewriting `[BLOCK-MERGE] <head>` to `[BLOCK-MERGE-DOWNGRADED] <head>`,
+  which necessarily leaves a superseded blocking body behind — so that clear
+  must be recognised or the gate reds a legitimate one forever. It is NOT
+  recognised by grepping the marker: on the non-blocking path the presented body
+  embeds the model's own output file verbatim, so review prose over a diff
+  containing that string would forge a clearance, the same reason
+  `codex-review.yml` refuses to grep its own refusal marker. It is read from the
+  workflow-authored `(all downgraded on adjudication)` heading, which is printed
+  from the parsed decision ABOVE the first `<details>` while the model's output
+  sits inside one, head-scoped to that same region. That shape holds only for
+  `codex-review.yml` and `fork-gpt-review.yml`, so the exemption is restricted
+  to the GPT lane by name and `test_prepare_pr_supersession.py` asserts from
+  source both that no other workflow prints the heading and that only those two
+  wrap their prose — a lane gaining the path, or GPT losing its wrapper, reddens
+  there instead of quietly widening the exemption.
+- **The clearance path differs by lane family, and the gate's failure text says
+  which.** On the GPT lane, clear the verdict the sanctioned way and the gate
+  reads it as cleared. The whole-design lanes have no downgrade artifact at all,
+  so a superseded BLOCK there cannot be stamped away: the only exit is pushing a
+  new head, and that is what their failure text names. An ordinary same-head
+  re-sample that did not drop a block is reported for information and does NOT
+  gate. A reading the gate could not establish is `pending`, never red, for the
+  same reason the disposition gate's is — an unreadable comment history is not
+  "no verdict was superseded" — and the step is skipped for `dependabot[bot]`
+  with the same condition the lanes carry, because on such a pull request no
+  lane ever publishes and `pending` would strand the status for the life of the
+  head with nothing able to clear it. The local `pr_status.py` fails closed on a
+  dropped block and on an unreadable reading, because that exit code is what
+  arms `gh pr merge --auto`; an empty lane population is a separate cause and
+  does not, since the marker evaluation beside it already reports it.
 - **Unapproved fork runs remain blocking but are attributed separately.** GitHub
   reports a fork workflow held behind *Approve and run* as `action_required`
   even though it has not executed. Readiness keeps the failure status and
