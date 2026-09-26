@@ -1099,6 +1099,22 @@ def read_context_tokens(source: object) -> tuple[int, int]:
         return (0, 0)
 
 
+# Runaway guard for :func:`_wrapper_chain`, NOT a depth limit. The walk follows
+# the four documented holder attributes and stops at objects it has already
+# seen, so a real provider stack — a handful of wrappers around one handle and
+# one runtime — is exhausted long before this. What the bound exists for is a
+# source that SYNTHESIZES attributes: a ``MagicMock`` answers every ``getattr``
+# with a fresh child, so without a bound the walk would never end. It is sized
+# so that no plausible wrapper depth can reach it: a wrapper layer carrying all
+# four holders costs three nodes on the way down, so this admits twenty-plus
+# stacked layers, an order of magnitude past anything a session accumulates.
+_WRAPPER_CHAIN_MAX_NODES = 64
+
+# Holder attributes, in the order they are followed. ``_runtime`` is LAST on
+# purpose — see :func:`_wrapper_chain`.
+_WRAPPER_HOLDERS: tuple[str, ...] = ("client", "_client", "_handle", "_runtime")
+
+
 def _wrapper_chain(source: object) -> list[object]:
     """Collect *source* and the provider/client/handle wrappers nested under it.
 
@@ -1110,23 +1126,38 @@ def _wrapper_chain(source: object) -> list[object]:
     ``AcpSessionProvider`` to ``_client`` (the ``-> AcpClient`` annotation there
     carries a ``type: ignore``). A default Kiro turn therefore hides its resolved
     state two levels down, at ``provider.client._handle``, so probing a fixed
-    depth misses it. Breadth-first with a node cap and an identity-based visited
-    set, so a wrapper that points back at itself terminates.
+    depth misses it.
+
+    Depth-first along the holder attributes, with an identity-based visited set
+    so a wrapper that points back at itself (or two wrappers that share a
+    runtime) terminates. Depth-first, not breadth-first, because the model state
+    sits at the BOTTOM of the holder chain while every wrapper layer above it —
+    a fallback wrapper, session sharing, a subagent companion, a channel-linked
+    session — carries siblings that hold nothing. A breadth-first walk with a
+    node budget spends that budget on the siblings and, a few layers down,
+    stops short of the ``_model`` node; ``_resolve_model`` then persists a blank
+    and the credits land in the read-time ``unknown`` bucket. Following the
+    chain downward first reaches the handle regardless of how many layers are
+    stacked on top; :data:`_WRAPPER_CHAIN_MAX_NODES` is a runaway guard for
+    attribute-synthesizing sources, not a depth limit.
 
     ``_runtime`` is traversed **last** deliberately. It is the only holder of
     ``_agent`` for the session-provider shape (``runtime.py:273``), but it also
     carries the process-level ``--model`` argument (``runtime.py:280``); visiting
-    it after ``_handle`` keeps session-level model state ahead of process-level
-    state when :func:`read_effective_model` falls through to ``_model``.
+    it after the whole ``_handle`` subtree keeps session-level model state ahead
+    of process-level state when :func:`read_effective_model` falls through to
+    ``_model``.
     """
     chain: list[object] = []
+    # A stack: the LAST entry is visited next, so children are pushed in
+    # reverse holder order to come off in holder order.
     pending: list[object] = [source]
-    while pending and len(chain) < 8:
-        node = pending.pop(0)
+    while pending and len(chain) < _WRAPPER_CHAIN_MAX_NODES:
+        node = pending.pop()
         if node is None or any(seen is node for seen in chain):
             continue
         chain.append(node)
-        for holder in ("client", "_client", "_handle", "_runtime"):
+        for holder in reversed(_WRAPPER_HOLDERS):
             inner = getattr(node, holder, None)
             if inner is not None and not isinstance(inner, (str, bytes, int)):
                 pending.append(inner)
@@ -1374,8 +1405,69 @@ def _finite_only(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# The record fields that make a row billed: the same six dimensions
+# ``llm_helpers.usage_has_billing`` reads off a ``TurnUsage``, by their record
+# names. A claude-seam turn bills in tokens with ``cost`` still 0 (cost is a
+# session-cumulative delta that lands only when a cost frame arrives) and
+# credits stay 0 off the kiro path, so a credits-and-cost check alone would
+# stay silent for exactly the token-billed rows.
+_BILLED_RECORD_FIELDS: tuple[str, ...] = (
+    "credits",
+    "cost",
+    "input",
+    "output",
+    "cache_create",
+    "cache_read",
+)
+
+
+def _record_is_billed(record: dict[str, Any]) -> bool:
+    """Whether a BUILT record carries any billing dimension, non-finite aside.
+
+    Mirrors ``llm_helpers.usage_has_billing`` over the record's own fields
+    (:data:`_BILLED_RECORD_FIELDS`), so the write site judges the row it is
+    about to persist rather than the event it was built from. A non-finite
+    value is a corrupt measurement, handled by :func:`_write_token_record`'s
+    own sanitizer, not a charge.
+    """
+    for key in _BILLED_RECORD_FIELDS:
+        value = record.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(value) and value != 0:
+            return True
+    return False
+
+
+def _warn_unattributed_billing(record: dict[str, Any]) -> None:
+    """Log — loudly — a billed row about to be persisted with no model.
+
+    Read time renders a blank ``model`` as ``unknown`` (``cost_breakdown``).
+    Left as the only signal, that bucket is where an attribution failure is
+    discovered weeks later, once it is large enough to notice, not where and
+    when it happens. The row is still persisted — the charge is real and
+    dropping it would understate spend — and the failure goes on record at the
+    moment of writing, naming the slot, surface and provider so the dispatch
+    path that lost the model can be found, and the billed dimensions so the
+    size of the loss is on record too. Nothing else: the row's other fields
+    are per-turn telemetry and do not belong in a log line.
+    """
+    if str(record.get("model") or "") or not _record_is_billed(record):
+        return
+    logger.warning(
+        "usage row: model attribution failed for a billed turn; persisting with a blank "
+        "model (read time renders it as 'unknown'). slot=%s surface=%s provider=%s "
+        "credits=%s cost=%s tokens=%s",
+        record.get("slot", ""),
+        record.get("surface", ""),
+        record.get("provider", ""),
+        record.get("credits", 0),
+        record.get("cost", 0),
+        {k: record.get(k, 0) for k in ("input", "output", "cache_create", "cache_read")},
+    )
+
+
 def _write_token_record(record: dict[str, Any], now: datetime) -> None:
     """Append a prebuilt token record to today's shard (blocking I/O)."""
+    _warn_unattributed_billing(record)
     shard_path = _shard_path_for(now)
     parent = shard_path.parent
     # mkdir only when missing — the dir is created once per day, not per turn.

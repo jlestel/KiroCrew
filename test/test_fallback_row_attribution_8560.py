@@ -3,12 +3,12 @@
 ``chat_runner``'s post-turn persist blanks the caller-side model while a
 throttle fallback is active and leaves the row's attribution entirely to
 ``persist_token_record_async``'s ``model_source`` walk. That walk succeeds for a
-shallow provider, which is why the row usually carries the served id — but
-``_wrapper_chain`` collects at most 8 nodes, so a session whose provider has
-accumulated wrapper layers (session sharing, a channel link, a subagent
-companion) hides its model-bearing node past the cap. The walk then reports
-nothing, and the row lands blank: the turn's credits become unattributable even
-though the slot knew exactly which model served them.
+shallow provider, which is why the row usually carries the served id — but a
+walk over another module's object graph is a coincidence to lean on: a session
+whose provider has accumulated wrapper layers (session sharing, a channel link,
+a subagent companion) buries its model-bearing node, and any walk that stops
+short reports nothing, landing the row blank — the turn's credits become
+unattributable even though the slot knew exactly which model served them.
 
 The served id is already on the slot as ``_active_fallback_model``, written only
 after ``advance_fallback_candidate`` witnessed the ``set_model``, and cleared by
@@ -29,14 +29,16 @@ from test_dashboard_chat import TestRunChatTransientRetry as _TransientSuite
 
 
 def _deep_chain_client(stream, *, primary="primary-model", advertised=("fallback-model",)):
-    """A provider whose model state sits BEYOND ``_wrapper_chain``'s 8-node cap.
+    """A provider whose model state sits six wrapper layers below the surface.
 
     Mirrors the real nesting ``_wrapper_chain``'s docstring documents —
     ``AcpProvider`` -> ``client`` -> ``AcpSessionProvider`` -> ``_handle`` ->
     ``AcpSessionHandle`` -> ``_runtime`` — with the extra wrapper layers a
     long-lived shared session accumulates. ``set_model`` writes the handle's
     ``_model``/``_resolved_model_id`` exactly as ``AcpSessionHandle.set_model``
-    does (``session_handle.py:1379-1384``); the cap is what hides them.
+    does (``session_handle.py:1379-1384``). The depth-first walk reaches them,
+    so this shape exercises the caller-side path with the walk as an
+    independent second witness rather than as the row's only source.
     """
 
     class _Runtime:
@@ -156,17 +158,31 @@ class TestFallbackServedTurnAttribution:
         slot = state.get_or_create_slot("s1")
         slot._titled = True
 
+        # The depth-first walk reaches this handle on its own, so left live it
+        # would name the same model and the row would be right for TWO reasons.
+        # Blind it for the run: the row's value must then come from the
+        # caller-side model alone (`_resolve_model` short-circuits on a
+        # non-blank caller-side model and never consults `model_source`), which
+        # is the path this file pins. The real walk is asserted separately
+        # below as the independent second witness.
+        real_read_turn_model = usage_mod.read_turn_model
+        monkeypatch.setattr(usage_mod, "read_turn_model", lambda source: "")
+
         with patch("asyncio.sleep", new_callable=AsyncMock):
             await _run_chat(state, slot, "hello")
             await self._drain_bg(state)
 
-        # Preconditions: the fallback really served the turn, and the walk that
-        # the persist site relies on really cannot see it.
+        # Preconditions: the fallback really served the turn, the blinded walk
+        # really reports nothing, and the real walk reaches the deep handle.
         assert slot._active_fallback_model == "fallback-model"
         assert handle._model == "fallback-model"
         assert usage_mod.read_turn_model(client) == "", (
-            "precondition: the wrapper-chain walk must be blind here, otherwise "
-            "this test is not exercising the capped-chain case"
+            "precondition: the wrapper-chain walk must be blind for this run, "
+            "otherwise the row is not exercising the caller-side path alone"
+        )
+        assert real_read_turn_model(client) == "fallback-model", (
+            "the depth-first wrapper-chain walk must reach the deep handle here; "
+            "a blank means a wrapper stack of this depth hides the model again"
         )
 
         rows = self._rows(shard_dir)

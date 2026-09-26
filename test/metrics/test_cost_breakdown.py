@@ -343,11 +343,13 @@ class TestNonFiniteCredits:
 
     def test_a_clean_record_is_written_quietly(self, tmp_path, monkeypatch, caplog):
         # The warning has to mean something when it appears, so the ordinary
-        # path must not emit one.
+        # path must not emit one. Ordinary means attributed: a billed row with
+        # no model is its own failure and is reported by the write site.
         monkeypatch.setattr(usage_mod, "_token_usage_dir", lambda: tmp_path)
         with caplog.at_level(logging.WARNING, logger=usage_mod.__name__):
             usage_mod._write_token_record(
-                {"_type": "tokens", "credits": 12.5}, datetime.now(timezone.utc)
+                {"_type": "tokens", "model": "claude-opus-5", "credits": 12.5},
+                datetime.now(timezone.utc),
             )
         assert caplog.records == []
 

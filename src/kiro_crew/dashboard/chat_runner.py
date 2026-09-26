@@ -15880,14 +15880,18 @@ async def _run_chat(
                 # would bill a model that, again, never executed.
                 #
                 # `provider_active_model` reads the provider's own
-                # `served_model` / `_model` accessor directly — no wrapper walk,
-                # so unlike `persist_token_record_async`'s `model_source` path it
-                # is not subject to `_wrapper_chain`'s 8-node cap. That cap is
-                # why blanking here and leaving recovery to `model_source` loses
-                # the id outright on a session with accumulated wrapper layers:
-                # the walk reports nothing and the row persists
-                # `"model": ""`, which read time renders as `unknown`, merging
-                # this turn's credits with genuinely attribute-less rows.
+                # `served_model` / `_model` accessor directly: the live
+                # provider is the freshest witness to what served THIS turn,
+                # and passing it as the caller-side model makes the row correct
+                # by construction — `_resolve_model` short-circuits on a
+                # non-blank caller-side model. `persist_token_record_async`'s
+                # `model_source` walk is the independent second witness, not
+                # the row's only source: blanking here and leaving recovery to
+                # another module's traversal of the wrapper graph makes this
+                # turn's attribution hostage to that graph's shape, and a row
+                # that lands `"model": ""` is rendered as `unknown` at read
+                # time, merging this turn's credits with genuinely
+                # attribute-less rows.
                 #
                 # An unreadable provider still yields `""` and falls through to
                 # the `model_source` walk — no worse than the blank it would

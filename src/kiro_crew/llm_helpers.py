@@ -63,10 +63,19 @@ from kiro_crew.sel import sel as _sel
 _PROMPT_BUSY_RETRIES = 2
 _PROMPT_BUSY_DELAY = 1.5  # seconds between retries
 
-# Cap on the wrapper chain walked to find a turn's billing stats. A provider is
-# wrapped at most a few layers deep, so a longer walk means a cycle or an
-# unrelated object graph, not a deeper seam.
-_WRAPPER_WALK_MAX_NODES = 8
+# Runaway guard for the wrapper chain walked to find a turn's billing stats,
+# NOT a depth limit. The walk is depth-first along the documented holders and
+# identity-deduped, so a real provider stack is exhausted long before this;
+# the bound exists for a source that synthesizes attributes (a ``MagicMock``
+# answers every ``getattr`` with a fresh child). Sized so no plausible wrapper
+# depth reaches it: session sharing, a channel link, a subagent companion and
+# a fallback wrapper each add a layer, and the same object graph is the one
+# ``dashboard.handlers.usage._wrapper_chain`` walks for the model with the
+# same guard.
+_WRAPPER_WALK_MAX_NODES = 64
+
+# Holder attributes the billing-stats walk follows, in order.
+_BILLING_STAT_HOLDERS: tuple[str, ...] = ("_client", "_handle", "_sess", "provider")
 
 # Sentinel for "no prior stats object was observed", distinct from a provider that
 # legitimately exposes None. Used by provider_last_turn_usage's identity guard.
@@ -1879,23 +1888,30 @@ def _billing_stat_holders(provider: Any) -> "list[Any]":
     provider on ``_handle``, and the shared background session hands non-kiro
     callers a thin adapter whose only link to the runner is ``_sess.provider``.
     Walking all of them keeps a background turn on the claude_code / bedrock seam
-    from reporting 0 credits for a turn that was billed. Bounded and
-    identity-deduped so a self-referential wrapper chain cannot loop.
+    from reporting 0 credits for a turn that was billed. Depth-first along
+    :data:`_BILLING_STAT_HOLDERS` and identity-deduped, so a self-referential
+    wrapper chain cannot loop and a stack of wrapper layers cannot exhaust the
+    node budget on holder-less siblings before the runner is reached — the
+    stats sit at the bottom of the chain, and a breadth-first walk with a node
+    budget stops short of them a few layers down. :data:`_WRAPPER_WALK_MAX_NODES`
+    is a runaway guard for attribute-synthesizing sources, not a depth limit.
 
     A name absent from this tuple is exactly how a new seam's spend went
-    unreported, which is why the billing read now prefers the provider's declared
+    unreported, which is why the billing read prefers the provider's declared
     :meth:`LLMProvider.billing_stats` and only falls back here.
     """
     out: list[Any] = []
     seen: set[int] = set()
+    # A stack: the LAST entry is visited next, so children are pushed in
+    # reverse holder order to come off in holder order.
     frontier: list[Any] = [provider]
     while frontier and len(out) < _WRAPPER_WALK_MAX_NODES:
-        node = frontier.pop(0)
+        node = frontier.pop()
         if node is None or id(node) in seen:
             continue
         seen.add(id(node))
         out.append(node)
-        for attr in ("_client", "_handle", "_sess", "provider"):
+        for attr in reversed(_BILLING_STAT_HOLDERS):
             frontier.append(getattr(node, attr, None))
     return out
 
