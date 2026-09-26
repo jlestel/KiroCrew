@@ -6640,7 +6640,10 @@
       "worktree_disabled_no_project_directory": "\"এই সেশনে যোগ করুন\" কম্পোজার আগে থেকে পূরণ করে — আপনি পাঠান না চাপা পর্যন্ত কিছুই পাঠানো হয় না। worktree এখানে ব্যবহার করা যাবে না: এই সেশনের কোনো প্রজেক্ট ডিরেক্টরি নেই (কম্পোজারের প্রজেক্ট চিপ থেকে একটি বেছে নিন)।"
     },
     "inboundLinkChip": {
-      "driven_from": "{{label}} থেকে পরিচালিত"
+      "driven_from": "{{label}} থেকে পরিচালিত",
+      "driven_from_paused": "{{label}} থেকে পরিচালিত · উত্তর বিরত",
+      "driven_from_paused_hint": "{{label}} আবার শুরু করো বা আনলিঙ্ক করো।",
+      "driven_from_hint": "{{label}} থামাও বা আনলিঙ্ক করো।"
     },
     "infoTip": {
       "more_information": "আরও তথ্য"
@@ -6988,8 +6991,21 @@
     "linkedSurfacesSection": {
       "connect_failed": "{{label}}-এ সংযোগ করা যায়নি: {{reason}}",
       "connect_to": "{{label}}-এ সংযোগ করুন",
-      "disconnect_failed": "{{label}} থেকে সংযোগ বিচ্ছিন্ন করা যায়নি: {{reason}}",
-      "disconnect_from": "{{label}} থেকে সংযোগ বিচ্ছিন্ন করুন",
+      "direct_message_id": "ডাইরেক্ট মেসেজ · {{id}}",
+      "disconnect_failed": "{{label}}-এ উত্তর থামানো যায়নি: {{reason}}",
+      "disconnect_from": "{{label}}-এ উত্তর থামাও",
+      "disconnect_outcome": "সংযোগ থেকে যায়।",
+      "born_in_note": "{{label}} থেকে শুরু — সংযোগ থামানো যায়, সরানো যায় না।",
+      "ask_agent_stale_outcome": "জিজ্ঞাসা করো এই চ্যানেল এখন কিসের সাথে সংযুক্ত।",
+      "resume_replies_to": "{{label}}-এ উত্তর আবার শুরু করো",
+      "direction_one_way": "একমুখী · এই সেশন → {{label}}",
+      "direction_two_way": "দ্বিমুখী · {{label}} ↔ এই সেশন",
+      "still_linked": "উত্তর থামানো আছে — সংযোগ থেকে যায়।",
+      "unlink_failed": "{{label}} থেকে আনলিঙ্ক করা যায়নি: {{reason}}",
+      "unlink_from": "{{label}} থেকে আনলিঙ্ক করো",
+      "unlink_outcome": "সংযোগ সরিয়ে দেয় — {{label}} এই সেশন পরিচালনা করে না। সেশন মেনু থেকে যখন খুশি আবার সংযোগ করতে পারো।",
+      "unlink_outcome_out": "সংযোগ সরিয়ে দেয় — {{label}}-এ উত্তর যায় না। সেশন মেনু থেকে যখন খুশি আবার সংযোগ করতে পারো।",
+      "unlink_stale": "এই মেনু খোলা থাকার সময় {{label}} সংযোগ বদলে গেছে। কিছুই আনলিঙ্ক করা হয়নি; সারিটি রিফ্রেশ করা হয়েছে।",
       "held_elsewhere": "{{label}} অন্য একটি সেশন ব্যবহার করছে।",
       "unavailable": "এই গন্তব্যটি উপলভ্য নয়।",
       "unknown_error": "অজানা ত্রুটি",

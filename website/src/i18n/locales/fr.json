@@ -6746,7 +6746,10 @@
       "worktree_disabled_no_project_directory": "« Ajouter à cette session » pré-remplit le champ de saisie — rien n'est envoyé avant que vous appuyiez sur Envoyer. Les worktrees ne sont pas disponibles ici : cette session n'a pas de répertoire de projet (choisissez-en un via la puce Projet du champ de saisie)."
     },
     "inboundLinkChip": {
-      "driven_from": "Pilotée depuis {{label}}"
+      "driven_from": "Pilotée depuis {{label}}",
+      "driven_from_paused": "Pilotée depuis {{label}} · réponses en pause",
+      "driven_from_paused_hint": "Reprends ou dissocie {{label}}.",
+      "driven_from_hint": "Mets en pause ou dissocie {{label}}."
     },
     "infoTip": {
       "more_information": "Plus d’informations"
@@ -7096,8 +7099,21 @@
     "linkedSurfacesSection": {
       "connect_failed": "Impossible de se connecter à {{label}} : {{reason}}",
       "connect_to": "Se connecter à {{label}}",
-      "disconnect_failed": "Impossible de se déconnecter de {{label}} : {{reason}}",
-      "disconnect_from": "Se déconnecter de {{label}}",
+      "direct_message_id": "Message direct · {{id}}",
+      "disconnect_failed": "Impossible de mettre en pause les réponses vers {{label}} : {{reason}}",
+      "disconnect_from": "Mettre en pause les réponses vers {{label}}",
+      "disconnect_outcome": "La connexion reste.",
+      "born_in_note": "Démarrée depuis {{label}} — la connexion peut être mise en pause, pas supprimée.",
+      "ask_agent_stale_outcome": "Demande à quoi ce canal est connecté maintenant.",
+      "resume_replies_to": "Reprendre les réponses vers {{label}}",
+      "direction_one_way": "Unidirectionnel · cette session → {{label}}",
+      "direction_two_way": "Bidirectionnel · {{label}} ↔ cette session",
+      "still_linked": "Réponses en pause — la connexion reste.",
+      "unlink_failed": "Impossible de dissocier de {{label}} : {{reason}}",
+      "unlink_from": "Dissocier de {{label}}",
+      "unlink_outcome": "Supprime la connexion — {{label}} ne pilote plus cette session. Tu peux te reconnecter à tout moment depuis le menu de la session.",
+      "unlink_outcome_out": "Supprime la connexion — les réponses ne vont plus vers {{label}}. Tu peux te reconnecter à tout moment depuis le menu de la session.",
+      "unlink_stale": "La connexion {{label}} a changé pendant que ce menu était ouvert. Rien n’a été dissocié. La ligne a été actualisée.",
       "held_elsewhere": "{{label}} est utilisé par une autre session.",
       "unavailable": "Cette destination est indisponible.",
       "unknown_error": "erreur inconnue",

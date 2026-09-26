@@ -6746,7 +6746,10 @@
       "worktree_disabled_no_project_directory": "\"Aggiungi a questa sessione\" precompila il campo di scrittura — nulla viene inviato finché non premi invia. I worktree non sono disponibili qui: questa sessione non ha una directory di progetto (scegline una con il chip Progetto del campo di scrittura)."
     },
     "inboundLinkChip": {
-      "driven_from": "Pilotata da {{label}}"
+      "driven_from": "Pilotata da {{label}}",
+      "driven_from_paused": "Pilotata da {{label}} · risposte in pausa",
+      "driven_from_paused_hint": "Riprendi o scollega {{label}}.",
+      "driven_from_hint": "Metti in pausa o scollega {{label}}."
     },
     "infoTip": {
       "more_information": "Maggiori informazioni"
@@ -7096,8 +7099,21 @@
     "linkedSurfacesSection": {
       "connect_failed": "Impossibile connettersi a {{label}}: {{reason}}",
       "connect_to": "Connetti a {{label}}",
-      "disconnect_failed": "Impossibile disconnettersi da {{label}}: {{reason}}",
-      "disconnect_from": "Disconnetti da {{label}}",
+      "direct_message_id": "Messaggio diretto · {{id}}",
+      "disconnect_failed": "Impossibile mettere in pausa le risposte a {{label}}: {{reason}}",
+      "disconnect_from": "Metti in pausa le risposte a {{label}}",
+      "disconnect_outcome": "La connessione resta.",
+      "born_in_note": "Avviata da {{label}} — la connessione può essere messa in pausa, non rimossa.",
+      "ask_agent_stale_outcome": "Chiedi a cosa è collegato ora questo canale.",
+      "resume_replies_to": "Riprendi le risposte a {{label}}",
+      "direction_one_way": "Unidirezionale · questa sessione → {{label}}",
+      "direction_two_way": "Bidirezionale · {{label}} ↔ questa sessione",
+      "still_linked": "Risposte in pausa — la connessione resta.",
+      "unlink_failed": "Impossibile scollegare da {{label}}: {{reason}}",
+      "unlink_from": "Scollega da {{label}}",
+      "unlink_outcome": "Rimuove la connessione — {{label}} smette di pilotare questa sessione. Puoi ricollegarti in qualsiasi momento dal menu della sessione.",
+      "unlink_outcome_out": "Rimuove la connessione — le risposte smettono di andare a {{label}}. Puoi ricollegarti in qualsiasi momento dal menu della sessione.",
+      "unlink_stale": "La connessione con {{label}} è cambiata mentre questo menu era aperto. Non è stato scollegato nulla; la riga è stata aggiornata.",
       "held_elsewhere": "{{label}} è in uso da un'altra sessione.",
       "unavailable": "Questa destinazione non è disponibile.",
       "unknown_error": "errore sconosciuto",

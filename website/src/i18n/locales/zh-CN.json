@@ -6534,7 +6534,10 @@
       "worktree_disabled_no_project_directory": "“添加到此会话”只是预填输入框 — 在你按下发送前不会发送任何内容。此处无法使用工作树：此会话没有项目目录（可通过输入框的“项目”按钮选择一个）。"
     },
     "inboundLinkChip": {
-      "driven_from": "由 {{label}} 驱动"
+      "driven_from": "由 {{label}} 驱动",
+      "driven_from_paused": "由 {{label}} 驱动 · 回复已暂停",
+      "driven_from_paused_hint": "恢复或取消关联 {{label}}。",
+      "driven_from_hint": "暂停或取消关联 {{label}}。"
     },
     "infoTip": {
       "more_information": "更多信息"
@@ -6880,8 +6883,21 @@
     "linkedSurfacesSection": {
       "connect_failed": "无法连接到 {{label}}：{{reason}}",
       "connect_to": "连接到 {{label}}",
-      "disconnect_failed": "无法断开与 {{label}} 的连接：{{reason}}",
-      "disconnect_from": "断开与 {{label}} 的连接",
+      "direct_message_id": "私信 · {{id}}",
+      "disconnect_failed": "无法暂停回复到 {{label}}：{{reason}}",
+      "disconnect_from": "暂停回复到 {{label}}",
+      "disconnect_outcome": "连接保留。",
+      "born_in_note": "从 {{label}} 发起 — 连接可以暂停，但不能移除。",
+      "ask_agent_stale_outcome": "询问此频道现在连接到哪里。",
+      "resume_replies_to": "恢复回复到 {{label}}",
+      "direction_one_way": "单向 · 此会话 → {{label}}",
+      "direction_two_way": "双向 · {{label}} ↔ 此会话",
+      "still_linked": "回复已暂停 — 连接仍在。",
+      "unlink_failed": "无法取消与 {{label}} 的关联：{{reason}}",
+      "unlink_from": "取消与 {{label}} 的关联",
+      "unlink_outcome": "移除连接 — {{label}} 不再驱动此会话。可随时在会话菜单中重新连接。",
+      "unlink_outcome_out": "移除连接 — 回复不再发送到 {{label}}。可随时在会话菜单中重新连接。",
+      "unlink_stale": "此菜单打开期间，{{label}} 连接已更改。未取消任何关联；该行已刷新。",
       "held_elsewhere": "{{label}} 正在被另一个会话使用。",
       "unavailable": "此目标当前不可用。",
       "unknown_error": "未知错误",

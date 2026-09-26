@@ -2214,7 +2214,10 @@
       "worktree_disabled_no_project_directory": "\"Add to this session\" pre-fills the composer — nothing is sent until you press send. Worktrees are unavailable here: this session has no project directory (pick one with the composer's Project chip)."
     },
     "inboundLinkChip": {
-      "driven_from": "Driven from {{label}}"
+      "driven_from": "Driven from {{label}}",
+      "driven_from_paused": "Driven from {{label}} · replies paused",
+      "driven_from_paused_hint": "Resume or unlink {{label}}.",
+      "driven_from_hint": "Pause or unlink {{label}}."
     },
     "instancesViewport": {
       "connecting": "Connecting…",
@@ -2451,8 +2454,21 @@
     "linkedSurfacesSection": {
       "connect_failed": "Could not connect to {{label}}: {{reason}}",
       "connect_to": "Connect to {{label}}",
-      "disconnect_failed": "Could not disconnect from {{label}}: {{reason}}",
-      "disconnect_from": "Disconnect from {{label}}",
+      "direct_message_id": "Direct message · {{id}}",
+      "disconnect_failed": "Could not pause replies to {{label}}: {{reason}}",
+      "disconnect_from": "Pause replies to {{label}}",
+      "disconnect_outcome": "The connection stays.",
+      "born_in_note": "Started from {{label}} — the connection can be paused, not removed.",
+      "ask_agent_stale_outcome": "Ask what this channel is linked to now.",
+      "resume_replies_to": "Resume replies to {{label}}",
+      "direction_one_way": "One-way · this session → {{label}}",
+      "direction_two_way": "Two-way · {{label}} ↔ this session",
+      "still_linked": "Replies paused — the connection stays.",
+      "unlink_failed": "Could not unlink from {{label}}: {{reason}}",
+      "unlink_from": "Unlink from {{label}}",
+      "unlink_outcome": "Removes the connection — {{label}} stops driving this session. Reconnect anytime from the session menu.",
+      "unlink_outcome_out": "Removes the connection — replies stop going to {{label}}. Reconnect anytime from the session menu.",
+      "unlink_stale": "The {{label}} connection changed while this menu was open. Nothing was unlinked; the row was refreshed.",
       "held_elsewhere": "{{label}} is in use by another session.",
       "unavailable": "This destination is unavailable.",
       "unknown_error": "unknown error",

@@ -6534,7 +6534,10 @@
       "worktree_disabled_no_project_directory": "「このセッションに追加」はコンポーザーを事前入力します。送信を押すまで何も送信されません。ワークツリーは使用不可です。このセッションにはプロジェクトディレクトリがありません (コンポーザーのプロジェクトチップで選択してください)。"
     },
     "inboundLinkChip": {
-      "driven_from": "{{label}}から駆動中"
+      "driven_from": "{{label}}から駆動中",
+      "driven_from_paused": "{{label}}から駆動中 · 返信は一時停止中",
+      "driven_from_paused_hint": "{{label}}を再開またはリンク解除できます。",
+      "driven_from_hint": "{{label}}を一時停止またはリンク解除できます。"
     },
     "infoTip": {
       "more_information": "詳細情報"
@@ -6880,8 +6883,21 @@
     "linkedSurfacesSection": {
       "connect_failed": "{{label}} に接続できませんでした：{{reason}}",
       "connect_to": "{{label}} に接続",
-      "disconnect_failed": "{{label}} から切断できませんでした：{{reason}}",
-      "disconnect_from": "{{label}} から切断",
+      "direct_message_id": "ダイレクトメッセージ · {{id}}",
+      "disconnect_failed": "{{label}} への返信を一時停止できませんでした：{{reason}}",
+      "disconnect_from": "{{label}} への返信を一時停止",
+      "disconnect_outcome": "接続は残ります。",
+      "born_in_note": "{{label}} から開始 — 接続は一時停止できますが、解除はできません。",
+      "ask_agent_stale_outcome": "このチャンネルが今どこに接続されているか尋ねます。",
+      "resume_replies_to": "{{label}} への返信を再開",
+      "direction_one_way": "一方向 · このセッション → {{label}}",
+      "direction_two_way": "双方向 · {{label}} ↔ このセッション",
+      "still_linked": "返信は一時停止中 — 接続は残ります。",
+      "unlink_failed": "{{label}} とのリンクを解除できませんでした：{{reason}}",
+      "unlink_from": "{{label}} とのリンクを解除",
+      "unlink_outcome": "接続を解除します — {{label}}はこのセッションを駆動しなくなります。再接続はいつでもセッションメニューから行えます。",
+      "unlink_outcome_out": "接続を解除します — {{label}}への返信は送られなくなります。再接続はいつでもセッションメニューから行えます。",
+      "unlink_stale": "このメニューを開いている間に {{label}} の接続が変わりました。何も解除されていません。行は更新されました。",
       "held_elsewhere": "{{label}} は別のセッションで使用中です。",
       "unavailable": "この送信先は利用できません。",
       "unknown_error": "不明なエラー",

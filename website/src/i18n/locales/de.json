@@ -6640,7 +6640,10 @@
       "worktree_disabled_no_project_directory": "„Zu dieser Sitzung hinzufügen“ füllt das Eingabefeld vor — es wird nichts gesendet, bis Sie auf Senden drücken. Worktrees sind hier nicht verfügbar: Diese Sitzung hat kein Projektverzeichnis (wählen Sie eines über den Projekt-Chip des Eingabefelds)."
     },
     "inboundLinkChip": {
-      "driven_from": "Gesteuert von {{label}}"
+      "driven_from": "Gesteuert von {{label}}",
+      "driven_from_paused": "Gesteuert von {{label}} · Antworten pausiert",
+      "driven_from_paused_hint": "Setze {{label}} fort oder hebe die Verknüpfung auf.",
+      "driven_from_hint": "Pausiere {{label}} oder hebe die Verknüpfung auf."
     },
     "infoTip": {
       "more_information": "Weitere Informationen"
@@ -6988,8 +6991,21 @@
     "linkedSurfacesSection": {
       "connect_failed": "Verbindung mit {{label}} konnte nicht hergestellt werden: {{reason}}",
       "connect_to": "Mit {{label}} verbinden",
-      "disconnect_failed": "Verbindung mit {{label}} konnte nicht getrennt werden: {{reason}}",
-      "disconnect_from": "Verbindung mit {{label}} trennen",
+      "direct_message_id": "Direktnachricht · {{id}}",
+      "disconnect_failed": "Antworten an {{label}} konnten nicht pausiert werden: {{reason}}",
+      "disconnect_from": "Antworten an {{label}} pausieren",
+      "disconnect_outcome": "Die Verbindung bleibt.",
+      "born_in_note": "Von {{label}} aus gestartet — die Verbindung kann pausiert, aber nicht entfernt werden.",
+      "ask_agent_stale_outcome": "Frag, womit dieser Kanal jetzt verbunden ist.",
+      "resume_replies_to": "Antworten an {{label}} fortsetzen",
+      "direction_one_way": "Einseitig · diese Sitzung → {{label}}",
+      "direction_two_way": "Zweiseitig · {{label}} ↔ diese Sitzung",
+      "still_linked": "Antworten pausiert — die Verbindung bleibt.",
+      "unlink_failed": "Verknüpfung mit {{label}} konnte nicht aufgehoben werden: {{reason}}",
+      "unlink_from": "Verknüpfung mit {{label}} aufheben",
+      "unlink_outcome": "Entfernt die Verbindung — {{label}} steuert diese Sitzung nicht mehr. Du kannst jederzeit über das Sitzungsmenü neu verbinden.",
+      "unlink_outcome_out": "Entfernt die Verbindung — keine Antworten mehr an {{label}}. Du kannst jederzeit über das Sitzungsmenü neu verbinden.",
+      "unlink_stale": "Die Verbindung zu {{label}} hat sich geändert, während dieses Menü offen war. Es wurde nichts aufgehoben; die Zeile wurde aktualisiert.",
       "held_elsewhere": "{{label}} wird von einer anderen Sitzung verwendet.",
       "unavailable": "Dieses Ziel ist nicht verfügbar.",
       "unknown_error": "unbekannter Fehler",

@@ -43,6 +43,8 @@ def _make_state(tmp_path, session_map):
     sessions.set_slack_link = session_map.set_slack_link
     sessions.clear_slack_link = session_map.clear_slack_link
     sessions.get_session_for_thread = session_map.get_session_for_thread
+    # The unlink route lands the cleared link on disk before it answers.
+    sessions.aflush = session_map.aflush
     sessions.set_approval_policy = MagicMock()
     state = DashboardState(
         sessions=sessions,

@@ -24,7 +24,11 @@ from kiro_crew.dashboard.chat_utils import (
     remember_slack_options,
     slack_options_owner_keys_snapshot,
 )
-from kiro_crew.dashboard.state import DashboardState, _log_task_exception
+from kiro_crew.dashboard.state import (
+    DashboardState,
+    _expected_binding,
+    _log_task_exception,
+)
 from kiro_crew.messaging.link import SLACK_NAMESPACE
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform.governance_profiles import vet_and_audit
@@ -422,6 +426,14 @@ async def api_chat_slot_slack_link(request: web.Request) -> web.Response:
     # what resolves an OPTIONS click on the control replayed below back to this
     # conversation -- without it the click would answer into a separate session.
     state.link_slack(slot.key, thread_ts, target_channel)
+    # Persist before publishing: the map's writer is debounced, and everything
+    # below -- the transcript backfilled into the thread, the slots push, the
+    # `{ok, thread_ts}` answer -- tells the user the thread is linked. A gateway
+    # exit before the deferred write would drop the link on restart and leave a
+    # thread full of this transcript that no session owns. (Same point as the
+    # unlink routes; `link_slack`'s own slot redraw precedes this, and a redraw
+    # the next push corrects is not a report the user acts on.)
+    await state.sessions.aflush()
 
     # Seed the new thread with readable history — only when we created a NEW
     # thread. Linking to an existing thread (challenge-and-redirect) would
@@ -472,69 +484,123 @@ async def api_chat_slot_slack_unlink(request: web.Request) -> web.Response:
     # leaving the real link untouched so mirroring silently resumes next turn.
     session_key = effective_session_key(slot)
 
-    # Link mutations stay ON the event loop, deliberately. Moving this clear into
-    # `asyncio.to_thread` (an earlier revision of this PR) was wrong twice over:
-    # the worker runs CONCURRENTLY with the loop, so a compare-and-clear inside it
-    # is not atomic against a loop-side relink at all -- the thread can read the
-    # captured link, a relink can write its replacement, and the thread then clears
-    # that replacement, losing the routing. The session map has no cross-thread
-    # lock, so the loop is the only thing serialising its writers. `_save()` is a
-    # small atomic temp-file rename on a rare user action; that cost is the price
-    # of serialization, and it is the cheaper side of the trade.
+    # Link mutations stay ON the event loop: `_save()` is a small atomic
+    # temp-file rename on a rare user action, and moving a clear into
+    # `asyncio.to_thread` buys nothing. The map serialises its writers under its
+    # own lock, and a compare-and-clear is atomic only when BOTH steps run under
+    # it -- which is why the body-armed path below is one map call
+    # (`clear_slack_link_if`) and this helper serves the bodiless path alone.
     def _clear_persisted_link_sync() -> bool:
-        """Clear BOTH persisted key spellings for this slot's link.
+        """Clear BOTH persisted key spellings for this slot's link, unconditionally.
 
         chat_runner copies a dashboard session's link from the bare key onto the
         "dashboard:"-prefixed one when a turn runs, so both spellings must go or
-        the next turn re-inherits the link. A channel key has no such twin.
-
-        No compare-and-clear here, and none is needed: this runs on the event loop
-        with no await between the read and the write, so nothing can interleave. An
-        earlier revision of this PR did compare against a captured value, because
-        the clear had been moved into a thread — the serialization above is what
-        makes that guard unnecessary, and the test asserting no ``to_thread`` in
-        this handler is what keeps it that way.
+        the next turn re-inherits the link. A channel key has no such twin. For
+        a caller with no row in hand there is nothing to compare against, so
+        this is the plain clear; a body that names a row goes through the map's
+        compare-and-clear instead.
         """
         done = state.sessions.clear_slack_link(session_key)
         if session_key.startswith("dashboard:"):
             done = state.sessions.clear_slack_link(session_key[len("dashboard:") :]) or done
         return done
 
-    # Tear the link down with NO await in the middle, so nothing can interleave
-    # between reading the link and clearing it. That is what makes any
-    # compare-and-clear reconciliation unnecessary: the strike-through does not
-    # run BEFORE the teardown, so there is no await for a relink to land inside
-    # and nothing to reconcile afterwards.
-    #
-    # The ordering is therefore free, and striking first is not mandatory: a
-    # click carries the identity of the conversation that asked it, so one
+    # A click carries the identity of the conversation that asked it, so one
     # arriving after the link is gone is refused on its own terms instead of
     # resolving to nothing and starting a brand-new session carrying a stale
-    # answer.
+    # answer -- so the strike-through need not run before the teardown.
     prev_channel = slot._slack_channel
     prev_thread_ts = slot._slack_thread_ts
-    cleared = _clear_persisted_link_sync()
-    slot._slack_linked = False
-    slot._slack_channel = ""
-    slot._slack_thread_ts = ""
-    if prev_thread_ts:
-        # Or the thread keeps resolving to this conversation after the link is gone.
-        state._slack_to_slot.pop(prev_thread_ts, None)
+    expected = await _expected_binding(request)
+    if expected is not None:
+        # Same guard as mirror-unlink, on the Slack fields the row is projected
+        # from: a stale Slack row must not tear down a thread this slot was
+        # re-linked to after that row was drawn. Compare and clear are ONE
+        # guarded step in the map (both key spellings), so no re-link can land
+        # between them. False is a mismatch and nothing was touched.
+        channel_type, token = expected
+        if not state.sessions.clear_slack_link_if(session_key, channel_type, token):
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slack_unlink",
+                outcome="denied",
+                source="dashboard",
+                resources=f"{slot.key} reason=mirror_changed",
+            )
+            logger.info("slack unlink: %s refused, the link changed under the menu", slot.key)
+            return web.json_response(
+                {
+                    "error": "the session's linked channel changed; nothing was unlinked",
+                    "code": "mirror_changed",
+                },
+                status=409,
+            )
+        cleared = True
+    else:
+        cleared = _clear_persisted_link_sync()
+    # Persist before publishing: the map's writer is debounced, and everything
+    # below -- the slot's own fields, the courtesy note in the thread, the slots
+    # push, the `{ok, was_linked}` answer -- tells the user the thread is gone.
+    # A gateway exit before the deferred write would reload the link on restart
+    # and make every one of those a lie. (Same point as `mirror-unlink`.)
+    #
+    # The in-process teardown is in the `finally` so it completes whether or not
+    # the write lands. `aflush` re-raises a failed write (a full or read-only
+    # data home), and the failure must surface -- the answer is the existing
+    # error path, not an `ok`. But the map is already clear in memory by then,
+    # and a teardown skipped by the raise would leave the slot's fields and the
+    # thread's reverse-index entry asserting a thread the map does not hold:
+    # the row keeps rendering from the fields, a reply in the thread still
+    # resolves to this slot, and a retried Unlink is 409 because the map has no
+    # thread to compare. So the fields follow the map, in success and in
+    # failure alike; only what the user is TOLD waits for durability.
+    #
+    # And they follow the map LITERALLY: the teardown is conditional on what the
+    # map holds once the await returns. The write is a real thread hop, and a
+    # second same-slot request can run a whole `slack-link` inside it -- the
+    # existing-thread branch reaches `link_slack` with no network await -- so
+    # the map may hold a NEW binding by the time control comes back here. An
+    # unconditional teardown would strip that new link's fields and reverse
+    # index while the map keeps asserting it, and a re-link then short-circuits
+    # on `already_linked`, so nothing in-process ever restores them. The map was
+    # cleared above, so any link it holds now is that newer write, whatever its
+    # thread: it keeps its fields and its index (`link_slack` already retired
+    # the old thread's entry), and the answer says so. No link means the old
+    # binding is the one to take down.
+    relinked = False
+    try:
+        await state.sessions.aflush()
+    finally:
+        newer_thread_ts, _newer_channel = state.sessions.get_slack_link(session_key)
+        if newer_thread_ts:
+            relinked = True
+        else:
+            slot._slack_linked = False
+            slot._slack_channel = ""
+            slot._slack_thread_ts = ""
+            if prev_thread_ts:
+                # Or the thread keeps resolving to this conversation after the link is gone.
+                state._slack_to_slot.pop(prev_thread_ts, None)
 
     # Presentation only: leave the thread without a question nothing will answer.
     # Swallowed on failure -- an un-struck control is untidy, not unsafe, because
-    # the click it invites is refused when it arrives.
-    try:
-        await expire_slack_options(state, session_key)
-    except Exception:
-        logger.debug(
-            "slack unlink: could not strike the pending OPTIONS control through",
-            exc_info=True,
-        )
+    # the click it invites is refused when it arrives. Not when a relink landed:
+    # the session is linked again, possibly to the very same thread, and a
+    # control struck through there would be one the new link still answers.
+    if not relinked:
+        try:
+            await expire_slack_options(state, session_key)
+        except Exception:
+            logger.debug(
+                "slack unlink: could not strike the pending OPTIONS control through",
+                exc_info=True,
+            )
 
     # Best-effort courtesy note so a Slack watcher knows why the thread went
     # quiet. Same redaction path as the link endpoint; failure is non-fatal.
-    if cleared and state.slack_client and prev_channel and prev_thread_ts:
+    # Withheld after a relink for the same reason as the strike: a thread that
+    # was just linked again must not be told its replies stopped syncing.
+    if cleared and not relinked and state.slack_client and prev_channel and prev_thread_ts:
         try:
             await state.slack_client.post_message(
                 prev_channel,
@@ -549,10 +615,12 @@ async def api_chat_slot_slack_unlink(request: web.Request) -> web.Response:
         operation="chat.slack_unlink",
         outcome="success" if cleared else "noop",
         source="dashboard",
-        resources=slot.key,
+        resources=f"{slot.key} (relinked meanwhile)" if relinked else slot.key,
     )
     state.push_slots_update()
-    return web.json_response({"ok": True, "was_linked": cleared})
+    # `relinked` names the race for the caller: the binding it named is gone,
+    # and a newer link stands -- the slots push it receives carries that row.
+    return web.json_response({"ok": True, "was_linked": cleared, "relinked": relinked})
 
 
 async def api_chat_slot_slack_pause(request: web.Request) -> web.Response:
@@ -619,6 +687,12 @@ async def api_chat_slot_slack_pause(request: web.Request) -> web.Response:
     # any loop-side mutator then blocks the whole loop on the lock — strictly
     # worse than calling it here.
     was_paused = bool(state.sessions.set_slack_paused(session_key, paused))
+    # Persist before publishing: the flag's write is debounced, and everything
+    # below -- the note in the thread, the slots push, the `{ok, paused}` answer
+    # -- reports a pause (or resume) the user just acted on. A gateway exit before
+    # the deferred write would revert it on restart without a word: a thread the
+    # user muted starts delivering again. (Same point as the unlink routes.)
+    await state.sessions.aflush()
 
     # Posted INTO the Slack thread, not shown in the dashboard. Without it the
     # thread simply dead-ends and anyone watching cannot tell a disconnected

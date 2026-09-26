@@ -2618,20 +2618,192 @@ only when a `mirror` `ChannelLink` exists on the dashboard-side key:
   when a thread is named: a threadless Slack row — the bucket `set_channel` stamps
   on a channel session's first turn, which `clear_mirror_link` leaves behind — is
   bookkeeping nobody can deliver through and reads as `None`, so no reader needs
-  its own copy of that rule.
+  its own copy of that rule. `clear_mirror_link` takes BOTH spellings a channel
+  session's binding can live on in one save — the canonical row and the
+  pre-unification `dashboard:` row it superseded — because the read falls back
+  to the older row the moment the canonical one is gone: popping the winner
+  alone left the session reading as mirrored to its previous target, and the
+  dashboard redrew the row its Unlink had just reported removed.
+- `SessionManager.clear_mirror_link_if(key, channel_type, token)` /
+  `clear_slack_link_if(key, channel_type, token)` — compare-and-clear as ONE
+  step under the map's own lock: the binding held is recomputed into its row
+  token (`messaging.link.binding_token`, with the binding's persisted nonce)
+  and cleared only if channel and token both match; False is a mismatch — the
+  binding changed, or there is none — and nothing is touched. The only way an
+  unlink that NAMES a binding clears it. A route that reads the binding,
+  compares it and then clears it performs two steps, and a rebind landing
+  between them (another thread's `!sessions` pick, a rival claim, the
+  dispatcher re-asserting an origin mirror) is cleared by a stale unlink that
+  matched the binding before it — so the routes hold no compare of their own
+  (`test_channel_connect_row.py::TestCompareAndClearIsOneStep` enumerates
+  the unlink routes and asserts it). The mirror twin clears exactly as
+  `clear_mirror_link` does (both spellings, one save, the unbind audit); the
+  Slack twin clears both key spellings of a dashboard session.
 - `SessionManager.clear_mirror_links_at(link)` — value-keyed sweep: clears
   EVERY session whose mirror targets that exact non-Slack location and returns
   the cleared keys. The write counterpart of `find_mirror_sessions`, and the
   only clear that reaches a binding stranded under a key spelling the
-  conversation no longer derives (a rotated DM generation, a pre-unification
-  `dashboard:` row).
+  conversation no longer derives (a rotated DM generation, or a pre-unification
+  `dashboard:` row of a DIFFERENT session — the same session's own legacy row is
+  within `clear_mirror_link`'s reach).
 - `POST /api/chat/slots/{name}/mirror-link` | `mirror-unlink` — dashboard-side
   endpoints (auth posture matches `slack-link`: under the `/api/chat`
   `mixed_internal_paths` prefix, never the strict `internal_paths` set).
   New links use `{channel_type, target_id}` and resolve the opaque configured
   target server-side; the legacy `{conversation_id, thread_id?}` body remains
   accepted for compatibility. A successful new link posts an anchor plus the
-  last five redacted messages before persisting the mirror.
+  last five redacted messages before persisting the mirror. `mirror-unlink` is
+  what the session menu's **Unlink from X** item calls for EVERY row — a body
+  naming a `slack` binding is the slot's Slack thread, and the handler hands it
+  to `slack-unlink`'s (which owns that teardown: both key spellings, the slot's
+  own fields, the thread's reverse index, the courtesy note). Which store a
+  binding lives in is the server's fact, kept beside the code that enforces it
+  (`mirror-link` refuses Slack on channel type, so no slack-typed mirror is
+  creatable, and `SessionMap.get_mirror_link` already reads the thread as the
+  session's mirror); the menu carries no channel-to-endpoint switch of its own
+  — the same client-side inference, made for the `driven` flag, renders a
+  paused Slack row as a one-way link. It is
+  the one user-facing action that SEVERS an explicit binding, as
+  distinct from the Disconnect row, which pauses it. #3006 removed the sever
+  actions (the chip's Release button, the menu's Stop-mirroring items) when it
+  made Disconnect mean "output stops, the binding stays"; the Unlink item
+  reinstates one, on the evidence of #14068, because a paused binding is still a
+  binding: it still routes that conversation's messages into
+  the session and still counts as a mirror for session control, so a session
+  disconnected from the menu stays refused ("sessions mirrored to a channel
+  cannot control other sessions") with no exit short of an in-channel `/unlink`.
+  The item is offered on every channel the session is explicitly bound
+  to and never on a channel the session was BORN in: a channel-born session
+  carries two rows for its own conversation — the `origin` row and the
+  self-mirror `bind_origin_mirror` writes on every inbound turn — and popping that
+  mirror would leave dashboard-taken turns and the auto-compact notice reaching
+  nobody until the next inbound message rebound it, so the menu judges the group
+  by its `origin` row and offers Disconnect alone there. On success the dashboard
+  drops that channel's explicit link rows at once (`dropSlotLinks`) and the
+  endpoint's own `push_slots_update` confirms it. **The request names the binding
+  it severs.** Both `mirror-unlink` and `slack-unlink` accept an optional body
+  `{channel_type, binding}` spelled as the slots projection spells the row: the
+  channel and the row's opaque `binding` token, a digest of the WHOLE binding —
+  channel type, full conversation id, thread id and the binding's own persisted
+  nonce — minted by the projection
+  (`messaging.link.binding_token`) and recomputed by the map from the binding
+  it holds inside `clear_mirror_link_if` / `clear_slack_link_if`, which clear
+  only on equality; the body reader `_expected_binding` in `dashboard/state.py`
+  is the routes' one piece of the guard, and the routes hold no compare of
+  their own. The token, not the redacted
+  `target`, is the identity, because the display tail drops the thread and the
+  id's head: a Slack thread and its same-channel replacement (a re-link after an
+  unlink, or a Slack-side resume, both land in the same owner DM on a fresh
+  thread) read alike on `target` and differ on `binding`. The nonce is what
+  separates a binding from its byte-identical recreation: `SessionMap` mints one
+  (`mirror_nonce` beside `mirror`, `slack_link_nonce` beside the Slack fields)
+  whenever a binding is created or its target changes, keeps it across an
+  identical rewrite (the inbound paths re-write the same coordinates on every
+  turn), and drops it with the binding — so unlink → reconnect the SAME target
+  yields a new token, and a delayed unlink from a tab still holding the old row
+  is refused instead of deleting the binding another tab just made. A binding
+  written before nonces existed has none and its token digests the coordinates
+  alone; the binding that replaces it carries a nonce, which is all the guard
+  needs. The menu always sends
+  it, because the row it renders can be stale — a tab that missed a slots push
+  while its socket reconnected still shows the old row after another tab
+  rebound the slot — and a key-only clear would delete the binding the clicker
+  never saw. A mismatch, or no binding at all, is 409 `mirror_changed` and
+  clears nothing; the menu reports it under the row as **"The X connection
+  changed while this menu was open. Nothing was unlinked; the row was
+  refreshed."** — worded after what the refusal knows (the connection the row
+  was drawn from was replaced, nothing was cleared) and never as "no longer
+  linked", because a nonce-only mismatch (a Slack thread replaced in the same
+  channel, a rebind after an unlink from a second tab) means the channel IS
+  linked, to a new target, and the refetch redraws the row as connected beside
+  the notice — and refetches the slots. While that notice shows the channel's
+  Unlink item is not rendered at all and the toggle row's consequence line and
+  direction tag are withheld — the refetch may redraw the very same row (a
+  binding re-linked on the same channel), and an Unlink (live or dimmed — a
+  dimmed one still read as "odd"), or a line or tag saying the connection
+  stands, directly under "nothing was unlinked" contradicted it; they follow
+  the notice and return with its dismissal (or the row's next click). The
+  agent hand-off item stays, for the stale refusal as for every other failure:
+  inside Radix menu content it is the notice's only keyboard-reachable
+  escalation and renders in the notice's own branch, `aria-describedby` the
+  notice's id (`errors-use-error-notice`'s third sanctioned state — a notice
+  with neither `askAgent` nor that sibling is a dead end), and a notice that
+  says the connection changed is a question the agent can answer — which the
+  item now says under its label, in the menu's own sub-line grammar,
+  **"Ask what this channel is linked to now."**: a bare sparkle item in a menu
+  whose every other action self-describes was the one control a reader could
+  not identify ("no idea what it does or why it's in this menu"). Only the stale
+  refusal carries that line; an ordinary failure keeps the bare item, as the
+  hand-off reads everywhere else in the dashboard. A body naming
+  the channel without a token is refused the same way (the caller tried to
+  name a row and failed — never the unconditional clear); a body that is
+  present but not valid JSON, or not a JSON object, is 400 `invalid_body` and
+  clears nothing (reading it as "no body" would hand a caller that garbled its
+  row the unconditional clear); only an EMPTY body keeps the unconditional
+  clear for callers that hold no row.
+  The Unlink item names its outcome under its label — for a two-way binding
+  "Removes the connection — X stops driving this session. Reconnect anytime
+  from the session menu.", for a one-way mirror "Removes the connection —
+  replies stop going to X. Reconnect anytime from the session menu." — and
+  every connected
+  row's toggle reads **`Pause replies to X`** — the Disconnect action labelled
+  for what it does, the symmetric twin of `Resume replies to X`, because
+  "disconnect" everywhere else in life means sever and a reader read the row
+  right only through its sub-line ("'disconnect' and 'pauses' pull in different
+  directions"); a label change only, #3006's pause semantics stand — and carries
+  **"The connection stays."** — a full sentence, ended like `still_linked`'s,
+  because the unpunctuated form read as "cut off, like a sentence missing its
+  ending" (every sub-line says "the
+  connection", never "the link": "Copy link" a few items up means a web address,
+  and one word for two things in one menu read as a collision), because stacked under Disconnect the
+  two verbs read as near-synonyms and a reader who cannot tell the temporary one
+  from the permanent one clicks neither; a line under Unlink alone cannot
+  separate them (with nothing under Disconnect there is no second term to
+  compare against), and a bare removal verb reads as hard to undo, so the Unlink
+  line also says that reconnecting brings the link back and where that lives:
+  a reader who understood the verb still would not click it without knowing
+  how easy the way back is. The way back is its own sentence: as a third
+  dash-clause ("... until you reconnect — from the session menu.") the place
+  attached to the nearest verb and parsed as "removes the link from the session
+  menu". The place is named as "the session menu", not "this
+  menu", because the same rows also open under the paused header chip and an
+  unlink from there removes the chip and its menu. The Unlink line no longer
+  names the kind of link: "two-way link" made a reader pause on the one control
+  that ends the lock-out ("I'd pause first because I don't fully understand
+  'two-way link'"), and the tail carries what stops. The direction itself is
+  an explicit label on every BOUND row, rendered from the row's
+  `drives_session` in the menus' right-aligned tag grammar — **"Two-way · X ↔
+  this session"** for a binding that drives this session, **"One-way · this
+  session → X"** for a one-way mirror; an offer, bound to nothing, carries
+  none — and the paused sub-line (`still_linked`, one string) carries no
+  direction at all: two rows that looked alike carried captions that flipped
+  between "messages there still reach this session" and "don't reach" with
+  nothing marking why, and a reader who met both stopped trusting either ("I
+  cannot tell which is true … I no longer trust the captions"). The Unlink
+  line keeps its two tails (`unlink_outcome` / `_out`), because what a sever
+  STOPS genuinely differs, and the label above it is what makes the two tails
+  read as two kinds of link rather than as one caption that contradicts
+  itself. The pair defines each
+  other: one pauses and keeps the link, the other removes it and names
+  reconnecting (the menu offers the same destination as a fresh `Connect` row
+  right after) as what brings it back. The pause row's line is not limited to
+  rows with an Unlink beneath them: a reader who has learned it on a mirrored
+  session's menu and then meets a bare `Pause replies to X` on a born-in channel
+  cannot tell whether that one keeps the conversation bound, and the line is
+  true there too —
+  the conversation stays bound and a reply there resumes it. Which direction
+  label a row carries, and which Unlink tail, is the row's own
+  `drives_session` — the slots projection's statement,
+  per link row, that messages sent there land in this session — never an
+  inference from the wire's `direction` or the channel name: a Slack thread row
+  is projected `out` (its inbound routing is Slack's own thread index, not the
+  mirror's inbound marker) yet a reply in a linked thread resumes this session
+  while the link stands and Unlink evicts that index, so the projection marks
+  it `drives_session: true`; a `both` mirror is `true` by its inbound marker, a
+  one-way `out` mirror `false`, and the conversation a session was born in
+  `true`. The server owns the routing fact; a client that re-derives it reads
+  a paused Slack row as a one-way link. A row from a cached payload
+  without the field reads as not driving until the next slots push.
 - `POST /api/chat/slots/{name}/slack-pause` | `mirror-pause` — disconnect (or
   reconnect) a channel while **retaining** its binding, so inbound still routes
   to the same session and a later reconnect needs no re-link. Same auth posture
@@ -2643,6 +2815,92 @@ only when a `mirror` `ChannelLink` exists on the dashboard-side key:
   silences the courtesy note posted into the conversation and keeps the
   disconnect. That note is skipped entirely for an `origin` disconnect, since the
   mirror resolver addresses the EXPLICIT mirror — a different conversation.
+  Because the binding survives, the UI names the state rather than letting a
+  paused channel read like one that was never connected: the menu row reads
+  `Resume replies to X` — the verb names the state its sub-line describes; under
+  a line saying the connection still stands, `Connect to X` read as a second link
+  rather than a resume ("the title says 'Connect' but the small text describes
+  the current paused state… I would not be confident which one I was about to
+  do"). Every paused BOUND row reads it, a paused born-in conversation too:
+  that row carries the direction tag, and a bare `Connect` under a tag
+  asserting the connection stands is the same contradiction. Only a
+  never-connected offer, which asserts no connection, keeps `Connect to X`. Every
+  paused bound row carries a consequence line under the verb —
+  **"Replies paused — the connection stays."**, the born-in row included (with
+  only the verb saying it, a reader found the menu itself said "paused"
+  nowhere), the
+  direction on the row's label, not in the line (a consequence, not the word "linked",
+  which collided with the neighbouring "Copy link" item; and led by what is
+  paused, not by "Disconnected", which under a row reading `Connect` contradicted
+  itself)
+  — and a severable row keeps its `Unlink from X` item; a born-in row carries
+  beneath that line the note that explains its missing Unlink, **"Started from
+  X — the connection can be paused, not removed."**, connected or paused,
+  because a reader who meets a
+  mirrored channel's two controls and this channel's one could not tell "why one
+  connected chat gets both choices and this one only gets the pause". **X is
+  the label the server sends**, everywhere the destination is named: a bound
+  row (and its failure lines) reads its link row's `label` as the slots
+  projection spells it, the header chip reads the same row's label, and an
+  offer reads the target's `label` from `channel-targets` — the same channel
+  form with the destination on it ("Discord DM · 1234"), the one thing an
+  offer must add since several destinations on one channel can be offered at
+  once. On the offer row that label is split at its ` · `: the verb line keeps
+  the channel form (`Connect to Discord DM`, the name the bound row and the chip
+  use) and the discriminator is the row's muted sub-line — a human tail as the
+  transport sent it ("#eng", "Direct Message", "yourself"), a tail that is
+  nothing but the id of a `user:` target named for what it is (**"Direct
+  message · 118273645"**) — because a raw id inside a button label read as
+  broken ("I don't know whose number that is") and the reconnect path Unlink
+  promises lands on exactly that row; an unavailable offer keeps the
+  discriminator above its reason. The dashboard keeps no brand table of its own for these names (its
+  `channelBrandLabel` is only the fallback for a wire row that carries no
+  label): one destination used to carry three names across the journey —
+  the chip's "Discord DM", the row's "Discord", the offer's "Discord DM ·
+  1234" — and a reader "could not tell why one is more specific than the
+  other, or whether they do different things"; the header chip for a two-way binding
+  reads **"Driven from X · replies paused"** (live: "Driven from X"; unlinked:
+  no chip). Both states are ONE affordance — a menu trigger (with a chevron as
+  its visible cue) that opens the session menu's own Linked surfaces rows FOR
+  THE CHANNEL IT NAMES, right under the chip: for the paused chip the
+  `Resume replies to X` row that resumes and the `Unlink from X` row, with
+  "Resume or unlink X." as its `title`; for the live chip the `Pause replies to
+  X` and `Unlink from X` rows, with "Pause or unlink X." as its `title`; no
+  other channel's rows and no offers (a chip that reads "Driven from Discord DM"
+  must not open a menu offering Slack or Telegram). The paused chip is the one
+  that invites repair — a chip that
+  names a problem and answers a click with nothing is a dead click at the moment
+  of need; a hover-only hint did not cure that (delayed, absent on touch,
+  unread by a screen reader) — and the live chip is the same trigger because a
+  button beside a plain span that looked identical gave one chip two behaviours
+  a reader could not tell apart before clicking. It is not a second control: the
+  rows are the one component that connects, pauses and unlinks, so the chip
+  cannot disagree with the menu about what any verb means. Three states, each
+  spelled differently, because the middle one is the one session control still
+  refuses. **Link, pause and unlink publish only after the SessionMap write is
+  durable**: the map's writer is debounced, so `mirror-link`, `mirror-pause`,
+  `mirror-unlink`, `slack-link`, `slack-pause` and `slack-unlink` each `await
+  state.sessions.aflush()` between the map write and the first thing that
+  reports it done (the slots push, the note or backfill in the channel, the
+  response) — a gateway exit before the deferred write would otherwise reload an
+  unlinked binding on restart, lift a pause the user set, or lose a link whose
+  thread already carries the transcript, and make the reported state a lie.
+  (`mirror-link`'s claim runs off the loop, where a batch writes inline; its
+  await is the same visible contract, normally finding nothing owed.) A failed
+  flush surfaces as the route's error, never as `ok`; on `slack-unlink` the slot's
+  own fields and the thread's reverse-index entry are torn down in a `finally`
+  around the flush, so they follow the in-memory map in failure too — a teardown
+  skipped by the raise would leave the row rendering, a reply in the thread
+  resolving to the slot, and a retried Unlink refused with nothing to compare.
+  They follow the map literally: the teardown is conditional on what the map
+  holds once the wait returns. The write is a real thread hop and a second
+  same-slot `slack-link` can run its whole handler inside it, so a link the map
+  holds afterwards is that newer write (the route cleared the old one), whatever
+  its thread — its fields and index stand, the thread gets no "unlinked" note and
+  no struck control, and the answer carries `relinked: true`; an empty map means
+  the old binding's fields and index are the ones to take down.
+  Pinned in `test_channel_connect_row.py::TestPersistBeforePublish`, one test
+  per route, and `test_chat_slack.py::TestSlackUnlink::test_a_failed_flush_still_tears_down_the_slot_and_the_reverse_index`, `::test_a_relink_that_lands_inside_the_flush_window_survives_the_unlink` and `::test_a_plain_unlink_still_tears_down_the_slot_and_the_reverse_index`.
 - **Neither `mirror-unlink` nor `mirror-pause` detaches a channel-born slot.** Both
   act on the outbound mirror binding only (clear it, or mute delivery through it);
   the slot's `linked_session_key` — the channel session its turns run on — is

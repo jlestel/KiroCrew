@@ -6640,7 +6640,10 @@
       "worktree_disabled_no_project_directory": "\"इस सत्र में जोड़ें\" कंपोज़र को पहले से भर देता है — जब तक आप भेजें नहीं दबाते, कुछ भी नहीं भेजा जाता। वर्कट्री यहाँ उपलब्ध नहीं हैं: इस सत्र की कोई प्रोजेक्ट डायरेक्टरी नहीं है (कंपोज़र की प्रोजेक्ट चिप से एक चुनें)।"
     },
     "inboundLinkChip": {
-      "driven_from": "{{label}} से संचालित"
+      "driven_from": "{{label}} से संचालित",
+      "driven_from_paused": "{{label}} से संचालित · जवाब रुके हुए",
+      "driven_from_paused_hint": "{{label}} को फिर से शुरू करो या अनलिंक करो।",
+      "driven_from_hint": "{{label}} को रोको या अनलिंक करो।"
     },
     "infoTip": {
       "more_information": "अधिक जानकारी"
@@ -6988,8 +6991,21 @@
     "linkedSurfacesSection": {
       "connect_failed": "{{label}} से कनेक्ट नहीं किया जा सका: {{reason}}",
       "connect_to": "{{label}} से कनेक्ट करें",
-      "disconnect_failed": "{{label}} से डिस्कनेक्ट नहीं किया जा सका: {{reason}}",
-      "disconnect_from": "{{label}} से डिस्कनेक्ट करें",
+      "direct_message_id": "डायरेक्ट मैसेज · {{id}}",
+      "disconnect_failed": "{{label}} पर जवाब रोके नहीं जा सके: {{reason}}",
+      "disconnect_from": "{{label}} पर जवाब रोको",
+      "disconnect_outcome": "कनेक्शन बना रहता है।",
+      "born_in_note": "{{label}} से शुरू हुआ — कनेक्शन रोका जा सकता है, हटाया नहीं।",
+      "ask_agent_stale_outcome": "पूछो कि यह चैनल अब किससे जुड़ा है।",
+      "resume_replies_to": "{{label}} पर जवाब फिर से शुरू करो",
+      "direction_one_way": "एकतरफ़ा · यह सत्र → {{label}}",
+      "direction_two_way": "दोतरफ़ा · {{label}} ↔ यह सत्र",
+      "still_linked": "जवाब रुके हुए हैं — कनेक्शन बना रहता है।",
+      "unlink_failed": "{{label}} से अनलिंक नहीं किया जा सका: {{reason}}",
+      "unlink_from": "{{label}} से अनलिंक करो",
+      "unlink_outcome": "कनेक्शन हटाता है — {{label}} इस सत्र को संचालित नहीं करता। सत्र मेनू से कभी भी फिर से कनेक्ट कर सकते हो।",
+      "unlink_outcome_out": "कनेक्शन हटाता है — जवाब {{label}} पर नहीं जाते। सत्र मेनू से कभी भी फिर से कनेक्ट कर सकते हो।",
+      "unlink_stale": "यह मेनू खुला रहते हुए {{label}} कनेक्शन बदल गया। कुछ भी अनलिंक नहीं किया गया; पंक्ति ताज़ा कर दी गई।",
       "held_elsewhere": "{{label}} किसी अन्य सेशन द्वारा उपयोग में है।",
       "unavailable": "यह गंतव्य उपलब्ध नहीं है।",
       "unknown_error": "अज्ञात त्रुटि",

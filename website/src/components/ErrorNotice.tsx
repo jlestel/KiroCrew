@@ -22,15 +22,23 @@ export type ErrorNoticeMenuItemComponent = ComponentType<{
  * notice. `describedBy` points back to that passive alert. Successful selection
  * follows Radix's normal close path. A staging failure prevents that close so
  * the diagnostic and recovery action stay visible.
+ *
+ * `outcome` is an optional one-line consequence rendered under the label, for a
+ * host whose every other item names its outcome in a sub-line: there, a bare
+ * "Ask the agent" was the one control a reader could not identify ("no idea
+ * what it does or why it's in this menu"). The host words it for the notice it
+ * follows; the tooltip keeps describing the mechanism.
  */
 export function ErrorNoticeMenuItem({
   Item,
   message,
   describedBy,
+  outcome,
 }: {
   Item: ErrorNoticeMenuItemComponent
   message?: string | null
   describedBy: string
+  outcome?: string
 }) {
   if (!message) return null
 
@@ -43,7 +51,14 @@ export function ErrorNoticeMenuItem({
       }}
     >
       <Sparkles size={13} className="shrink-0 text-muted" aria-hidden="true" />
-      {i18nT('components.askAgent.ask_the_agent')}
+      {outcome ? (
+        <span className="flex min-w-0 flex-col">
+          <span className="truncate">{i18nT('components.askAgent.ask_the_agent')}</span>
+          <span className="truncate text-[11px] text-muted">{outcome}</span>
+        </span>
+      ) : (
+        i18nT('components.askAgent.ask_the_agent')
+      )}
     </Item>
   )
 }
