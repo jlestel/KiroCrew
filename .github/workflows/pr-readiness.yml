@@ -1214,6 +1214,38 @@ jobs:
             fi
           done
 
+          # Intent Lock (intent-lock.yml): a red row means the PR's frozen goal
+          # sections changed, and only a maintainer's `/intent approve <sha>`
+          # clears it -- the same who-must-act as an unapproved fork run, so it
+          # joins awaiting_approval[]. Bound to THIS PR by external_id. A row
+          # still being evaluated is a wait. No row (a PR that predates the
+          # check) contributes nothing.
+          # A fork evaluation already read every check-run; a same-repo one
+          # reads only this name, one request.
+          if [ "$transport_failed" = "false" ]; then
+            intent_runs="$sha_check_runs"
+            if [ -z "$intent_runs" ]; then
+              intent_runs="$(gh_retry gh api --method GET \
+                "repos/$REPO/commits/$SHA/check-runs?check_name=Intent%20Lock&per_page=100")" || {
+                rc=$?
+                if [ "$rc" -eq 22 ]; then exit 1; fi
+                transport_failed=true
+              }
+            fi
+            if [ "$transport_failed" = "false" ]; then
+              intent="$(jq -r --arg x "intent-lock:$PR" '[.check_runs[]
+                  | select(.name == "Intent Lock" and .external_id == $x)]
+                | max_by(.id) | if . == null then ""
+                  elif .status != "completed" then "running"
+                  else .conclusion // "" end' <<<"$intent_runs")"
+              if [ "$intent" = "failure" ]; then
+                awaiting_approval+=("Intent Lock (goal changed: /intent approve $SHA)")
+              elif [ "$intent" = "running" ]; then
+                pending+=("Intent Lock (evaluating)")
+              fi
+            fi
+          fi
+
           # A read that still fails after the bounded retries is a TRANSPORT
           # failure: this revision's verdict is UNKNOWN, not red. Publish an
           # explicit non-terminal "could not be evaluated" verdict (a pending
@@ -1469,9 +1501,9 @@ jobs:
               echo "**Awaiting maintainer approval**"
               printf -- "- %s\n" ${awaiting_approval[@]+"${awaiting_approval[@]}"}
               echo
-              echo "> GitHub created these fork runs but has not executed them."
-              echo "> A maintainer must approve them; the contributor cannot"
-              echo "> clear this condition."
+              echo "> Fork runs GitHub has not executed, or an Intent Lock goal"
+              echo "> change. A maintainer must approve them; the contributor"
+              echo "> cannot clear this condition."
             fi
             if [ "${#blockers[@]}" -gt 0 ]; then
               echo

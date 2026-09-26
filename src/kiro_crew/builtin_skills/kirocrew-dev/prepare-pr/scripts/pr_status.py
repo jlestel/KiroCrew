@@ -129,6 +129,10 @@ PASS_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 CTX_PASS = {"SUCCESS"}
 CTX_RUNNING = {"PENDING", "EXPECTED"}
 DEFAULT_READINESS_CONTEXT = "PR Readiness"
+# intent-lock.yml's check-run. Red means the PR's frozen goal sections changed
+# and only a maintainer's `/intent approve <head-sha>` clears it: a human wait,
+# so it is reported apart from the failing checks the loop fixes.
+INTENT_LOCK_CHECK = "Intent Lock"
 
 # A host closes an issue on merge ONLY for these verbs. "Related: #n", "Part of
 # #n" and a bare "#n" render as links and close nothing, which is how finished
@@ -1362,6 +1366,7 @@ def decide(
     rollup_notice="",
     disposition_eval=None,
     concerns_eval=None,
+    intent_wait=False,
 ):
     """Resolve PR state to (exit_code, status line). Fail-closed.
 
@@ -1498,6 +1503,13 @@ def decide(
         reasons.append("{} reported action required".format(readiness_context))
     if n_fail > 0:
         reasons.append("{} check(s) failed".format(n_fail))
+    if intent_wait:
+        # Still blocking, but named as a HUMAN wait: no code change clears it,
+        # and the loop must never post the approval itself.
+        reasons.append(
+            "HUMAN WAIT - Intent Lock: the frozen goal sections changed; only a "
+            "maintainer's `/intent approve <head-sha>` clears it (not a code fix)"
+        )
     if n_checks == 0:
         # An empty rollup has two very different causes, and the reason chosen
         # here travels in ``progress_key.status``, which a polling loop
@@ -1774,10 +1786,14 @@ def main(argv):
     n_running = n_fail = 0
     failing_checks = []
     readiness_kind = None
+    intent_wait = False
     for e in rollup:
         kind = classify_check(e)
+        intent_red = kind == "fail" and not e.get("context") and e.get("name") == INTENT_LOCK_CHECK
         if kind == "running":
             n_running += 1
+        elif intent_red:
+            intent_wait = True
         elif kind == "fail":
             n_fail += 1
         name = sanitize(e.get("name") or e.get("context") or "check")
@@ -1789,6 +1805,8 @@ def main(argv):
         if e.get("context") == readiness_context:
             readiness_kind = kind
         shown = (e.get("status") or "-") + "/" + (e.get("conclusion") or e.get("state") or "-")
+        if intent_red:
+            kind = "fail - HUMAN WAIT, maintainer approval"
         print("  - {}: {}  [{}]".format(name, shown, kind))
     print("  rollup: total={} running={} failing={}".format(len(rollup), n_running, n_fail))
     print("  aggregate readiness: {}".format(readiness_kind or "not published"))
@@ -2015,6 +2033,7 @@ def main(argv):
         rollup_notice=rollup_notice,
         disposition_eval=disposition_eval,
         concerns_eval=concerns_eval,
+        intent_wait=intent_wait,
     )
     print(status)
     if "--json" in argv[1:]:

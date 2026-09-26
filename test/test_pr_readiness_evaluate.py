@@ -1761,3 +1761,60 @@ class TestAnAdvisoryLaneThatPublishedNoVerdictIsNotPassed:
         assert branch_labels == labels
         assert set(arms) == labels
         assert set(arms.values()) == set(_whole_design_lanes())
+
+
+class TestIntentLockAwaitsMaintainerApproval:
+    """A red Intent Lock row (intent-lock.yml) is cleared only by a
+    maintainer's `/intent approve <sha>`, so it is reported with the other
+    maintainer-approval waits, bound to THIS PR by its external_id."""
+
+    @staticmethod
+    def _rows(runner: Runner, *rows: tuple[str, int, str | None]) -> None:
+        # Added to the default fixture, whose CodeQL row keeps that lane green.
+        path = runner.fixtures / "check_runs.json"
+        fixture = json.loads(path.read_text())
+        fixture["check_runs"] += [
+            {
+                "name": "Intent Lock",
+                "external_id": eid,
+                "id": rid,
+                "status": "completed" if c else "in_progress",
+                "conclusion": c,
+            }
+            for eid, rid, c in rows
+        ]
+        path.write_text(json.dumps(fixture))
+
+    @pytest.mark.parametrize("fork", [False, True])
+    def test_a_red_row_awaits_maintainer_approval(self, runner: Runner, fork: bool):
+        self._rows(runner, ("intent-lock:2650", 5, "failure"))
+        proc, outputs = runner.evaluate(fork=fork)
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert "Intent Lock (goal changed: /intent approve" in _lane_log(proc)
+        if not fork:
+            # A fork's reviewer rows are absent from this fixture, so only the
+            # same-repo description is exactly this one wait.
+            assert outputs["description"] == "1 workflow(s) awaiting maintainer approval"
+
+    def test_another_prs_row_and_a_superseded_row_are_ignored(self, runner: Runner):
+        self._rows(
+            runner,
+            ("intent-lock:9999", 7, "failure"),
+            ("intent-lock:2650", 5, "failure"),
+            ("intent-lock:2650", 6, "success"),
+        )
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "success"
+        assert "awaiting_approval=[]" in _lane_log(proc)
+
+    def test_a_row_mid_evaluation_waits_instead_of_going_green(self, runner: Runner):
+        # intent-lock.sh marks its row in_progress before it evaluates. A
+        # readiness run reading it then must not publish green: the verdict
+        # that is about to land may be red.
+        self._rows(runner, ("intent-lock:2650", 5, None))
+        proc, outputs = runner.evaluate()
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "pending"
+        assert "Intent Lock (evaluating)" in _lane_log(proc)

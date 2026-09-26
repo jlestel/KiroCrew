@@ -3738,3 +3738,36 @@ def test_the_evaluator_itself_refuses_an_untrusted_override_record() -> None:
         [forged], _HEAD, bindings, only=["GPT"], authors=("coverage-app[bot]",)
     )
     assert widened["overridden"] == {"GPT": "maintainer"}, widened
+
+
+def test_a_red_intent_lock_is_a_human_wait_not_a_failed_check(capsys) -> None:
+    """Only a maintainer's `/intent approve` clears it, so it still blocks but is
+    named apart from the checks the loop fixes."""
+    module = _load_script()
+    _install_fake_gh(
+        module,
+        _pr_payload(
+            [
+                {"name": "Intent Lock", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"name": "CI", "status": "COMPLETED", "conclusion": "FAILURE"},
+            ]
+        ),
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 20
+    out = capsys.readouterr().out
+    assert "1 check(s) failed" in out
+    assert "HUMAN WAIT - Intent Lock" in out
+    assert "/intent approve <head-sha>" in out
+
+
+def test_an_intent_lock_status_context_is_an_ordinary_failure(capsys) -> None:
+    """The human-wait reading is for the check-run intent-lock.yml publishes; a
+    commit status that merely shares the name stays a failed check."""
+    module = _load_script()
+    _install_fake_gh(module, _pr_payload([{"context": "Intent Lock", "state": "FAILURE"}]))
+
+    assert module.main(["pr_status.py", "42"]) == 20
+    out = capsys.readouterr().out
+    assert "1 check(s) failed" in out
+    assert "HUMAN WAIT" not in out

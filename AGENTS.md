@@ -236,7 +236,8 @@ finding outside the goal is rebutted or deferred, never absorbed by widening the
 goal. A defect in code this PR adds or changes is always in scope and gets fixed;
 'out of goal' applies only to new scope — a new feature, surface, or hardening this
 PR does not need. Edit them only when a human explicitly asks, and say why in a PR
-comment.
+comment. The `Intent Lock` check turns red when they change, until a maintainer
+comments `/intent approve <head-sha>`. That is a human wait: never post it yourself.
 
 ## CHANGELOG.md
 

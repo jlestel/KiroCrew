@@ -1,0 +1,72 @@
+name: Intent Lock
+
+# Publishes the `Intent Lock` check: red when a PR's frozen goal sections (the
+# Goal line, Why it matters, Not a goal) differ from the baseline recorded when
+# the PR opened, green again once a repository writer comments
+# `/intent approve <head-sha>`. The rules live in .github/scripts/intent-lock.sh.
+#
+# One workflow for same-repo and fork PRs: `pull_request_target` and
+# `issue_comment` both run the BASE branch's copy of this file and the script,
+# with a token that can write to the PR, whatever the head repository is. The
+# check-run is published explicitly against the PR head so it shows beside the
+# PR's other checks.
+#
+# TRUST MODEL: nothing here checks out, builds or executes PR code. The only
+# PR-controlled values read are the PR body (fetched through the API) and the
+# comment body, both handled as data.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  # To dispatch pr-readiness.yml after the verdict changes.
+  actions: write
+  checks: write
+  # Only to check out the base branch's copy of the script.
+  contents: read
+  # The baseline and notices are PR comments.
+  issues: write
+  pull-requests: write
+
+concurrency:
+  # Serialised per PR, not cancelled: each run reads the baseline and then
+  # writes it or the check-run, and a cancel between the two could post a
+  # second baseline.
+  group: intent-lock-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  lock:
+    # Not "Intent Lock": that name is the verdict row the script publishes,
+    # and a failed job must not read as that row's maintainer wait.
+    name: Intent Lock (evaluate)
+    if: >-
+      github.event_name == 'pull_request_target'
+      || (github.event.issue.pull_request != null
+          && startsWith(github.event.comment.body, '/intent approve '))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/intent-lock.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Evaluate and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          # The PR body as the event saw it: the text a maintainer approved,
+          # or the text the PR opened with. PR-controlled; read as data only.
+          EVENT_BODY: ${{ github.event.pull_request.body || github.event.issue.body }}
+          # Commenter-controlled. Read as data only.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+        run: bash .github/scripts/intent-lock.sh

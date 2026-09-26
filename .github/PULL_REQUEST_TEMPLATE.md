@@ -1,6 +1,8 @@
 <!-- The first three sections (Problem / Motivation, Why it matters, Not a
      goal) state the PR's goal. They are FROZEN once the PR opens: agents
-     never edit them on their own, only when a human explicitly asks. Every
+     never edit them on their own, only when a human explicitly asks. The
+     Intent Lock check turns red when they change, until a maintainer
+     comments `/intent approve <head-sha>`. Every
      section from "What changed" down is rewritten to match the current diff.
      Omit a section only when it is genuinely not applicable, and say so
      (e.g. "N/A — ..."). Every claim here must be supported by the diff. -->
