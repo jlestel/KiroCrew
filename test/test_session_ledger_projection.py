@@ -362,7 +362,7 @@ def test_record_refuses_when_the_session_has_no_crew_log():
 
 def test_record_refuses_when_the_crew_log_is_switched_off(monkeypatch):
     _unit()
-    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
     with pytest.raises(sl.LedgerUnavailable, match="KIROCREW_CREW_LOG"):
         sl.record(SLOT, session_id=SESSION, goal="g")
 

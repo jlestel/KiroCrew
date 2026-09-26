@@ -1261,7 +1261,7 @@ async def test_a_publish_whose_append_is_skipped_is_still_what_a_reader_gets(vet
 
         # A third cycle with the log off: the file advances, the fold cannot.
         with pytest.MonkeyPatch.context() as patch:
-            patch.delenv("KIROCREW_CREW_LOG", raising=False)
+            patch.setenv("KIROCREW_CREW_LOG", "0")
             crew_log_emit.reset_caches()
             resp = await c.post(
                 "/api/agent-panel/publish",

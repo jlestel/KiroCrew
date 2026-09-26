@@ -175,6 +175,451 @@ class TestPairing:
         assert report.reclaimable_sessions == 2
 
 
+def _crew_log(unit_id: str, slot: str, *, closed: bool = True) -> int:
+    """One session crew-log unit whose header names *slot*; its size on disk."""
+    from crew_log_type_helpers import minimal_data
+
+    from kiro_crew.crew_log import CrewLog
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    log = CrewLog.create(KIND_SESSION, unit_id, owner="default", agent="kirocrew", slot=slot)
+    log.append("session/opened", minimal_data(KIND_SESSION, "session/opened"), src="gateway")
+    if closed:
+        log.append("session/closed", {"reason": "reset"}, src="gateway")
+    path = log.path
+    del log
+    old = _NOW - 40 * _DAY
+    for child in path.parent.iterdir():
+        os.utime(child, (old, old))
+    return sum(child.stat().st_size for child in path.parent.iterdir() if child.is_file())
+
+
+def _crew_log_exists(unit_id: str) -> bool:
+    from kiro_crew.crew_log import CrewLog
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    return CrewLog.exists(KIND_SESSION, unit_id)
+
+
+class TestCrewLogsAreTheSessions:
+    """A session's crew logs are measured, reclaimed and restored with it.
+
+    One unit per ACP id the conversation ran under, so a reset leaves two; both
+    belong to the transcript their header's slot names.
+    """
+
+    def test_the_report_counts_every_crew_log_unit(self, stores: tuple[Path, Path]) -> None:
+        crew_home, _ = stores
+        crew = _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        before_reset = _crew_log("acp-before-reset", "chat-1")
+        after_reset = _crew_log("acp-after-reset", "chat-1")
+
+        report = session_storage.measure(_index(), now=_NOW)
+
+        assert report.total_sessions == 1
+        assert report.total_bytes == crew + before_reset + after_reset
+
+    def test_a_mapped_crew_log_unit_keeps_its_session_active(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-mapped", "chat-1")
+
+        index = _index(active={"acp-mapped"})
+        with pytest.raises(SessionStorageError, match="still in use"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=index, now=_NOW
+            )
+
+        assert _crew_log_exists("acp-mapped")
+
+    def test_trash_stages_them_outside_the_batch_and_restore_puts_them_back(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        size = _crew_log("acp-before-reset", "chat-1") + _crew_log("acp-after-reset", "chat-1")
+
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+
+        assert not _crew_log_exists("acp-before-reset")
+        assert not _crew_log_exists("acp-after-reset")
+        staged = session_storage.trash_root() / batch.batch_id
+        assert not any(
+            "log.jsonl" == path.name for path in staged.rglob("*")
+        ), "a crew log was staged in the agent-writable batch"
+        assert (crew_log_trash_root() / batch.batch_id / "dashboard_chat-1").is_dir()
+        assert batch.bytes == 50 + size
+        assert session_storage.list_trash()[0].bytes == 50 + size
+
+        assert session_storage.restore(batch.batch_id) == 1
+
+        assert _crew_log_exists("acp-before-reset")
+        assert _crew_log_exists("acp-after-reset")
+        assert not (crew_log_trash_root() / batch.batch_id).exists()
+
+    def test_emptying_the_trash_removes_the_staged_crew_logs(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+
+        freed = session_storage.empty_trash([batch.batch_id])
+
+        # The manifest is freed too, so the total is at least what was staged.
+        assert freed >= batch.bytes
+        assert not (crew_log_trash_root() / batch.batch_id).exists()
+        assert not _crew_log_exists("acp-before-reset")
+
+    def test_a_crew_log_a_writer_holds_leaves_the_whole_session_in_place(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        from crew_log_type_helpers import minimal_data
+
+        from kiro_crew.crew_log import CrewLog
+        from kiro_crew.crew_log.schema import KIND_SESSION
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-idle", "chat-1")
+        held = CrewLog.create(KIND_SESSION, "acp-held", owner="default", agent="k", slot="chat-1")
+        held.append("session/opened", minimal_data(KIND_SESSION, "session/opened"), src="gateway")
+        old = _NOW - 40 * _DAY
+        for child in held.path.parent.iterdir():
+            os.utime(child, (old, old))
+
+        with pytest.raises(SessionStorageError, match="resumed"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+            )
+
+        assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
+        assert _crew_log_exists("acp-idle"), "a unit staged before the refusal was not put back"
+        assert _crew_log_exists("acp-held")
+        del held
+
+    def test_an_occupied_crew_log_name_keeps_the_whole_session_staged(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        _crew_log("acp-after-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        _crew_log("acp-after-reset", "chat-2")  # the name is taken again
+
+        assert session_storage.restore(batch.batch_id) == 0
+
+        assert not (crew_home / "sessions" / "dashboard_chat-1.jsonl").exists()
+        assert not _crew_log_exists("acp-before-reset"), "restored without its sibling"
+        assert session_storage.list_trash()[0].sessions == 1
+
+    @staticmethod
+    def _fail_the_restore_after_the_crew_logs_went_back(monkeypatch, mode: str) -> list:
+        """Make the transcript's restore fail, then make staging a unit back fail too.
+
+        ``fsync``: every crew-log directory sync fails from then on, so neither unit can
+        be staged again. ``owned``: the session is resumed mid-restore, so the unit it
+        writes is leased and stays live. Returns the handles a resume keeps open.
+        """
+        from crew_log_type_helpers import minimal_data
+
+        from kiro_crew.crew_log import CrewLog
+        from kiro_crew.crew_log import store as crew_store
+        from kiro_crew.crew_log.schema import KIND_SESSION
+
+        failing = {"on": False}
+        handles: list = []
+        real_sync = crew_store._sync_down
+
+        def _sync_down(top: Path, leaf: Path) -> None:
+            if failing["on"]:
+                raise OSError(errno.EIO, "injected fsync failure")
+            real_sync(top, leaf)
+
+        def _move(src: Path, dst: Path, **_kwargs) -> bool:
+            if mode == "fsync":
+                failing["on"] = True
+                raise OSError(errno.EIO, "injected transcript move failure")
+            resumed = CrewLog.open(KIND_SESSION, "acp-before-reset")
+            resumed.append(
+                "session/opened", minimal_data(KIND_SESSION, "session/opened"), src="gateway"
+            )
+            handles.append(resumed)
+            return False
+
+        monkeypatch.setattr(crew_store, "_sync_down", _sync_down)
+        monkeypatch.setattr(session_storage, "_move_file_exclusive", _move)
+        return handles
+
+    @staticmethod
+    def _held(unit_id: str) -> bool:
+        from kiro_crew.crew_log.schema import KIND_SESSION
+        from kiro_crew.crew_log.store import TRASH_HOLD_FILE, unit_dir_for
+
+        directory = unit_dir_for(KIND_SESSION, unit_id)
+        return directory is not None and (directory / TRASH_HOLD_FILE).exists()
+
+    @pytest.mark.parametrize("mode", ["fsync", "owned"])
+    def test_a_unit_a_failed_restore_cannot_stage_again_is_held_from_the_sweep(
+        self, stores: tuple[Path, Path], monkeypatch, mode: str
+    ) -> None:
+        """A failed rollback leaves a unit live beside a staged transcript: it is held.
+
+        The session stays listed in the trash, the sweep does not expire the live half,
+        and restoring the session once the failure has passed makes it whole and lets
+        the unit age out again.
+        """
+        from kiro_crew.crew_log import store as crew_store
+
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        _crew_log("acp-after-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        with monkeypatch.context() as patch:
+            handles = self._fail_the_restore_after_the_crew_logs_went_back(patch, mode)
+            assert session_storage.restore(batch.batch_id) == 0
+
+        assert not live.exists(), "the transcript left the trash without its session"
+        assert session_storage.list_trash()[0].sessions == 1
+        assert _crew_log_exists("acp-before-reset")
+        assert self._held("acp-before-reset")
+        # Far past every retention window: a held unit is still not collected.
+        assert crew_store.sweep_expired(0, now=time.time() + 400 * 86400)[0] == 0
+        assert _crew_log_exists("acp-before-reset")
+
+        handles.clear()
+        assert session_storage.restore(batch.batch_id) == 1
+
+        assert live.is_file()
+        assert not self._held("acp-before-reset")
+        assert not self._held("acp-after-reset")
+        if mode == "fsync":
+            assert crew_store.sweep_expired(0, now=time.time() + 400 * 86400) == (2, 0)
+
+    def test_a_sweep_between_publishing_the_units_and_the_commit_takes_nothing(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        """The units go back before the transcript; a sweep in that gap must not take them.
+
+        Both units are closed and far past the window by the time the sweep runs, so an
+        unheld unit is collectable. Once the restore commits the holds are released and
+        the same sweep collects them, so the hold lasts exactly as long as the restore.
+        """
+        from kiro_crew.crew_log import store as crew_store
+
+        crew_home, _ = stores
+        live = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        _crew_log("acp-after-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        later = time.time() + 400 * 86400
+        swept: list[tuple[int, int]] = []
+        real_move = session_storage._move_file_exclusive
+
+        def _sweep_then_move(src: Path, dst: Path, **kwargs) -> bool:
+            if not swept:
+                swept.append(crew_store.sweep_expired(0, now=later))
+            return real_move(src, dst, **kwargs)
+
+        monkeypatch.setattr(session_storage, "_move_file_exclusive", _sweep_then_move)
+
+        assert session_storage.restore(batch.batch_id) == 1
+
+        assert swept == [(0, 0)], "the sweep collected a unit the restore had published"
+        assert live.is_file()
+        assert _crew_log_exists("acp-before-reset")
+        assert _crew_log_exists("acp-after-reset")
+        assert not self._held("acp-before-reset")
+        assert not self._held("acp-after-reset")
+        assert crew_store.sweep_expired(0, now=later) == (2, 0)
+
+    def test_emptying_the_batch_releases_a_held_unit(
+        self, stores: tuple[Path, Path], monkeypatch
+    ) -> None:
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-before-reset", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        with monkeypatch.context() as patch:
+            self._fail_the_restore_after_the_crew_logs_went_back(patch, "fsync")
+            assert session_storage.restore(batch.batch_id) == 0
+        assert self._held("acp-before-reset")
+
+        session_storage.empty_trash([batch.batch_id])
+
+        assert not (crew_log_trash_root() / batch.batch_id).exists()
+        assert _crew_log_exists("acp-before-reset")
+        assert not self._held("acp-before-reset")
+
+    def test_a_manifest_uid_cannot_step_out_of_the_crew_log_staging(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The manifest is agent-writable; its uid must never become a ``..`` path."""
+        from kiro_crew.crew_log.schema import KIND_SESSION
+        from kiro_crew.crew_log.store import crew_log_root, crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-forge", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        # The planted staging: a real unit moved outside the hidden tree, and a manifest
+        # entry whose uid walks back out to it.
+        planted = session_storage.trash_root() / batch.batch_id / "forge"
+        planted.mkdir()
+        staged_uid = crew_log_trash_root() / batch.batch_id / "dashboard_chat-1"
+        for unit_dir in staged_uid.iterdir():
+            unit_dir.rename(planted / unit_dir.name)
+        escape = os.path.relpath(planted, crew_log_trash_root() / batch.batch_id)
+        manifest = session_storage.trash_root() / batch.batch_id / session_storage.MANIFEST_NAME
+        # First after the header, while the batch's crew-log staging still exists for
+        # the ``..`` to walk back out of.
+        header, *entries = manifest.read_text(encoding="utf-8").splitlines()
+        planted_entry = json.dumps({"uid": escape, "files": []})
+        manifest.write_text("\n".join([header, planted_entry, *entries]) + "\n", encoding="utf-8")
+
+        session_storage.restore(batch.batch_id)
+
+        assert not any((crew_log_root(KIND_SESSION)).glob("*")), "a planted unit was published"
+
+    def test_crew_logs_that_cannot_go_back_are_recorded_not_dropped(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed move puts the crew logs back; one it cannot is listed, never lost."""
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _crew_log("acp-recreated", "chat-1")
+
+        def _unstatable(_path):
+            raise OSError("stat failed")
+
+        monkeypatch.setattr(session_storage, "_file_stamp", _unstatable)
+        monkeypatch.setattr(session_storage, "_restore_crew_logs", lambda *_a: None)
+
+        with pytest.raises(SessionStorageError, match="can be restored"):
+            session_storage.move_to_trash(
+                ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+            )
+
+        assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
+        (batch,) = session_storage.list_trash()
+        manifest = session_storage.trash_root() / batch.batch_id / session_storage.MANIFEST_NAME
+        entries = [json.loads(line) for line in manifest.read_text().splitlines()[1:]]
+        assert entries == [{"uid": "dashboard_chat-1", "files": []}]
+        assert any((crew_log_trash_root() / batch.batch_id / "dashboard_chat-1").iterdir())
+
+    def test_a_linked_threads_dir_keeps_the_crew_logs_staged_too(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The restore that refuses a sidecar link takes nothing of the session back."""
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        threads = crew_home / "sessions" / ".threads"
+        threads.mkdir()
+        sidecar = threads / "dashboard_chat-1.json"
+        sidecar.write_text("{}", encoding="utf-8")
+        old = _NOW - 40 * _DAY
+        os.utime(sidecar, (old, old))
+        _crew_log("acp-with-threads", "chat-1")
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        # Linked to a directory INSIDE the session store, so the origin checks pass and
+        # the restore reaches the link refusal itself.
+        threads.rmdir()
+        threads.symlink_to(crew_home / "sessions" / "archive", target_is_directory=True)
+
+        assert session_storage.restore(batch.batch_id) == 0
+
+        assert not _crew_log_exists("acp-with-threads"), "half the session came back"
+
+    def test_empty_refuses_a_batch_holding_crew_logs_its_manifest_does_not_list(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        # What a put-back that could not record its entry leaves behind.
+        stray = crew_log_trash_root() / batch.batch_id / "dashboard_chat-9" / "unit"
+        stray.mkdir(parents=True)
+        (stray / "log.jsonl").write_text("{}\n", encoding="utf-8")
+        skips: list[str] = []
+
+        assert session_storage.empty_trash([batch.batch_id], on_skip=skips.append) == 0
+
+        assert skips == [session_storage.SKIP_UNLISTED_FILES]
+        assert (stray / "log.jsonl").is_file()
+
+    def test_a_batch_removed_behind_the_trash_does_not_authorize_deleting_its_crew_logs(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The batch directory is agent-writable; its absence approves nothing."""
+        from kiro_crew.crew_log.store import crew_log_trash_root
+
+        crew_home, _ = stores
+        _transcript(crew_home, "dashboard_chat-1", size=50, age_days=40)
+        _transcript(crew_home, "dashboard_chat-2", size=50, age_days=40)
+        _crew_log("acp-kept", "chat-1")
+        victim = session_storage.move_to_trash(
+            ["dashboard_chat-1"], reason="manual", index=_index(), now=_NOW
+        )
+        other = session_storage.move_to_trash(
+            ["dashboard_chat-2"], reason="manual", index=_index(), now=_NOW
+        )
+        shutil.rmtree(session_storage.trash_root() / victim.batch_id)
+
+        session_storage.empty_trash([other.batch_id])
+
+        assert any((crew_log_trash_root() / victim.batch_id / "dashboard_chat-1").iterdir())
+
+    def test_a_session_made_only_of_crew_logs_round_trips(self, stores: tuple[Path, Path]) -> None:
+        _crew_log("acp-orphan", "chat-gone")
+
+        units = {u.uid: u for u in session_storage.select_reclaimable(_index(), 0, now=_NOW)}
+        assert set(units) == {"acp-orphan"}
+
+        batch = session_storage.move_to_trash(
+            ["acp-orphan"], reason="manual", index=_index(), now=_NOW
+        )
+        assert batch.sessions == 1
+        assert not _crew_log_exists("acp-orphan")
+
+        assert session_storage.restore(batch.batch_id) == 1
+        assert _crew_log_exists("acp-orphan")
+
+
 class TestActiveExclusion:
     def test_a_mapped_session_protects_both_halves(self, stores: tuple[Path, Path]) -> None:
         crew_home, kiro_home = stores

@@ -77,9 +77,10 @@ otherwise raise into the crew page of every crew in the repository. The write pa
 is the other half -- it lists and folds STRICTLY, because a write validated against
 an empty record could admit a second editor.
 
-**Prerequisite: the crew log is ON.** The crew log is switched on by
-`KIROCREW_CREW_LOG=1` and is OFF by default (the append-only ledger RFC pins it off
-until it graduates). A gateway with it off has NO crew ledger: every record call is
+**Prerequisite: the crew log is ON.** The crew log is ON by default and is switched
+off by setting `KIROCREW_CREW_LOG` to a falsy value (`0`, `false`, `no`, `off`) or to
+any value it does not recognise. A
+gateway with it off has NO crew ledger: every record call is
 refused **409 `crew_log_unavailable`** with a message that names the variable, every
 read folds the empty record, and the one-time carry (below) does not run -- the
 pre-projection files are left untouched until the first successful write, so a

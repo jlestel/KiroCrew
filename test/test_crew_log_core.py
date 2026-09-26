@@ -478,9 +478,9 @@ def test_the_ownership_registry_is_the_documented_partition():
 
 #: The session log's complete vocabulary. Spelled out in full rather than derived
 #: from the ownership registry, so a domain that quietly loses an action is caught --
-#: the registry is prefix-based and would not notice. The shapes are pre-release
-#: while ``KIROCREW_CREW_LOG`` defaults off, so a type may be added, removed or
-#: reshaped; this tuple is what makes such a change deliberate rather than silent.
+#: the registry is prefix-based and would not notice. ``KIROCREW_CREW_LOG`` defaults
+#: on, so installs hold these types and a change to them needs the additive rule or
+#: a migration; this tuple is what makes such a change deliberate rather than silent.
 SESSION_VOCABULARY: tuple[str, ...] = (
     "session/opened",
     "session/closed",

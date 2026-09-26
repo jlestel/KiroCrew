@@ -3587,6 +3587,214 @@ class TestSessionLedgerOnPermanentDelete:
         assert "dashboard_chat-1-100" not in state._slots
 
 
+class TestEveryCrewLogOfTheConversationGoes:
+    """A conversation owns one crew-log unit per ACP id it ran under.
+
+    A reset, an agent or model switch and a provider swap each start a new unit, so a
+    delete that took only the current one left the rest of the history on disk.
+    """
+
+    @staticmethod
+    def _unit(session_id: str, slot: str, *, closed: bool = True) -> None:
+        from crew_log_type_helpers import minimal_data
+
+        from kiro_crew import crew_log as lg
+
+        log = lg.CrewLog.create(
+            lg.KIND_SESSION, session_id, owner="default", agent="kirocrew", slot=slot
+        )
+        log.append("session/opened", minimal_data(lg.KIND_SESSION, "session/opened"), src="gateway")
+        if closed:
+            log.append("session/closed", {"reason": "reset"}, src="gateway")
+        del log
+
+    _exists = staticmethod(TestSessionLedgerOnPermanentDelete._exists)
+
+    @pytest.mark.asyncio
+    async def test_a_reset_predecessor_goes_with_the_current_unit(self, monkeypatch):
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._unit("acp-before-reset", "dashboard_chat-1-100")
+        self._unit("acp-current", "dashboard_chat-1-100", closed=False)
+        slot = _make_slot("dashboard_chat-1-100")
+        state = _make_state({"dashboard_chat-1-100": slot})
+        state.sessions.resumable_sid = MagicMock(return_value="acp-current")
+        # What the locked pre-unlink transaction recorded for this slot.
+        claim = replace(
+            _capture_history_delete_claim(state, "dashboard_chat-1-100"),
+            ledger_excluded_units=frozenset({"acp-before-reset", "acp-current"}),
+        )
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-1-100", delete_claim=claim)
+
+        assert not self._exists("acp-before-reset")
+        assert not self._exists("acp-current")
+
+    @pytest.mark.asyncio
+    async def test_a_row_with_no_open_tab_takes_every_unit_its_header_names(self, monkeypatch):
+        """A unit left without a close by a gateway restart goes too."""
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._unit("acp-first", "chat-7")
+        self._unit("acp-second", "chat-7", closed=False)
+        self._unit("acp-bystander", "chat-8")
+        state = _make_state({})
+
+        await _remove_slot_for_history_key(state, "dashboard:chat-7")
+
+        assert not self._exists("acp-first")
+        assert not self._exists("acp-second")
+        assert self._exists("acp-bystander")
+
+    @pytest.mark.asyncio
+    async def test_a_dashboard_underscore_row_takes_the_units_its_bare_slot_key_named(
+        self, monkeypatch
+    ):
+        """A closed row is listed by its transcript stem; its units name the slot key."""
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._unit("acp-first", "chat-7")
+        self._unit("acp-second", "chat-7", closed=False)
+        self._unit("acp-bystander", "chat-8")
+        state = _make_state({})
+
+        await _remove_slot_for_history_key(state, "dashboard_chat-7")
+
+        assert not self._exists("acp-first")
+        assert not self._exists("acp-second")
+        assert self._exists("acp-bystander")
+
+    @pytest.mark.asyncio
+    async def test_a_row_with_no_open_tab_keeps_what_another_holder_still_uses(self, monkeypatch):
+        """Mapped to another conversation, served by a live slot, or running: all kept.
+
+        A mapping under the deleted row's own key is not a veto: its transcript is the
+        one this delete removed.
+        """
+        _guard_work_ledger_cleanup(monkeypatch)
+        self._unit("acp-shared", "chat-7")
+        self._unit("acp-served", "chat-7")
+        self._unit("acp-running", "chat-7", closed=False)
+        self._unit("acp-own-mapping", "chat-7")
+        mapping = {"acp-shared": "dashboard:chat-9", "acp-own-mapping": "dashboard:chat-7"}
+        state = _make_state({})
+        state.sessions.find_key_by_sid = MagicMock(
+            side_effect=lambda sid, exclude="": (
+                None if mapping.get(sid) == exclude else mapping.get(sid)
+            )
+        )
+        monkeypatch.setattr(
+            sessions_module,
+            "_live_slot_sid",
+            lambda _state, spelling: "acp-served" if spelling == "chat-7" else "",
+        )
+        monkeypatch.setattr(
+            sessions_module, "_live_session_units", lambda _state: frozenset({"acp-running"})
+        )
+
+        await _remove_slot_for_history_key(state, "dashboard:chat-7")
+
+        assert self._exists("acp-shared")
+        assert self._exists("acp-served")
+        assert self._exists("acp-running")
+        assert not self._exists("acp-own-mapping")
+
+
+class TestAKeptCrewLogIsNotLeftExcluded:
+    """A unit the removal did not take stays in its slot's ledger fold."""
+
+    @staticmethod
+    def _run(monkeypatch, *, status=None, raises=False, mapped_after_exclusion=False):
+        from kiro_crew.crew_log import store as crew_log_store
+
+        excluded: list[tuple[str, tuple[str, ...]]] = []
+        given_back: list[tuple[str, tuple[str, ...]]] = []
+
+        def _exclude(slot_key, units):
+            excluded.append((slot_key, tuple(units)))
+            return session_ledger.SlotExclusion(tuple(units), False)
+
+        def _unexclude(slot_key, units, **_k):
+            given_back.append((slot_key, tuple(units)))
+
+        monkeypatch.setattr(session_ledger, "exclude_units", _exclude)
+        monkeypatch.setattr(session_ledger, "unexclude_units", _unexclude)
+        monkeypatch.setattr(
+            crew_log_store, "session_units_by_slot", lambda **_k: {"chat-7": ("acp-kept",)}
+        )
+
+        def _remove(*_a, **_k):
+            if raises:
+                raise RuntimeError("tree unreadable")
+            return status
+
+        monkeypatch.setattr(crew_log_store, "remove_unit", _remove)
+        sessions = MagicMock()
+        calls = {"n": 0}
+
+        def _find(sid, exclude=""):
+            calls["n"] += 1
+            if mapped_after_exclusion and calls["n"] > 1:
+                return "dashboard:chat-9"
+            return None
+
+        sessions.find_key_by_sid = _find
+        sessions_module._remove_session_crew_logs(
+            sessions, "dashboard:chat-7", frozenset({"chat-7"}), None, frozenset()
+        )
+        return excluded, given_back
+
+    @pytest.mark.parametrize("status", ["owned", "failed"])
+    def test_an_unremoved_unit_has_its_exclusion_given_back(self, monkeypatch, status):
+        excluded, given_back = self._run(monkeypatch, status=status)
+        assert excluded == [("chat-7", ("acp-kept",))]
+        assert given_back == [("chat-7", ("acp-kept",))]
+
+    def test_a_removal_that_raised_gives_the_exclusion_back(self, monkeypatch):
+        _excluded, given_back = self._run(monkeypatch, raises=True)
+        assert given_back == [("chat-7", ("acp-kept",))]
+
+    def test_a_unit_mapped_again_after_the_exclusion_is_given_back(self, monkeypatch):
+        _excluded, given_back = self._run(
+            monkeypatch, status="removed", mapped_after_exclusion=True
+        )
+        assert given_back == [("chat-7", ("acp-kept",))]
+
+    def test_a_later_slot_s_failed_exclusion_gives_back_the_earlier_one(self, monkeypatch):
+        """Nothing is removed when any exclusion fails, so none of them may stand."""
+        from kiro_crew.crew_log import store as crew_log_store
+
+        given_back: list = []
+
+        def _exclude(slot_key, units):
+            if slot_key == "chat-8":
+                raise session_ledger.LedgerExclusionError("unwritable")
+            return session_ledger.SlotExclusion(tuple(units), False)
+
+        monkeypatch.setattr(session_ledger, "exclude_units", _exclude)
+        monkeypatch.setattr(
+            session_ledger,
+            "unexclude_units",
+            lambda slot_key, units, **_k: given_back.append((slot_key, tuple(units))),
+        )
+        monkeypatch.setattr(
+            crew_log_store,
+            "session_units_by_slot",
+            lambda **_k: {"chat-7": ("acp-a",), "chat-8": ("acp-b",)},
+        )
+        removed: list = []
+        monkeypatch.setattr(crew_log_store, "remove_unit", lambda *a, **k: removed.append(a))
+        sessions = MagicMock()
+        sessions.find_key_by_sid = lambda sid, exclude="": None
+        sessions_module._remove_session_crew_logs(
+            sessions, "dashboard:chat-7", frozenset({"chat-7", "chat-8"}), None, frozenset()
+        )
+        assert removed == []
+        assert given_back == [("chat-7", ("acp-a",))]
+
+    @pytest.mark.parametrize("status", ["removed", "absent"])
+    def test_a_unit_that_is_gone_stays_excluded(self, monkeypatch, status):
+        _excluded, given_back = self._run(monkeypatch, status=status)
+        assert given_back == []
+
+
 class TestTheExclusionMustNotCatchASuccessorUnit:
     """The listing is by RECYCLABLE slot key, so what it returns needs re-proving."""
 

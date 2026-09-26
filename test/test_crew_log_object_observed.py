@@ -530,7 +530,7 @@ def test_a_disabled_emitter_does_no_fit_work(monkeypatch):
     error and not a feature.
     """
     _unit()
-    monkeypatch.delenv(crew_log_emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(crew_log_emit.CREW_LOG_ENV, "0")
     worked: list[str] = []
     monkeypatch.setattr(
         crew_log_emit,

@@ -1559,7 +1559,9 @@ def _require_crew_log(session_id: str) -> Any:
     if not crew_log_emit.enabled():
         raise CrewLedgerUnavailable(
             "the crew ledger is recorded in the crew's crew log, which is switched off; "
-            f"set {crew_log_emit.CREW_LOG_ENV}=1 to record one"
+            f"{crew_log_emit.CREW_LOG_ENV} is set to 0, false, no, off or an unrecognised value; "
+            "unset it (or remove it from ~/.kiro/crew/.env) and restart the gateway "
+            "to record one"
         )
     from kiro_crew.crew_log.schema import KIND_SESSION
     from kiro_crew.crew_log.store import CrewLog

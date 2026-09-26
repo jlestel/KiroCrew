@@ -297,7 +297,7 @@ def test_record_refuses_when_the_session_has_no_crew_log():
 def test_record_refuses_when_the_crew_log_is_switched_off(monkeypatch):
     key = "chat-off-1"
     _unit(slot=key)
-    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
     crew_log_emit.reset_caches()
     with pytest.raises(sl.LedgerUnavailable, match="KIROCREW_CREW_LOG"):
         _record(key, goal="g")

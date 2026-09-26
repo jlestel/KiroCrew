@@ -59,7 +59,7 @@ import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable, Collection, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -560,6 +560,258 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
 
         forget_unit(unit_id)
     return REMOVE_REMOVED
+
+
+#: A file inside a unit directory that keeps the unit out of retention. The session
+#: trash writes it when a restore that failed could not stage a unit it had already put
+#: back: the unit is then live while the rest of its session is still in the trash, and
+#: the sweep must not expire a unit whose session the user can still restore. Only the
+#: trash removes it, when that session is restored or its batch is emptied.
+TRASH_HOLD_FILE = ".trash-hold"
+
+
+def hold_unit(kind: str, unit_id: str) -> bool:
+    """Keep *unit_id* out of retention until :func:`release_unit_hold`. False when not held.
+
+    The mark is what the sweep reads, so it counts once it exists: a directory sync
+    that fails afterwards is logged, not treated as a failure to hold.
+    """
+    require_kind(kind)
+    try:
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
+        if is_link(named):
+            return False
+        directory = crew_log_dir(kind, unit_id)
+        if not directory.is_dir():
+            return False
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        os.close(os.open(directory / TRASH_HOLD_FILE, flags, 0o600))
+    except (CrewLogError, OSError):
+        log_exception_text(
+            logger, logging.ERROR, "crew log trash: could not hold %s log %r", kind, unit_id
+        )
+        return False
+    try:
+        from kiro_crew.atomic_write import fsync_dir
+
+        fsync_dir(directory)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not sync the hold on %r", unit_id
+        )
+    return True
+
+
+def hold_staged_unit(staged: Path) -> bool:
+    """Mark a unit still in the trash as held, so it is held the moment it is published.
+
+    A restore publishes a session's units before its transcript, and a sweep running in
+    between would otherwise read a closed, expired unit and delete it while the rest of
+    the session is still coming back. The mark rides the rename into the live tree.
+    False when the staged directory is not a real directory under the trash root.
+    """
+    trash = crew_log_trash_root()
+    try:
+        if is_link(trash) or is_link(staged) or not staged.is_relative_to(trash):
+            return False
+        if not staged.is_dir():
+            return False
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        os.close(os.open(staged / TRASH_HOLD_FILE, flags, 0o600))
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not hold staged %s", staged.name
+        )
+        return False
+    return True
+
+
+def release_unit_hold(kind: str, unit_id: str) -> None:
+    """Let *unit_id* age out again; a unit with no hold is left as it is."""
+    require_kind(kind)
+    try:
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
+        if is_link(named):
+            return
+        (crew_log_dir(kind, unit_id) / TRASH_HOLD_FILE).unlink()
+    except FileNotFoundError:
+        return
+    except (CrewLogError, OSError):
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not release the hold on %r", unit_id
+        )
+
+
+def _is_held(directory: Path) -> bool:
+    """Whether *directory* carries a trash hold; an unreadable answer counts as held."""
+    try:
+        (directory / TRASH_HOLD_FILE).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def crew_log_trash_root() -> Path:
+    """Where session trash stages crew logs: ``<data home>/crew-log/trash``.
+
+    Inside the crew-log tree rather than beside the transcripts in the session trash,
+    because that tree is the one the sandbox hides from agents. A staged crew log is
+    later RESTORED into the live tree, so a copy an agent could edit while it waits
+    would be a way to write entries the gateway then reads as its own.
+    """
+    return data_home() / _ROOT_LEAF / "trash"
+
+
+#: Whether a unit directory can be renamed while this process holds its lease. POSIX
+#: renames a directory whatever is open inside it; Windows refuses a directory holding
+#: an open handle, and the held lease IS one. See :func:`stage_unit`.
+_RENAME_UNDER_LEASE = os.name != "nt"
+
+
+def _sync_down(top: Path, leaf: Path) -> None:
+    """Sync *leaf* and every directory above it up to *top*, so a new name survives a crash."""
+    from kiro_crew.atomic_write import fsync_dir
+
+    level = leaf
+    while True:
+        fsync_dir(level)
+        if level == top or top not in level.parents:
+            return
+        level = level.parent
+
+
+def _durable_rename(source: Path, destination: Path) -> bool:
+    """Rename *source* to *destination* and make both names durable. False when it did not.
+
+    The rename alone is not a move a caller may build on: a power loss before the
+    two parent directories are synced can come back to the unit under neither name,
+    or under both. The destination's own chain is synced BEFORE the rename, so the
+    directory it lands in exists on disk first; both parents are synced after it. A
+    sync that fails after the rename puts the unit back and syncs that too, so a False
+    answer means the unit is where it started. If even the rollback cannot be synced,
+    a power loss may still recover the unit under *destination*; that is logged, and it
+    loses nothing -- a crew log left in the trash with no manifest entry is kept there
+    by the session trash, which refuses to delete staging its manifest does not list.
+    """
+    top = data_home() / _ROOT_LEAF
+    _mkdir_private(destination.parent)
+    _sync_down(top, destination.parent)
+    os.rename(source, destination)
+    try:
+        _sync_down(top, destination.parent)
+        _sync_down(top, source.parent)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log: could not sync the move of %s", source.name
+        )
+        try:
+            os.rename(destination, source)
+        except OSError:
+            log_exception_text(
+                logger, logging.ERROR, "crew log: %s is at %s and not synced", source, destination
+            )
+            return True
+        try:
+            _sync_down(top, source.parent)
+            _sync_down(top, destination.parent)
+        except OSError:
+            log_exception_text(
+                logger,
+                logging.ERROR,
+                "crew log: %s was put back at %s but that is not synced; after a power "
+                "loss it may be found at %s instead",
+                source.name,
+                source,
+                destination,
+            )
+        return False
+    return True
+
+
+def stage_unit(kind: str, unit_id: str, destination: Path) -> str:
+    """Move one unit's directory to *destination*, under its lease. A ``REMOVE_*`` status.
+
+    The session trash's counterpart of :func:`remove_unit`: the same sole lease stands
+    between the move and a live writer, so a unit some process is appending to answers
+    ``owned`` and stays where it is. ``removed`` means the unit left the live tree and
+    both names are on disk. *destination* must not exist; it is created under
+    :func:`crew_log_trash_root`.
+
+    On Windows the lease is released before the rename rather than held across it,
+    because Windows refuses to rename a directory that holds an open handle and the
+    lease is one. That refusal is what stands in for the hold: a writer that takes the
+    lease in the gap has its lease file open inside the directory, so the rename fails
+    and the unit stays, exactly as ``owned`` would have left it.
+    """
+    require_kind(kind)
+    named = _checked_crew_log_root(kind) / _store_name(unit_id)
+    if is_link(named):
+        return REMOVE_ABSENT
+    directory = crew_log_dir(kind, unit_id)
+    if not directory.is_dir():
+        return REMOVE_ABSENT
+    trash = crew_log_trash_root()
+    if is_link(trash) or not destination.is_relative_to(trash):
+        raise CrewLogError(
+            f"refusing to stage a crew log outside {trash}: {destination}", code=CODE_BAD_ROOT
+        )
+    try:
+        lease_key = acquire_lease(directory / LEASE_FILE, kind=kind, unit_id=unit_id, sole=True)
+    except CrewLogError as exc:
+        if exc.code == CODE_ALREADY_OWNED:
+            return REMOVE_OWNED
+        raise
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: cannot lease %s log %r", kind, unit_id
+        )
+        return REMOVE_FAILED
+    held = True
+    try:
+        if not _RENAME_UNDER_LEASE:
+            release_lease(lease_key)
+            held = False
+        moved = _durable_rename(directory, destination)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not stage %s log %r", kind, unit_id
+        )
+        return REMOVE_FAILED
+    finally:
+        if held:
+            release_lease(lease_key)
+    # The session-tree projection keeps this unit's record: a staged unit comes back on
+    # restore, and nothing re-derives a record for an unchanged root. A reader that
+    # meets the unit while it is staged gets ``gone``, as it would for a removed one.
+    return REMOVE_REMOVED if moved else REMOVE_FAILED
+
+
+def restore_staged_unit(kind: str, staged: Path) -> "str | None":
+    """Put a unit :func:`stage_unit` moved back into the live tree; its id, or None.
+
+    The unit's own header decides where it goes: its id must fold to the staged
+    directory's name, the same proof :func:`unit_header_slot` requires. An occupied
+    destination is left alone -- a unit recreated since is newer than this copy. The
+    move is synced like the stage (:func:`_durable_rename`).
+    """
+    require_kind(kind)
+    header = None if is_link(staged) else _proved_header(staged)
+    if header is None:
+        return None
+    root = _checked_crew_log_root(kind)
+    target = root / staged.name
+    if is_link(target) or target.exists():
+        return None
+    try:
+        moved = _durable_rename(staged, target)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not restore %s", staged.name
+        )
+        return None
+    return str(header["id"]) if moved else None
 
 
 def _unit_header_object(kind: str, unit_id: str) -> "dict[str, Any] | None":
@@ -1187,21 +1439,19 @@ _TYPE_SESSION_OPENED = "session/opened"
 #: about which state the unit is in.
 _LIFECYCLE_TYPES = frozenset({_TYPE_SESSION_OPENED, _TYPE_SESSION_CLOSED})
 
-#: The ONE close reason that is positive proof the session's ACP id can never be
-#: resumed: ``destroy`` deletes that id's mapping outright
-#: (``_session_map.delete``), unconditionally, inside the registry lock and before
-#: this entry is written. An id absent from the map cannot be resumed by anything.
+#: The close reasons that let a unit age out under ``session.archive_retention_days``.
 #:
-#: ``reset`` is deliberately NOT here, and the reason is worth stating because the
-#: opposite reading is intuitive: a reset does cold-start its successor on a new
-#: id, but its own ``clear_sid`` is guarded by ``if clear_conversation and session
-#: is not None``, so a reset that keeps the conversation emits
-#: ``session/closed {reset}`` while LEAVING the old id mapped -- still resumable,
-#: and its log still needed. ``discarded`` clears the sid unconditionally and would
-#: qualify on that test, but no path writes that reason into a crew log today, so
-#: admitting it would be a rule about a file nothing produces. Every other reason --
-#: a shutdown, a crash, an eviction, or a spelling this build does not know -- ends
-#: the gateway's SERVICE of the session without ending the id's life.
+#: ``destroyed`` is positive proof the session's ACP id can never be resumed:
+#: ``destroy`` deletes that id's mapping outright, inside the registry lock and
+#: before this entry is written. ``reset`` cold-starts the slot on a new id, and the
+#: old id MAY still be resumable; it is collected anyway, on the same retention the
+#: transcript archive already follows: a resume appends ``session/opened``, which
+#: makes the unit open again and so uncollectable, and a unit left closed for the
+#: whole window is history the user's own setting says to expire. Without it every
+#: reset predecessor would be kept forever. Any other reason is kept: nothing states
+#: that its writer finished. A unit that ended with NO close at all -- a gateway
+#: restart and an idle expiry write none -- is covered by the predecessor rule in
+#: :func:`_expired_unit_id` instead.
 #:
 #: This reason is the whole authorization for deleting a unit, and it is read from
 #: the crew log rather than from anything outside it. The obvious alternative -- ask
@@ -1211,11 +1461,19 @@ _LIFECYCLE_TYPES = frozenset({_TYPE_SESSION_OPENED, _TYPE_SESSION_CLOSED})
 #: is revivable" and hands a trusted sweep a positive answer that authorizes
 #: deleting a fenced unit the writer of that file cannot touch directly. Absence of
 #: protection must never be authorization.
-_TERMINAL_CLOSE_REASONS = frozenset({"destroyed"})
+_TERMINAL_CLOSE_REASONS = frozenset({"destroyed", "reset"})
+
+
+#: Whether this process has already said that the sweep is expiring units an earlier
+#: build kept. Those are the units collected by a rule older builds did not have -- a
+#: ``reset`` close, and a predecessor a restart left open -- and an upgrade expires
+#: every one of them on its first pass, so the operator is told once, before the first
+#: goes, how many and under which setting.
+_EARLIER_BUILD_EXPIRY_ANNOUNCED = False
 
 
 def _is_terminal_close(entry: "Entry") -> bool:
-    """Whether *entry*'s reason proves this session's id can never be resumed."""
+    """Whether *entry*'s reason lets its unit age out (see the reason set)."""
     data = entry.data
     reason = data.get("reason") if isinstance(data, dict) else None
     return isinstance(reason, str) and reason in _TERMINAL_CLOSE_REASONS
@@ -1236,7 +1494,7 @@ def sweep_expired(retention_days: int, *, now: float | None = None) -> "tuple[in
     A missing root, or one holding no unit directories, costs a directory listing
     and answers ``(0, 0)``. That is also what makes this de facto gated by
     ``KIROCREW_CREW_LOG`` without reading it: only the emitter creates
-    session units, and the emitter is inert without the flag. Reading the flag
+    session units, and the emitter is inert with the flag off. Reading the flag
     HERE would be worse than not reading it -- turning it off would strand every
     crew log already written, permanently, since nothing else collects them.
 
@@ -1248,10 +1506,13 @@ def sweep_expired(retention_days: int, *, now: float | None = None) -> "tuple[in
     crew outlives every item it dispatched, so ageing one needs a rule of its own
     rather than a session's lifecycle applied to a unit that has none.
 
-    A unit is collectable only when its own log PROVES the session is finished:
+    A unit is collectable only when its own log says the session is finished:
     the newest lifecycle entry is a ``session/closed`` whose reason is one of
-    :data:`_TERMINAL_CLOSE_REASONS`, meaning the gateway cleared that ACP id's
-    mapping during the teardown so it can never be resumed. Nothing outside the
+    :data:`_TERMINAL_CLOSE_REASONS`, and that close is older than the retention
+    window. A unit that is not its slot's newest is collected only together with its
+    slot: the slot's newest unit must itself be expired, so a live slot keeps every unit
+    its work-ledger record is folded from (see :func:`_expired_unit_id`).
+    Nothing outside the
     crew log tree takes part in that decision -- see that constant for why the
     session map was tried for it and removed.
     """
@@ -1274,24 +1535,55 @@ def sweep_expired(retention_days: int, *, now: float | None = None) -> "tuple[in
         # Includes the ordinary case of a root that was never created.
         return (0, 0)
     cutoff_ms = int(((time.time() if now is None else now) - retention_days * 86400) * 1000)
+    slots = _SlotView(cutoff_ms)
+    # Oldest unit of each slot first: a predecessor's verdict reads its slot's newest
+    # unit, which must still be on disk when it is asked.
+    children.sort(key=lambda child: slots.rank(child.name))
     removed = 0
     failed = 0
+    due: "list[tuple[Path, str]]" = []
+    kept_by_earlier_build = 0
     for child in children:
         try:
             if is_link(child) or not child.is_dir():
                 continue
-            unit_id = _expired_unit_id(child, cutoff_ms)
-            if unit_id is None:
-                continue
+            by_new_rule: "list[bool]" = []
+            unit_id = _expired_unit_id(child, cutoff_ms, slots, by_new_rule=by_new_rule)
+        except (CrewLogError, OSError):
+            logger.debug("crew log retention: skipped %s", child.name, exc_info=True)
+            failed += 1
+            continue
+        if unit_id is None:
+            continue
+        due.append((child, unit_id))
+        kept_by_earlier_build += bool(by_new_rule)
+    global _EARLIER_BUILD_EXPIRY_ANNOUNCED
+    if kept_by_earlier_build and not _EARLIER_BUILD_EXPIRY_ANNOUNCED:
+        _EARLIER_BUILD_EXPIRY_ANNOUNCED = True
+        logger.warning(
+            "crew log: expiring %d unit(s) kept by an earlier build under "
+            "session.archive_retention_days=%d",
+            kept_by_earlier_build,
+            retention_days,
+        )
+    for child, unit_id in due:
+        try:
             # Re-read the SAME decision inside the removal's own lease hold. The
             # scan above is a snapshot, and ownership ends between turns by
             # design, so a session can be revived, append its ``session/opened``,
             # finish its turn and release the lease in the window between the two
             # -- after which an unguarded removal would take a live conversation's
             # log while contending with nobody.
-            status = remove_unit(
-                KIND_SESSION, unit_id, guard=partial(_still_expired, cutoff_ms, unit_id)
-            )
+            with _newest_unit_held(child, unit_id, slots) as held:
+                if not held:
+                    # The slot's newest unit cannot be fenced, so nothing proves the
+                    # slot stays expired while this unit goes.
+                    continue
+                status = remove_unit(
+                    KIND_SESSION,
+                    unit_id,
+                    guard=partial(_still_expired, cutoff_ms, unit_id, slots),
+                )
         except (CrewLogError, OSError):
             # One unreadable unit must not stop the pass over the others, and it
             # is not a removal: the unit keeps its history and the next pass sees
@@ -1313,19 +1605,157 @@ def sweep_expired(retention_days: int, *, now: float | None = None) -> "tuple[in
     return (removed, failed)
 
 
-def _still_expired(cutoff_ms: int, expected: str, directory: Path) -> bool:
+class _SlotView:
+    """One sweep's view of which units belong to which slot, from the headers alone.
+
+    Read from the fenced tree, never the session map. The listing is taken once and
+    re-taken only when a unit directory APPEARS -- a new unit may be a slot's new
+    newest -- or when a directory that had no header yet PUBLISHES one, so a pass that
+    removes many units pays one header scan, not one per unit. ``None`` from
+    :meth:`newest_other` means the answer cannot be proved, and every caller reads that
+    as "keep".
+
+    ``create`` makes a unit's directory and publishes its header as a second step, so
+    a directory can exist whose slot nobody can read yet. It may be any slot's new
+    newest unit, which is what would make every other unit of that slot a predecessor
+    of a live slot. So while such a directory is present and was touched after
+    *cutoff_ms*, no slot's newest unit can be named. One left header-less for the whole
+    retention window is not a create in progress, and does not hold the sweep up.
+    """
+
+    def __init__(self, cutoff_ms: "int | None" = None) -> None:
+        self._cutoff_ms = cutoff_ms
+        self._by_slot: "dict[str, tuple[str, ...]] | None" = None
+        self._names: "frozenset[str]" = frozenset()
+        self._ranks: "dict[str, int]" = {}
+        self._pending: "frozenset[str]" = frozenset()
+        self._refresh()
+
+    def _refresh(self) -> None:
+        try:
+            root = _checked_crew_log_root(KIND_SESSION)
+            names = frozenset(child.name for child in root.iterdir())
+            by_slot: "dict[str, tuple[str, ...]] | None" = session_units_by_slot()
+        except Exception:
+            root, names, by_slot = None, frozenset(), None
+        self._names, self._by_slot = names, by_slot
+        self._ranks = {
+            _store_name(unit): index
+            for units in (by_slot or {}).values()
+            for index, unit in enumerate(units)
+        }
+        self._pending = frozenset(
+            name
+            for name in names
+            if root is not None and name not in self._ranks and _awaits_header(root / name)
+        )
+
+    def _pending_blocks(self, root: Path, current: "frozenset[str]") -> bool:
+        """Whether a header-less directory still present may be a create in progress."""
+        for name in self._pending & current:
+            try:
+                touched_ms = int((root / name).stat().st_mtime * 1000)
+            except OSError:
+                continue
+            if self._cutoff_ms is None or touched_ms >= self._cutoff_ms:
+                return True
+        return False
+
+    def rank(self, name: str) -> int:
+        """How many older units *name*'s slot holds; 0 for an unattributed directory."""
+        return self._ranks.get(name, 0)
+
+    def newest_other(self, slot: str, unit_id: str) -> "str | None":
+        """The newest unit of *slot* still on disk, ``""`` when that is *unit_id* itself.
+
+        ``None`` when the listing cannot be made, or while a directory whose header is
+        not published yet may be a newer unit of this slot.
+        """
+        try:
+            root = _checked_crew_log_root(KIND_SESSION)
+            current = frozenset(child.name for child in root.iterdir())
+        except (CrewLogError, OSError):
+            return None
+        published = any(_proved_header(root / name) is not None for name in self._pending & current)
+        if published or current - self._names:
+            self._refresh()
+        if self._by_slot is None or self._pending_blocks(root, current):
+            return None
+        for unit in reversed(self._by_slot.get(slot, ())):
+            if _store_name(unit) in current:
+                return "" if unit == unit_id else unit
+        return ""
+
+
+def _awaits_header(directory: Path) -> bool:
+    """Whether *directory* is a real directory with no provable header yet."""
+    try:
+        if is_link(directory) or not directory.is_dir():
+            return False
+    except OSError:
+        return False
+    return _proved_header(directory) is None
+
+
+@contextmanager
+def _newest_unit_held(directory: Path, unit_id: str, slots: "_SlotView") -> Iterator[bool]:
+    """Fence the slot's newest unit while a predecessor is re-read and removed.
+
+    A predecessor is collectable only while its slot's newest unit is expired, and the
+    guard re-reads that under the predecessor's OWN lease -- which does not stop a
+    resume appending ``session/opened`` to the newest unit in between. Holding the
+    newest unit's per-append lock across the whole removal does, and it is the lock a
+    writer WAITS on: an append that arrives meanwhile blocks and then lands, after the
+    removal, so it is neither lost nor able to revive the slot mid-decision. The
+    non-blocking lease is deliberately not used -- a writer refused by it drops the
+    entry. Yields False when the lock cannot be taken; True, holding nothing, for a unit
+    that is its slot's newest or has no slot.
+    """
+    header = _proved_header(directory)
+    slot = header.get("slot") if header else None
+    newer = slots.newest_other(slot, unit_id) if isinstance(slot, str) and slot else ""
+    if newer is None:
+        yield False
+        return
+    if not newer:
+        yield True
+        return
+    with ExitStack() as fence:
+        try:
+            fence.enter_context(_open_lock(_lock_path(KIND_SESSION, newer)))
+        except (CrewLogError, OSError):
+            yield False
+            return
+        yield True
+
+
+def _still_expired(
+    cutoff_ms: int, expected: str, slots: "_SlotView | None", directory: Path
+) -> bool:
     """The sweep's re-decision, re-derived from the unit as it stands NOW.
 
-    Bound to its first two arguments and handed to :func:`remove_unit` as the
+    Bound to its first three arguments and handed to :func:`remove_unit` as the
     ``guard`` it calls under the lease. Re-deriving the ID as well as the age is
     deliberate: it refuses a directory that changed identity in the same window,
-    so the removal can only proceed against the unit the scan actually chose.
+    so the removal can only proceed against the unit the scan actually chose. For a
+    predecessor it also re-reads the slot's newest unit, so a slot revived since the
+    scan keeps it.
     """
-    return _expired_unit_id(directory, cutoff_ms) == expected
+    return _expired_unit_id(directory, cutoff_ms, slots) == expected
 
 
-def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
+def _expired_unit_id(
+    directory: Path,
+    cutoff_ms: int,
+    slots: "_SlotView | None" = None,
+    *,
+    by_new_rule: "list[bool] | None" = None,
+) -> "str | None":
     """The raw id of the unit in *directory* when it is closed and expired.
+
+    *by_new_rule*, when given, gains one ``True`` when the verdict came from a rule an
+    earlier build did not apply -- a ``reset`` close, or a predecessor that was never
+    closed -- which is what the sweep's one-time upgrade notice counts.
 
     ``None`` means leave it alone, and every path to ``None`` is deliberate:
 
@@ -1334,13 +1764,21 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
       resolves it, and it is accepted only if it folds BACK to this directory's
       own name. A directory no id addresses is not removed, because the removal
       would be aimed by id and would resolve somewhere else.
+    * **A trash hold** (:data:`TRASH_HOLD_FILE`). The unit is live while the rest of
+      its session waits in the trash, so the user can still restore it whole.
     * **A torn tail.** Unterminated trailing bytes are what
       ``open(repair=True)`` truncates, and the sweep cannot tell a dead writer's
       crash artifact from an append that has not yet reached its fsync -- the
       bytes are identical. Deleting the unit would destroy the history the repair
       exists to recover, so the repair gets it and retention does not.
-    * **The newest lifecycle entry is not a ``session/closed``.** An OPEN session
-      is never touched, whatever its age, and this is the check that decides it.
+    * **A predecessor of a live slot.** A unit that is not its slot's newest (per
+      *slots*) is collected only when the slot's newest unit is itself expired, so a
+      slot still in use keeps every unit its work-ledger record is folded from. Such a
+      predecessor is collected when it is closed and expired, or -- a gateway restart
+      and an idle expiry write no close -- when it was never closed and its newest
+      segment has not been written inside the window.
+    * **The newest lifecycle entry is not a ``session/closed``,** for a slot's newest
+      unit or one with no slot. An OPEN session is never touched, whatever its age.
       The pair ``session/opened`` / ``session/closed`` is what moves a unit
       between the two states, so the newest of the PAIR is the answer -- not the
       newest close on its own. A resumed session appends to the crew log it already
@@ -1377,7 +1815,7 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
         ]
     except OSError:
         return None
-    if not segments:
+    if not segments or _is_held(directory):
         return None
     segments.sort(key=lambda pair: pair[0])
     oldest = segments[0][1]
@@ -1405,9 +1843,30 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
         return None
     if tail.empty or tail.torn_offset is not None:
         return None
+    slot = parsed.get("slot") if parsed else None
+    newer = ""
+    if slots is not None and isinstance(slot, str) and slot:
+        found = slots.newest_other(slot, unit_id)
+        if found is None:
+            return None
+        newer = found
+    if newer:
+        newer_dir = unit_dir_for(KIND_SESSION, newer)
+        if newer_dir is None or _expired_unit_id(newer_dir, cutoff_ms) is None:
+            return None
     closed = _last_lifecycle_entry(tail)
     if closed is None or closed.type != _TYPE_SESSION_CLOSED:
-        return None
+        if not newer:
+            return None
+        try:
+            written_ms = int(newest.stat().st_mtime * 1000)
+        except OSError:
+            return None
+        if written_ms >= cutoff_ms:
+            return None
+        if by_new_rule is not None:
+            by_new_rule.append(True)
+        return unit_id
     if not _is_terminal_close(closed):
         return None
     closed_ms = closed.time
@@ -1416,7 +1875,11 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
             closed_ms = int(newest.stat().st_mtime * 1000)
         except OSError:
             return None
-    return unit_id if closed_ms < cutoff_ms else None
+    if closed_ms >= cutoff_ms:
+        return None
+    if by_new_rule is not None and closed.data.get("reason") == "reset":
+        by_new_rule.append(True)
+    return unit_id
 
 
 def _last_lifecycle_entry(tail: _Tail) -> "Entry | None":

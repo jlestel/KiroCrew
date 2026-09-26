@@ -2982,70 +2982,68 @@ async def _remove_slot_for_history_key(
     # scan, so deleting those sidecars cannot be made atomic here. Preserve them:
     # stale state is reversible, while deleting a successor's state is not.
 
-    # The append-only SESSION LEDGER is not one of those sidecars, and the
-    # difference is mechanical rather than a re-reading of the rule above. What
-    # makes a work ledger unsafe to delete here is that its identity is the SLOT
-    # KEY, which is recycled -- a successor tab in the same slot legitimately
-    # inherits and resumes that record, and no check here can prove one is not
-    # about to. A session's log is keyed by the ACP SESSION ID, which never
-    # names a different conversation, so removing it cannot reach a successor's
-    # state.
+    # The append-only CREW LOG is not one of those sidecars, and the difference is
+    # mechanical rather than a re-reading of the rule above. A work ledger's identity
+    # is the SLOT KEY, which is recycled, so no check here can prove a successor is not
+    # about to inherit it. A crew-log unit is keyed by the ACP SESSION ID, and its
+    # header -- written once inside the fenced tree -- names the slot it ran on, so the
+    # units of THIS conversation can be told apart from anyone else's.
     #
-    # Gated on the teardown having SUCCEEDED, not merely on having been
-    # attempted. ``destroy_if`` refuses when the session was replaced by a
-    # successor generation, is busy, or still has a live slot owner -- and in each
-    # of those cases the session it names is preserved and may be writing right
-    # now, so removing its crew log would take a live conversation's log. The write
-    # lease is not a substitute for this check: ownership ends BETWEEN turns by
-    # design, so an idle-but-live session holds nothing for the removal to be
-    # refused by. A refused teardown therefore leaves the crew log alone and the
-    # retention sweep collects it once the session is genuinely closed.
+    # A conversation owns one unit per ACP id it ran under: a reset, an agent or model
+    # switch and a provider swap each start a new one. Which of them this delete takes
+    # depends on what the claim proved.
     #
-    # Only an id this claim PROVED is used -- captured pre-unlink, dropped on every
-    # path that disowned the slot -- so an unresolvable one removes nothing.
-    if session_destroyed and claim.acp_session_id:
-        # A key still mapping to this session id VETOES the removal. The unit is
-        # keyed by the ACP id, so a second key pointing at that id shares this very
-        # crew log, and the teardown above removed only ONE mapping -- the other holder
-        # can still resume, and its log is still needed. Two keys on one sid is a
-        # state the system itself produces: importing a transferred session twice
-        # allocates a new slot key each time and deliberately leaves the source
-        # intact (see dashboard/session_transfer.py). Reading the map to WITHHOLD a
-        # deletion is safe in the way reading it to authorize one is not -- a forged
-        # or emptied map can only make this keep more than it must.
-        try:
-            retained_key = state.sessions.find_key_by_sid(claim.acp_session_id)
-        except Exception:
-            # An unreadable map is not evidence that nothing else maps this id.
-            retained_key = "<unreadable session map>"
-        if retained_key is not None:
-            logger.info(
-                "History delete: session id for %s is still mapped; leaving its crew log "
-                "to retention",
-                key,
+    # * A delete that tore down a slot takes the units the locked transaction excluded
+    #   before the unlink (generation-proved, so never a successor's), plus the
+    #   conversation's own unit only when the teardown SUCCEEDED: ``destroy_if``
+    #   refuses for a replaced, busy or still-owned session, and that session may be
+    #   writing right now. The write lease is no substitute, because ownership ends
+    #   BETWEEN turns by design.
+    # * A row with no open slot takes every unit whose header names the row's own
+    #   exact spelling. No tab was showing it, and the removal still stands down for
+    #   a unit mapped to another conversation, one a live slot or a running session
+    #   serves now, and one a writer holds. The row's spellings are every one its
+    #   slot may have been keyed under, so a ``dashboard_`` history row reaches the
+    #   units its bare slot key named.
+    crew_log_slots = {
+        key,
+        transcript_stem(key),
+        key.removeprefix("dashboard:"),
+        *_history_delete_candidate_keys(key),
+    }
+    crew_log_units: frozenset[str] | None
+    if slot is not None:
+        crew_log_slots.update(
+            spelling
+            for spelling in (
+                getattr(claim.slot, "key", None),
+                claim.session_key,
             )
+            if isinstance(spelling, str) and spelling
+        )
+        proved = set(claim.ledger_excluded_units)
+        own = claim.acp_session_id or ""
+        if session_destroyed and own:
+            proved.add(own)
         else:
-            # Every slot spelling this delete established for itself. The removal
-            # requires the unit's own header to name one of them, because the id
-            # above came from ``session_map.json`` -- inside the agent-visible tree --
-            # while the header is written once inside the fenced crew log tree and
-            # never rewritten. A mapping that named another conversation's session
-            # would aim this removal at that conversation's crew log; its header would
-            # not name this slot. The candidate spellings are included beside the
-            # live slot key so a legacy spelling of the same slot is not read as a
-            # different one.
-            proven_slots = frozenset(
-                spelling
-                for spelling in (
-                    getattr(claim.slot, "key", None),
-                    claim.session_key,
-                    *_history_delete_candidate_keys(key),
-                )
-                if isinstance(spelling, str) and spelling
-            )
-            await asyncio.to_thread(
-                _remove_session_crew_log, claim.acp_session_id, key, proven_slots
-            )
+            proved.discard(own)
+        crew_log_units = frozenset(proved)
+    elif claim.slot is None and claim.complete:
+        crew_log_units = None
+    else:
+        crew_log_units = frozenset()
+    if crew_log_units is None or crew_log_units:
+        protected = _live_session_units(state) | frozenset(
+            sid for spelling in crew_log_slots if (sid := _live_slot_sid(state, spelling))
+        )
+        await asyncio.to_thread(
+            _remove_session_crew_logs,
+            state.sessions,
+            key,
+            frozenset(crew_log_slots),
+            crew_log_units,
+            protected,
+        )
 
     # Cron ownership is different from the independent sidecars above: every key
     # here came from the strict store scan or from linked_session_key while the
@@ -3089,124 +3087,180 @@ async def _remove_slot_for_history_key(
 _CREW_LOG_TEARDOWN_FLUSH_SECONDS = 2.0
 
 
-def _remove_session_crew_log(
-    session_id: str, history_key: str, proven_slots: "frozenset[str]"
+def _live_session_units(state: DashboardState) -> "frozenset[str]":
+    """The crew-log unit of every session the manager is running now. Never raises."""
+    from kiro_crew.crew_log.resolve import unit_for_session_key
+
+    units: set[str] = set()
+    try:
+        keys = tuple(state.sessions.session_keys())
+    except Exception:
+        logger.debug("History delete: running sessions unreadable", exc_info=True)
+        return frozenset()
+    for session_key in keys:
+        try:
+            unit = unit_for_session_key(state.sessions, session_key)
+        except Exception:
+            continue
+        if isinstance(unit, str) and unit:
+            units.add(unit)
+    return frozenset(units)
+
+
+def _remove_session_crew_logs(
+    sessions: Any,
+    history_key: str,
+    slots: "frozenset[str]",
+    proved: "frozenset[str] | None",
+    protected: "frozenset[str]",
 ) -> None:
-    """Remove the append-only crew log of *session_id*. Never raises.
+    """Remove the crew-log units of a deleted conversation. Never raises.
 
-    Imported lazily: this handler module is loaded on every startup while the
-    crew log store is only reachable behind ``KIROCREW_CREW_LOG``, so a
-    launch without the flag should not pay for the import.
+    A unit is a candidate when its HEADER names one of *slots* -- the header is written
+    once inside the fenced crew-log tree and never rewritten, so it does not move when
+    ``session_map.json`` (agent-visible) does -- and, when *proved* is given, it is also
+    one of those ids. It is then kept when:
 
-    *proven_slots* is every slot spelling this delete established for itself, and
-    the unit's own HEADER has to name one of them. The id alone is not enough,
-    because it arrives from ``session_map.json`` -- a file inside the agent-visible
-    tree -- so a mapping that named another conversation's session would aim this
-    removal at that conversation's crew log. The header is the independent answer: it
-    is written once at creation inside the fenced crew log tree and never rewritten,
-    so it does not move when a mapping does, and a unit belonging to another slot
-    fails the check. Slot recycling does not weaken it, because the id is what
-    selects the unit and the slot only has to prove the unit belonged to the slot
-    being deleted.
+    * *protected* names it: a live slot or a running session serves it now;
+    * a session-map key of another conversation still maps it, or the map cannot be
+      read: that holder can resume, and its log is still needed. A key is this
+      conversation's when its transcript is the one this delete removed;
+    * a writer holds its lease.
 
-    A header that cannot be proved -- unreadable, or carrying no slot, which is the
-    case for a session that never ran on a dashboard slot -- removes NOTHING and
-    leaves the unit to the retention sweep, which collects it on age once its close
-    has landed.
+    Every unit taken is excluded from its slot's ledger fold first, so a later session
+    on the same recycled slot key cannot read the deleted conversation's state out of a
+    unit whose removal failed. A kept unit is left to the retention sweep.
 
-    Best-effort, like every other step of this teardown. The transcript row is
-    already gone by the time this runs, so raising would turn a crew log that could
-    not be collected into a failed delete the user has to retry against a row that
-    is absent -- and the retention sweep collects it on age regardless.
-    ``owned`` is the ordinary answer when a queued write still holds the lease,
-    and it is not an error: that pass simply does nothing.
+    Best-effort, like every other step of this teardown: the transcript row is already
+    gone, so raising would turn a crew log that could not be collected into a failed
+    delete the user has to retry against a row that is absent.
     """
+    from kiro_crew import session_ledger
+
     try:
         from kiro_crew.crew_log import emit as crew_log_emit
+        from kiro_crew.crew_log import store as crew_log_store
         from kiro_crew.crew_log.schema import KIND_SESSION
-        from kiro_crew.crew_log.store import (
-            REMOVE_REMOVED,
-            remove_unit,
-            unit_header_slot,
-        )
 
-        # LET THE TEARDOWN ENTRY LAND FIRST, and not as a courtesy: until it does,
-        # this removal cannot succeed at all. ``destroy`` -- the teardown checked
-        # above -- writes ``session/closed`` through the emitter's own thread, and
-        # the emitter releases this session's cached handle, with the write lease
-        # that handle carries, only once that entry lands. A removal claiming the
-        # lease ``sole`` is refused while the handle is held, so without this
-        # barrier the funnel answers ``owned`` for every session the gateway
-        # actually emitted for. Measured directly: a crew log opened through the
-        # emitter answers ``owned``, and ``removed`` only after its close lands.
-        #
-        # A timeout is not a failure and is not treated as one. The entry stays
-        # owed, so the unit becomes collectable by the retention sweep -- which
-        # needs that same close, since a unit whose newest lifecycle entry is not
-        # a close reads as OPEN whatever its age. This pass simply does nothing.
+        # LET THE TEARDOWN ENTRY LAND FIRST: the emitter releases a session's cached
+        # handle, and the write lease that handle carries, only once its close lands.
+        # A timeout is not a failure; the unit is then ``owned`` and left to retention.
         crew_log_emit.flush(timeout=_CREW_LOG_TEARDOWN_FLUSH_SECONDS)
+        by_slot = crew_log_store.session_units_by_slot()
+    except Exception:
+        logger.warning(
+            "History delete: could not list the crew logs of %s", history_key, exc_info=True
+        )
+        return
 
-        header_slot = unit_header_slot(KIND_SESSION, session_id)
-        if header_slot is None or header_slot not in proven_slots:
-            logger.info(
-                "History delete: the session's log for %s names slot %r, which this "
-                "delete did not prove; leaving it to retention",
+    own_stems = set(transcript_stems(history_key)) | {transcript_stem(history_key)}
+
+    def own(mapped: str) -> bool:
+        return transcript_stem(mapped) in own_stems
+
+    def mapped_elsewhere(unit: str) -> bool:
+        try:
+            first = sessions.find_key_by_sid(unit)
+            if first is None:
+                return False
+            if not own(first):
+                return True
+            other = sessions.find_key_by_sid(unit, exclude=first)
+        except Exception:
+            return True
+        return other is not None and not own(other)
+
+    taken: dict[str, list[str]] = {}
+    for slot_key in sorted(slots):
+        for unit in by_slot.get(slot_key, ()):
+            if proved is not None and unit not in proved:
+                continue
+            if unit in protected or mapped_elsewhere(unit):
+                continue
+            taken.setdefault(slot_key, []).append(unit)
+    if not taken:
+        return
+    # What THIS transaction added, per slot: the only exclusions it may take back. A
+    # unit a concurrent delete already excluded is that delete's to keep.
+    added: dict[str, set[str]] = {}
+
+    def give_back(slot_key: str, units: "set[str]") -> None:
+        """Undo this transaction's exclusion of *units*: they stay, so they stay foldable."""
+        mine = tuple(sorted(units & added.get(slot_key, set())))
+        if not mine:
+            return
+        try:
+            session_ledger.unexclude_units(slot_key, mine)
+        except Exception:
+            logger.error(
+                "History delete: crew log(s) %s of %s were kept but stay excluded from slot "
+                "%r's ledger record; restore them by hand in the slot's control directory",
+                ", ".join(mine),
                 history_key,
-                header_slot,
+                slot_key,
+                exc_info=True,
             )
             return
+        added[slot_key] -= set(mine)
 
-        # Every OTHER unit of this slot is excluded from the ledger fold before this
-        # one is removed. A slot accumulates one unit per reset, this funnel removes
-        # only the conversation's own, and the survivors stay readable -- so a fresh
-        # session on the same recycled slot key would fold them and read a deleted
-        # conversation's goal and phase. The slot's OTHER units are excluded before the
-        # transcript is unlinked, under the delete's own lock and against its captured
-        # generation; this stage runs after the unlink, where a rescan by the recyclable
-        # slot key could pick up a successor's unit and hide a live conversation's
-        # record for good. So only THIS conversation's unit is excluded here -- the one
-        # the header check above just proved belongs to the proved slot.
-        from kiro_crew import session_ledger
-
-        session_ledger.exclude_units(header_slot, (session_id,))
-
-        # Accept-all guard, deliberately. The sweep's guard re-reads the crew log
-        # because ITS reason is a property of the file -- an age it sampled outside
-        # the lease. This caller's reason is not in the file at all: the session
-        # this crew log belongs to was destroyed by the teardown above, which is
-        # checked before this runs, and the header check above already proved the
-        # unit is this slot's. Re-reading the age here would answer a question
-        # nobody asked, and a close entry still queued behind the teardown would
-        # make the honest answer "not closed" and skip a crew log whose session is
-        # gone.
-        status = remove_unit(KIND_SESSION, session_id, guard=lambda _dir: True)
+    try:
+        for slot_key, units in taken.items():
+            recorded = session_ledger.exclude_units(slot_key, tuple(units))
+            added[slot_key] = set(getattr(recorded, "added", ()) or ())
     except session_ledger.LedgerExclusionError:
-        # The exclusion is what stops a later session on this recycled slot key from
-        # folding the units this delete leaves behind. Without it the removal is
-        # refused outright: the conversation stays visible and can be deleted again,
-        # whereas its state showing up in a stranger's session cannot be undone.
         logger.error(
-            "History delete: refusing to remove the session's log for %s -- slot %r's "
-            "surviving units could not be excluded from its ledger record",
+            "History delete: refusing to remove the crew logs of %s -- their slot's ledger "
+            "exclusion could not be recorded",
             history_key,
-            header_slot,
         )
+        for slot_key, recorded_units in list(added.items()):
+            give_back(slot_key, set(recorded_units))
         return
     except Exception:
         logger.warning(
-            "History delete: could not remove the session's log for %s",
-            history_key,
-            exc_info=True,
+            "History delete: could not exclude the crew logs of %s", history_key, exc_info=True
         )
+        for slot_key, recorded_units in list(added.items()):
+            give_back(slot_key, set(recorded_units))
         return
-    if status == REMOVE_REMOVED:
-        logger.info("History delete: removed the session's log for %s", history_key)
-    else:
-        logger.info(
-            "History delete: the session's log for %s not removed (%s); leaving it to retention",
-            history_key,
-            status,
-        )
+
+    removed = 0
+    for slot_key, units in taken.items():
+        kept: set[str] = set()
+        for unit in units:
+            # Re-proved here, after the exclusion: a key mapped onto this unit since the
+            # selection makes it another conversation's again, and it must not be taken.
+            if mapped_elsewhere(unit):
+                kept.add(unit)
+                continue
+            # Accept-all guard, deliberately: this caller's reason is not a property of
+            # the file. The conversation was deleted, and every unit a running session
+            # or a live slot serves was left out above; the sole lease still refuses a
+            # unit a writer holds. Re-reading the file would ask whether the unit is
+            # closed, and a gateway restart leaves a finished unit with no close.
+            try:
+                status = crew_log_store.remove_unit(
+                    KIND_SESSION, unit, guard=lambda _directory: True
+                )
+            except Exception:
+                logger.warning("History delete: could not remove crew log %r", unit, exc_info=True)
+                kept.add(unit)
+                continue
+            if status == crew_log_store.REMOVE_REMOVED:
+                removed += 1
+            elif status != crew_log_store.REMOVE_ABSENT:
+                # ``owned`` or ``failed``: the unit is still there and may be written, so
+                # this transaction's exclusion of it comes back out.
+                kept.add(unit)
+                logger.info(
+                    "History delete: crew log %r of %s not removed (%s); leaving it to retention",
+                    unit,
+                    history_key,
+                    status,
+                )
+        give_back(slot_key, kept)
+    if removed:
+        logger.info("History delete: removed %d crew log(s) of %s", removed, history_key)
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:

@@ -7415,7 +7415,7 @@ class TestExtractToolCallUpdate:
         while nothing will read it is work the default path must not do. ``-1``
         distinguishes "not recorded" from a real zero-length output.
         """
-        monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+        monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
         client = self._client()
         msg = self._make_msg(
             {

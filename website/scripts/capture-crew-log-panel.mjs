@@ -12,6 +12,9 @@
  *     proves the section is drawn from theme variables rather than fixed colours.
  *  3. crew-log-empty.png — a session whose folds are all at seq 0: the section
  *     says nothing is recorded instead of rendering five zeroed sections.
+ *  4. crew-log-off.png — the same empty folds with the gateway reporting recording
+ *     switched off: the section says so and names the flag, which the empty frame
+ *     must not.
  *
  * Each scenario ASSERTS before it photographs, so the run exits non-zero when the
  * section is absent or renders the wrong state (a harness that only writes a PNG
@@ -143,7 +146,12 @@ const PANEL_BUCKET = JSON.stringify({
   tabs: [{ id: 'crewlog', kind: 'crewlog', title: 'Crew log' }],
 })
 
-async function renderPanel(browser, base, { theme, bundle, open, close, resolved = true, drained = true }) {
+async function renderPanel(
+  browser, base, {
+    theme, bundle, open, close, resolved = true, drained = true, recording = true,
+    flagValue = 'fasle',
+  },
+) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
   const page = await context.newPage()
   logPageProblems(page)
@@ -168,7 +176,11 @@ async function renderPanel(browser, base, { theme, bundle, open, close, resolved
         // state both change wording on these. A capture that omitted them would
         // photograph the default branch while claiming to show the real one.
         await json(route, {
-          session_id: SLOT, projections: bundle, resolved, writes_drained: drained,
+          session_id: SLOT, projections: bundle, resolved, writes_drained: drained, recording,
+          ...(recording ? {} : {
+            flag_value: flagValue,
+            flag_recognised: ['0', 'false', 'no', 'off'].includes(flagValue.toLowerCase()),
+          }),
         })
         return true
       }
@@ -319,7 +331,7 @@ async function main() {
         'Run a turn to start a new record',
         'may not have run a turn yet',
       ])
-      if (text.includes('Nothing recorded for this session')) {
+      if (text.includes('No messages saved for this chat yet')) {
         throw new Error('unaddressable: claimed nothing was recorded for a torn-down session')
       }
       await shootPanel(page, 'crew-log-unaddressable')
@@ -363,19 +375,82 @@ async function main() {
       const { context, page } = await renderPanel(browser, base, { theme: 'dark', bundle: EMPTY })
       const text = await sectionText(page)
       assertContains('empty', text, [
-        'Nothing recorded for this session', 'up to date; no entries yet',
-        // An empty fold has TWO causes -- recording off, or a session that has
-        // only just started -- and an unresolvable key is indistinguishable from
-        // both. The body must name them rather than assert one, and it owes a
-        // developer somewhere to look AND one thing to do.
-        'To start recording, set KIROCREW_CREW_LOG=1 where the gateway is launched',
-        'one that has just started has nothing folded yet',
-        'docs/reference/crew-log',
+        'No messages saved for this chat yet', 'up to date; no entries yet',
+        'a chat that has just started has none saved yet',
       ])
+      // Recording is on here, so the switch-off instructions belong to the other frame.
+      if (text.includes('KIROCREW_CREW_LOG')) {
+        throw new Error('empty: recording is on but the switch-off instructions are shown')
+      }
       if (text.includes('Lifecycle')) {
         throw new Error('empty: the section rendered fold bodies for a log with no entries')
       }
       await shootPanel(page, 'crew-log-empty')
+      await context.close()
+    }
+
+    {
+      // The gateway reports recording switched off: the one empty state whose fix is
+      // the flag rather than a turn.
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: EMPTY, recording: false,
+      })
+      const text = await sectionText(page)
+      assertContains('off', text, [
+        'The crew log is off',
+        "This chat's messages are not saved.",
+        'KIROCREW_CREW_LOG is set to “fasle”',
+        'which is not a recognised value',
+        'Remove that setting',
+        'what the crew log stores',
+      ])
+      if (text.includes('No messages saved for this chat yet')) {
+        throw new Error('off: said nothing was recorded instead of that recording is off')
+      }
+      const panelText = await page.locator('[data-testid="crew-log-tab"]').innerText()
+      if (panelText.includes('this session is writing now') || panelText.includes('no entries yet')) {
+        throw new Error('off: the footer still describes a record while recording is off')
+      }
+      if (!(await page.getByRole('link', { name: 'what the crew log stores' }).count())) {
+        throw new Error('off: the docs path is not a link')
+      }
+      const notice = page.getByTestId('crew-log-off')
+      if (!(await notice.count()) || !(await notice.getAttribute('class')).includes('bg-warn-subtle')) {
+        throw new Error('off: rendered like the neutral empty state instead of a warning')
+      }
+      await shootPanel(page, 'crew-log-off')
+      await context.close()
+    }
+
+    {
+      // Recording switched off on a chat that already has entries: the warning sits
+      // above the folds, which stay readable, and the footer still describes them.
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: POPULATED, recording: false, flagValue: '0',
+      })
+      const text = await sectionText(page)
+      assertContains('off-entries', text, [
+        'The crew log is off',
+        'KIROCREW_CREW_LOG is set to “0” where the gateway starts.',
+        'Status', 'Usage', 'Timeline', 'Tools', 'Approvals',
+        'up to date through entry 1,842',
+        'this session is writing now',
+      ])
+      if (text.includes('not a recognised value')) {
+        throw new Error('off-entries: a switch-off spelling was worded as unrecognised')
+      }
+      const notice = page.getByTestId('crew-log-off')
+      if (!(await notice.count()) || !(await notice.getAttribute('class')).includes('bg-warn-subtle')) {
+        throw new Error('off-entries: no warning notice above the saved entries')
+      }
+      const above = await page.evaluate(() => {
+        const n = document.querySelector('[data-testid="crew-log-off"]')
+        const status = [...document.querySelectorAll('[data-testid="crew-log-tab"] *')]
+          .find(el => el.textContent?.trim() === 'Status')
+        return Boolean(n && status && (n.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING))
+      })
+      if (!above) throw new Error('off-entries: the warning is not above the fold tables')
+      await shootPanel(page, 'crew-log-off-entries')
       await context.close()
     }
   } finally {

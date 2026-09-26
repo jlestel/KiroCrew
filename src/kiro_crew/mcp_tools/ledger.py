@@ -157,8 +157,10 @@ def session_ledger_read(name: str, args: dict[str, Any]) -> str:
             "This session has no work ledger yet. Use session_ledger_record "
             "to start one when doing long-horizon work. If recording answers "
             "crew_log_unavailable, the ledger is kept in this session's crew log "
-            "and that log is off: start the gateway with KIROCREW_CREW_LOG=1 "
-            "(the env var is the only setting; there is no config key)."
+            "and that log is off because KIROCREW_CREW_LOG is set to 0, false, no, "
+            "off or an unrecognised value: "
+            "unset it (or remove it from ~/.kiro/crew/.env) and restart "
+            "the gateway (the env var is the only setting; there is no config key)."
         )
     return json.dumps({"state": state, "events": events}, indent=2)
 

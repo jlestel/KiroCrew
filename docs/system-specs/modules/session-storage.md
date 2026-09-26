@@ -21,6 +21,13 @@ A conversation's bytes live in two places, owned by two programs:
 | Transcript | `<data home>/sessions/<stem>.jsonl` + `sessions/archive/<stem>__<stamp>.jsonl` | Dashboard history, search, memory consolidation |
 | Replay log | `<kiro home>/sessions/cli/<sid>.json` + `<sid>.jsonl` | kiro-cli, to resume a session |
 
+A third store rides along when the session recorded one: its crew logs,
+`<data home>/crew-log/sessions/<unit>/`, one unit per ACP session id the
+conversation ran under (a reset or model switch starts a new one). A unit joins
+the session whose transcript its header's `slot` names, else the replay log with
+its own id, else it is a row of its own. Its bytes and newest mtime count toward
+the session, and a session any of whose units is mapped is active.
+
 That split is an implementation detail. `StorageReport` carries no per-store
 breakdown and the HTTP payload has no field from which one could be derived, so a
 client can only present a session as one thing with one size. An inventory row
@@ -315,6 +322,30 @@ registering the module fails
 `TestAMalformedTitleCannotCrashTheList` covers the type guard.
 
 ## The trash
+
+### Crew logs are staged in the crew-log tree, not in the batch
+
+The batch directory is agent-writable and the crew-log tree is hidden from the
+sandbox, and a staged file is later RESTORED into the live tree. A crew log waiting
+in the batch could be edited into entries the gateway then reads as its own, so
+crew logs never enter it. After a session's files are staged and its manifest entry
+is written, each of its units is renamed under its sole lease
+(`crew_log.store.stage_unit`) to `<data home>/crew-log/trash/<batch>/<uid>/`, and both
+parent directories are synced before the move counts. Windows refuses to rename a
+directory holding an open handle, and the lease is one, so there the lease is released
+first and the same refusal stops a writer that took it in the gap. A unit a writer
+still holds is left in place. Restore puts a session's units back before its files,
+refusing an occupied name. Each unit is held (`.trash-hold`) before it is published and
+released only once the whole session is back, so a retention sweep running in between
+cannot expire half of a session that is being restored. When the rest of a restore then fails and a unit it
+already put back cannot be staged again -- a resumed session now leases it, or a sync
+fails -- that unit stays live while its session stays in the batch. It is HELD: a
+`.trash-hold` file in the unit directory keeps the retention sweep off it, and
+`<uid>/held` beside the session's staging lists it, so the hold is released when that
+session is restored whole or its batch is emptied. Only emptying the batch the user selected removes its
+crew-log staging: the batch directory is agent-writable, so a batch missing from it
+approves nothing, and its staging is kept. `list_trash` adds the staged crew-log bytes
+to each batch.
 
 Staged batches live at `<data home>/trash/sessions/<batch id>/`, with each file
 kept under a `cli/` or `crew/` subdirectory. The two halves can share a filename,

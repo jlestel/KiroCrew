@@ -296,6 +296,12 @@ folds those ids name is the remaining step, and it must read the walk's own `end
 reason: only `first` means the chain reached the slot's first unit, so any other
 reason totals PART of a life and must not be presented as the whole of one (§8).
 
+`recording` -- false when `KIROCREW_CREW_LOG` has switched the crew log off. Only then
+does the read add `flag_value`: that one variable's value, stripped, printable
+characters only and cut at 40, so the panel can quote the typo that switched it off,
+and `flag_recognised`, whether that value is one of the switch-off spellings, so the
+panel words any other value as unrecognised. No other environment value is sent.
+
 `writes_drained` -- whether the emitter owed nothing when the fold was taken. An
 append is handed to a queue and the entry point returns, so a turn can END with its
 last entries unwritten, and the refresh that turn's end triggers would fold a file
@@ -519,7 +525,7 @@ history in front of it. That is the posture `crew-log-core.md` section 6 states 
 
 A session with no crew log is not an error: the page reads as empty with
 `exists: false`, and each projection is the empty one at seq 0. A session that
-ran with `KIROCREW_CREW_LOG` off has none, and the panel renders without
+ran with `KIROCREW_CREW_LOG=0` has none, and the panel renders without
 first asking whether the file exists.
 
 Both routes are gated on the DASHBOARD OWNER. `resolve` makes no authorization
@@ -559,8 +565,8 @@ socket open the pass folds nothing, because the state stays cached and the next
 growth continues from where it is, so skipping costs no accuracy.
 
 The storage package is imported LAZILY by the handler module, never at import
-time. The crew log is optional behind `KIROCREW_CREW_LOG`, this module sits
-on the dashboard's boot path, and a gateway launched with the flag unset must not
+time. The crew log can be switched off with `KIROCREW_CREW_LOG=0`, this module sits
+on the dashboard's boot path, and a gateway launched with the flag off must not
 pay to load a store it will not read -- the same split the emitter keeps, pinned
 by a test that imports the module in a clean interpreter.
 

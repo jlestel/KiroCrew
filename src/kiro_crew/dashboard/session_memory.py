@@ -300,7 +300,7 @@ class SessionMemorySampler:
         the dashboard's boot path, so the projection is imported here, lazily, and
         only once the flag says there is a store to read -- the same split the
         emitter and the crew-log routes keep, pinned by the tests that launch with
-        the flag unset and assert the package never loaded. Asking the emitter is
+        the flag off and assert the package never loaded. Asking the emitter is
         the one import that is safe: it is pure glue and loads nothing until a write
         or a read reaches storage.
         """

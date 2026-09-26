@@ -6,8 +6,9 @@ dashboard chat path where a lifecycle fact is already known, and every one of
 them is **fail-soft** -- a crew log error is reported once and then swallowed, so a
 broken crew log can never break a turn.
 
-The whole module is inert unless ``KIROCREW_CREW_LOG`` is truthy. With the
-flag off nothing is created and every call returns immediately.
+The module is on by default and inert when ``KIROCREW_CREW_LOG`` is set to a
+falsy value (``0``/``false``/``no``/``off``). With the flag off nothing is
+created and every call returns immediately.
 
 The grouping identity of a session entry is ``data.turn`` -- the runner's own turn
 ordinal -- and, inside a turn, ``data.step``, the MODEL CALL the entry belongs to.
@@ -103,7 +104,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import env_flag_enabled
+from kiro_crew.constants import env_flag_default_on
 from kiro_crew.executors import crew_log_executor
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -115,7 +116,7 @@ if TYPE_CHECKING:  # pragma: no cover -- typing only; the runtime import stays g
 
 logger = logging.getLogger(__name__)
 
-#: Turning this on is a separate change from landing the emitter.
+#: On by default; a falsy value (``0``/``false``/``no``/``off``) switches it off.
 CREW_LOG_ENV = "KIROCREW_CREW_LOG"
 
 _KIND = "session"
@@ -615,7 +616,7 @@ def _crew_log() -> Any:
     gate -- pure glue, no import-time work, no shutdown hook registered until a
     write happens -- and the package it fronts (the store, the schema and the
     lease) stays unloaded until one of the entry points below reaches storage. A
-    launch with ``KIROCREW_CREW_LOG`` unset never imports it, because
+    launch with ``KIROCREW_CREW_LOG`` switched off never imports it, because
     ``enabled()`` refuses before any of those paths is taken.
     """
     global _subsystem
@@ -628,7 +629,7 @@ def _crew_log() -> Any:
 
 def enabled() -> bool:
     """True when the emitter should write. Read per call, never cached."""
-    return env_flag_enabled(CREW_LOG_ENV)
+    return env_flag_default_on(CREW_LOG_ENV)
 
 
 def _notify() -> None:
@@ -4682,8 +4683,8 @@ def on_plan_updated(session_id: str, turn: int, *, items: Any) -> None:
 
     Guarded on the flag HERE rather than relying on :func:`_write`'s own guard,
     because this function does real work before it reaches one: a redaction per task
-    and a serialize probe per admitted row, on the chat loop, for a feature that is
-    off by default. The subagent and background emitters are guarded at their callers
+    and a serialize probe per admitted row, on the chat loop, for a feature that can
+    be switched off. The subagent and background emitters are guarded at their callers
     instead; this and :func:`on_approval_requested` are the two the runner calls
     unconditionally, so they carry their own.
     """

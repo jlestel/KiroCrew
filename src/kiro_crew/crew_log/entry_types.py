@@ -1338,8 +1338,8 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
             "call set -- an omitted field means 'unchanged', which is what lets a partial "
             "update be one line. A phase change carries its event in the SAME entry, so "
             "no reader can observe a phase that moved without its logged reason. The "
-            "ledger therefore DEPENDS on this log: a gateway started without "
-            "``KIROCREW_CREW_LOG=1`` records none, and the tool refuses rather than "
+            "ledger therefore DEPENDS on this log: a gateway started with "
+            "``KIROCREW_CREW_LOG=0`` records none, and the tool refuses rather than "
             "keeping a document of its own."
         ),
     ),

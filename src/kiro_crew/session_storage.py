@@ -14,6 +14,11 @@ Kiro Crew and kiro-cli each own:
 * ``<kiro home>/sessions/cli/<sid>.json`` + ``<sid>.jsonl`` — kiro-cli's replay
   log, read to resume the session.
 
+A session that recorded a crew log also owns ``<data home>/crew-log/sessions/<unit>/``
+directories, one per ACP session id it ran under. They are measured with the session
+and reclaimed with it, but staged inside the crew-log tree rather than the batch (see
+:func:`_stage_crew_logs`).
+
 That split is an implementation detail and never surfaces in a report: callers get
 one total and one session count.
 
@@ -236,6 +241,8 @@ class SessionUnit:
     # tell "in use right now" apart from "idle but the product could resume it",
     # which is the difference between a hazard and a preference.
     live: bool = False
+    #: The crew-log units (ACP session ids) this session owns; see :func:`_crew_log_units`.
+    crew_units: tuple[str, ...] = ()
 
     def age_days(self, now: float) -> float:
         return max(0.0, (now - self.mtime) / _SECONDS_PER_DAY)
@@ -257,6 +264,7 @@ class _RawUnit:
     stems: tuple[str, ...]
     bytes: int
     mtime: float
+    crew_units: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -486,8 +494,15 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
             entry.sid in index.active_sids
             or entry.sid in cotenant
             or any(stem in active_stems for stem in entry.stems)
+            # A crew-log unit is keyed by its ACP session id, so a unit whose id is still
+            # mapped belongs to a session the product can resume.
+            or any(unit in index.active_sids or unit in cotenant for unit in entry.crew_units)
         )
-        live = entry.sid in index.live_sids or any(stem in live_stems for stem in entry.stems)
+        live = (
+            entry.sid in index.live_sids
+            or any(stem in live_stems for stem in entry.stems)
+            or any(unit in index.live_sids for unit in entry.crew_units)
+        )
         units.append(
             SessionUnit(
                 uid=entry.uid,
@@ -497,6 +512,7 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
                 mtime=entry.mtime,
                 active=active,
                 live=live,
+                crew_units=entry.crew_units,
             )
         )
     return units
@@ -686,6 +702,21 @@ def _scan_raw_uncached(sid_for_stem: Mapping[str, str]) -> list[_RawUnit]:
         for uid in list(sizes):
             record(uid, 0, scan_now)
 
+    # Crew-log half: attributed LAST, because the header's slot names a transcript
+    # and the transcripts above are what it is matched against.
+    stem_owner = {stem: uid for uid, owned in stems.items() for stem in owned}
+    crew_units: dict[str, list[str]] = {}
+    for unit_id, slot, crew_files in _crew_log_units():
+        uid = _crew_log_owner(unit_id, slot, stem_owner, sizes)
+        if not uid:
+            continue
+        sids.setdefault(uid, "")
+        stems.setdefault(uid, [])
+        crew_units.setdefault(uid, []).append(unit_id)
+        sizes.setdefault(uid, 0)
+        for size, mtime in crew_files:
+            record(uid, size, mtime)
+
     return [
         _RawUnit(
             uid=uid,
@@ -693,9 +724,379 @@ def _scan_raw_uncached(sid_for_stem: Mapping[str, str]) -> list[_RawUnit]:
             stems=tuple(stems.get(uid, [])),
             bytes=size,
             mtime=mtimes.get(uid, 0.0),
+            crew_units=tuple(crew_units.get(uid, ())),
         )
         for uid, size in sizes.items()
     ]
+
+
+def _crew_log_units() -> list[tuple[str, str, list[tuple[int, float]]]]:
+    """Every session crew-log unit as ``(unit id, header slot, [(size, mtime), ...])``.
+
+    Units come from the crew-log store's own header-proved listing, so a directory
+    whose header does not name it is not attributed to anyone. A unit that cannot be
+    walked is skipped: it is still collected by retention, and a read path answering
+    short costs a slightly low total, never a reclaim that takes the wrong files.
+    """
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    try:
+        unit_ids = crew_store.unit_ids(KIND_SESSION)
+        slot_of = {
+            unit: slot
+            for slot, owned in crew_store.session_units_by_slot().items()
+            for unit in owned
+        }
+    except Exception:
+        logger.debug("crew log store unreadable", exc_info=True)
+        return []
+    found: list[tuple[str, str, list[tuple[int, float]]]] = []
+    for unit_id in unit_ids:
+        directory = crew_store.unit_dir_for(KIND_SESSION, unit_id)
+        if directory is None:
+            continue
+        try:
+            files = _tree_files(directory)
+        except OSError:
+            logger.debug("crew log %r unreadable", unit_id, exc_info=True)
+            continue
+        found.append((unit_id, slot_of.get(unit_id, ""), files))
+    return found
+
+
+def _crew_log_owner(
+    unit_id: str, slot: str, stem_owner: Mapping[str, str], units: Mapping[str, int]
+) -> str:
+    """The session a crew-log unit belongs to, or ``""`` when it cannot be named.
+
+    The header's slot is the conversation: a dashboard slot's transcript is
+    ``dashboard_<slot>`` and a channel slot's IS its stem, so every unit a reset left
+    behind joins the transcript it wrote beside. Without a matching transcript the
+    unit joins the replay log that shares its id, and otherwise it is a row of its own.
+    """
+    if slot:
+        for stem in (slot, f"dashboard_{slot}"):
+            owner = stem_owner.get(stem)
+            if owner:
+                return owner
+    if unit_id in units:
+        return unit_id
+    return unit_id if _UNIT_ID_RE.match(unit_id) else ""
+
+
+def _tree_files(directory: Path) -> list[tuple[int, float]]:
+    """``(size, mtime)`` of every regular file under *directory*, links not followed."""
+    found: list[tuple[int, float]] = []
+    pending = [directory]
+    while pending:
+        with os.scandir(pending.pop()) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    info = entry.stat(follow_symlinks=False)
+                    found.append((info.st_size, info.st_mtime))
+    return found
+
+
+def _tree_bytes(directory: Path) -> int:
+    """Total size of the regular files under *directory*; 0 when it cannot be read."""
+    try:
+        return sum(size for size, _mtime in _tree_files(directory))
+    except OSError:
+        return 0
+
+
+#: Lists, one per line, the units a failed restore left live and held for a session.
+_CREW_HOLDS_FILE = "held"
+
+
+def _crew_staging(batch_id: str, uid: str = "") -> Path:
+    """Where a batch (or one of its sessions) stages crew logs, inside the crew-log tree.
+
+    *uid* reaches here from a manifest, which is agent-writable, so it must be a bare
+    unit id before it becomes a path segment: a ``..`` would otherwise step out of the
+    hidden tree and let a restore publish an agent-written directory as a crew log.
+    """
+    from kiro_crew.crew_log.store import crew_log_trash_root
+
+    if uid and not _UNIT_ID_RE.match(uid):
+        raise SessionStorageError(f"not a valid session id: {uid!r}")
+    base = crew_log_trash_root() / batch_id
+    return base / uid if uid else base
+
+
+def _stage_crew_logs(batch_id: str, uid: str, unit_ids: tuple[str, ...]) -> tuple[bool, int]:
+    """Stage every crew-log unit of *uid* for *batch_id*: ``(all moved, bytes staged)``.
+
+    Not into the batch directory: that tree is agent-writable, the crew-log tree is
+    hidden from the sandbox, and a restore publishes staged files back into the live
+    tree -- so a crew log waiting in the batch could be edited into entries the
+    gateway later reads as its own. Each unit is renamed under its sole lease
+    (:func:`kiro_crew.crew_log.store.stage_unit`).
+
+    All or nothing, like the session's other halves: a unit a writer still holds
+    means the session is in use, so the units already staged are put back and the
+    caller leaves the whole session where it is. A unit already gone is not a
+    failure -- there is nothing of it left to split.
+    """
+    if not unit_ids:
+        return True, 0
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    base = _crew_staging(batch_id, uid)
+    staged = 0
+    for unit_id in unit_ids:
+        directory = crew_store.unit_dir_for(KIND_SESSION, unit_id)
+        if directory is None:
+            continue
+        size = _tree_bytes(directory)
+        try:
+            status = crew_store.stage_unit(KIND_SESSION, unit_id, base / directory.name)
+        except Exception:
+            logger.warning("could not stage crew log %r of %r", unit_id, uid, exc_info=True)
+            status = crew_store.REMOVE_FAILED
+        if status == crew_store.REMOVE_REMOVED:
+            staged += size
+        elif status != crew_store.REMOVE_ABSENT:
+            logger.warning(
+                "crew log %r of %r could not move (%s); leaving it", unit_id, uid, status
+            )
+            return False, 0
+    return True, staged
+
+
+def _put_back_crew_logs(manifest: IO[str], batch_id: str, uid: str) -> bool:
+    """Return *uid*'s staged crew logs to the live tree; False when some had to stay.
+
+    A unit stays staged when its name was taken while it was away -- a resume that
+    recreated it. The staged copy is then the only one of that earlier history, so it
+    is recorded in the manifest as a crew-log-only entry: listed, restorable, and
+    never removed except by an empty the user asks for. The caller reports it rather
+    than calling the session left in place.
+    """
+    if _restore_crew_logs(batch_id, uid) is not None:
+        return True
+    try:
+        _append_entry(manifest, {"uid": uid, "files": []})
+    except OSError:
+        logger.error(
+            "could not record the staged crew logs of %r; they are in %s",
+            uid,
+            _crew_staging(batch_id, uid),
+            exc_info=True,
+        )
+    return False
+
+
+def _sync_batch_or_warn(
+    target: Path, staged_dirs: set[Path], manifest: IO[str], source_dirs: set[Path]
+) -> None:
+    """:func:`_sync_batch` on a path that is already failing: a sync error is logged.
+
+    The refusal that follows names where the staged units are, which is the pointer an
+    operator needs; replacing it with an ``OSError`` would lose that.
+    """
+    try:
+        _sync_batch(target, staged_dirs, manifest, source_dirs)
+    except OSError:
+        logger.warning("could not sync %s before refusing", target, exc_info=True)
+
+
+def _crew_logs_left_staged(uid: str, target: Path) -> SessionStorageError:
+    """The refusal for a session whose crew logs could not all be put back."""
+    return SessionStorageError(
+        f"session {uid!r} changed while being staged and some of its crew logs could "
+        f"not be put back; they are recorded in {target} and can be restored"
+    )
+
+
+def _staged_crew_dirs(batch_id: str, uid: str) -> list[Path]:
+    """The crew-log units staged for *uid* in *batch_id*, links never followed.
+
+    Empty for a *uid* that is not a bare unit id: such a manifest entry names no
+    staging this module wrote.
+    """
+    if not _UNIT_ID_RE.match(uid):
+        return []
+    base = _crew_staging(batch_id, uid)
+    try:
+        if platform_compat.is_link_or_junction(base) or not base.is_dir():
+            return []
+        return sorted(
+            child
+            for child in base.iterdir()
+            if child.is_dir() and not platform_compat.is_link_or_junction(child)
+        )
+    except OSError:
+        return []
+
+
+def _restore_crew_logs(batch_id: str, uid: str) -> list[tuple[str, Path]] | None:
+    """Put back every crew-log unit staged for *uid*: what went back, or None.
+
+    All or nothing: when one cannot go back -- its name is occupied by a unit created
+    since, which is newer -- the ones already restored are staged again and None is
+    returned, so the caller keeps the session in the batch with every half together.
+
+    Each unit is HELD before it is published, so a retention sweep running before the
+    rest of the session is back cannot expire it. The caller releases the holds with
+    :func:`_release_restored_holds` once the whole session has been restored.
+    """
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    restored: list[tuple[str, Path]] = []
+    if not _UNIT_ID_RE.match(uid):
+        return restored
+    for staged in _staged_crew_dirs(batch_id, uid):
+        held = crew_store.hold_staged_unit(staged)
+        unit_id = crew_store.restore_staged_unit(KIND_SESSION, staged) if held else None
+        if unit_id is None:
+            logger.warning("crew log %r of %r could not be restored", staged.name, uid)
+            _return_crew_logs(batch_id, uid, restored)
+            return None
+        restored.append((unit_id, staged))
+    for directory in (_crew_staging(batch_id, uid), _crew_staging(batch_id)):
+        with suppress(OSError):
+            directory.rmdir()
+    return restored
+
+
+def _return_crew_logs(batch_id: str, uid: str, restored: list[tuple[str, Path]]) -> None:
+    """Stage again the crew-log units a failed restore had already put back.
+
+    A unit that cannot go back -- a resumed session now writes it, or a sync failed --
+    stays live while the rest of its session stays in the batch. It is HELD out of
+    retention (:func:`kiro_crew.crew_log.store.hold_unit`) and recorded beside the
+    session's staging, so the sweep cannot expire half of a session the user can still
+    restore; the hold is released when that session is restored or the batch emptied.
+    """
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    held: list[str] = []
+    for unit_id, staged in reversed(restored):
+        try:
+            status = crew_store.stage_unit(KIND_SESSION, unit_id, staged)
+        except Exception:
+            status = crew_store.REMOVE_FAILED
+        if status != crew_store.REMOVE_REMOVED:
+            logger.error(
+                "crew log %r was restored alone (%s); holding it out of retention until "
+                "session %r is restored or trash batch %r is emptied",
+                unit_id,
+                status,
+                uid,
+                batch_id,
+            )
+            if crew_store.hold_unit(KIND_SESSION, unit_id):
+                held.append(unit_id)
+    if held:
+        _record_crew_holds(batch_id, uid, held)
+
+
+def _release_restored_holds(restored: list[tuple[str, Path]]) -> None:
+    """Let the units a committed restore put back age out again."""
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    for unit_id, _staged in restored:
+        crew_store.release_unit_hold(KIND_SESSION, unit_id)
+
+
+def _crew_holds_path(batch_id: str, uid: str) -> Path:
+    """Where the units held for *uid* in *batch_id* are listed, inside the hidden tree."""
+    return _crew_staging(batch_id, uid) / _CREW_HOLDS_FILE
+
+
+def _read_crew_holds(path: Path) -> list[str]:
+    """The unit ids listed in *path*; empty when there is none or it is a link."""
+    try:
+        if platform_compat.is_link_or_junction(path):
+            return []
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        logger.warning("could not read the crew-log holds in %s", path, exc_info=True)
+        return []
+    return [line for line in text.splitlines() if _UNIT_ID_RE.match(line)]
+
+
+def _record_crew_holds(batch_id: str, uid: str, unit_ids: list[str]) -> None:
+    """Add *unit_ids* to the holds listed for *uid*. A unit whose listing fails stays held."""
+    path = _crew_holds_path(batch_id, uid)
+    listed = dict.fromkeys([*_read_crew_holds(path), *unit_ids])
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write(path, "".join(f"{unit_id}\n" for unit_id in listed), fsync=True)
+    except OSError:
+        logger.error(
+            "could not record the crew-log holds of %r; %s stay held",
+            uid,
+            ", ".join(unit_ids),
+            exc_info=True,
+        )
+
+
+def _release_crew_holds(batch_id: str, uid: str) -> None:
+    """Release every hold recorded for *uid* in *batch_id*: its session is whole or gone."""
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    if not _UNIT_ID_RE.match(uid):
+        return
+    path = _crew_holds_path(batch_id, uid)
+    for unit_id in _read_crew_holds(path):
+        crew_store.release_unit_hold(KIND_SESSION, unit_id)
+    with suppress(OSError):
+        path.unlink()
+    for directory in (path.parent, path.parent.parent):
+        with suppress(OSError):
+            directory.rmdir()
+
+
+def _unlisted_crew_staging(batch: Path) -> list[str]:
+    """The sessions with crew logs staged for *batch* that its manifest does not list.
+
+    The crew-log counterpart of :func:`_unlisted_files`: a unit staged for a session no
+    entry names is still the only copy of that history, so nothing that removes the
+    batch may remove it. An unreadable manifest lists nothing, the safe direction.
+    """
+    parsed = _read_manifest(batch)
+    listed = {str(entry.get("uid") or "") for entry in parsed[1]} if parsed else set()
+    base = _crew_staging(batch.name)
+    try:
+        if platform_compat.is_link_or_junction(base) or not base.is_dir():
+            return []
+        staged = sorted(child.name for child in base.iterdir())
+    except OSError:
+        return [base.name]
+    return [uid for uid in staged if uid not in listed]
+
+
+def _discard_crew_staging(batch_id: str) -> int:
+    """Remove a batch's crew-log staging for good; the bytes it held.
+
+    Called only for a batch the user selected and that was emptied without a skip.
+    Nothing else removes crew-log staging: the batch directory is agent-writable, so
+    its absence is no evidence the user approved deleting what it staged.
+    """
+    base = _crew_staging(batch_id)
+    try:
+        if platform_compat.is_link_or_junction(base) or not base.is_dir():
+            return 0
+        uids = [child.name for child in base.iterdir()]
+    except OSError:
+        return 0
+    size = _tree_bytes(base)
+    for uid in uids:
+        _release_crew_holds(batch_id, uid)
+    shutil.rmtree(base, ignore_errors=True)
+    return 0 if base.exists() else size
 
 
 def _cli_index() -> dict[str, list[Path]]:
@@ -1882,6 +2283,10 @@ def _discard_restored_batch(batch: Path, expect: tuple[int, int] | None) -> None
         # Not knowing is treated exactly like finding leftovers: keep the batch.
         logger.warning("keeping trash batch %r: %s", batch.name, exc)
         return
+    if _unlisted_crew_staging(batch):
+        # Removing the batch would leave that staging to the prune, which deletes it.
+        logger.warning("keeping trash batch %r: it holds unlisted crew-log staging", batch.name)
+        return
     if leftovers:
         logger.warning(
             "keeping trash batch %r: %d staged file(s) are absent from its manifest, "
@@ -2670,6 +3075,8 @@ def _move_to_trash_locked(
             return False
         if unit.active or (unit.sid and unit.sid in live_sids):
             return True
+        if any(crew in live_sids for crew in unit.crew_units):
+            return True
         return any(stem in live_stems for stem in unit.stems)
 
     blocked = [uid for uid in requested if is_live(uid)]
@@ -2796,6 +3203,16 @@ def _move_to_trash_locked(
                         "could not remove the search index copy for %r; not moving it", uid
                     )
                     refused_index.append(uid)
+                    continue
+                # The crew logs go FIRST: renaming a unit is refused while a writer
+                # holds it, which means the session is in use, and nothing else of the
+                # session has moved yet to put back. Every rollback below returns them.
+                crew_ok, crew_bytes = _stage_crew_logs(batch_id, uid, unit.crew_units)
+                if not crew_ok:
+                    if not _put_back_crew_logs(manifest, batch_id, uid):
+                        _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                        raise _crew_logs_left_staged(uid, target)
+                    revived.append(uid)
                     continue
                 files: list[dict[str, Any]] = []
                 done: list[tuple[Path, Path]] = []
@@ -2927,6 +3344,7 @@ def _move_to_trash_locked(
                     # where its fragment is; replacing that with an OSError would cost
                     # the operator the only pointer to the fragment in exchange for
                     # information the log line already carries.
+                    _put_back_crew_logs(manifest, batch_id, uid)
                     try:
                         _sync_batch(target, staged_dirs, manifest, source_dirs)
                     except OSError:
@@ -2942,6 +3360,9 @@ def _move_to_trash_locked(
                         f"not be fully put back; what is still staged is recorded in "
                         f"{target} and can be restored"
                     )
+                if not _put_back_crew_logs(manifest, batch_id, uid):
+                    _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                    raise _crew_logs_left_staged(uid, target)
                 revived.append(uid)
                 continue
             if failed:
@@ -2951,6 +3372,9 @@ def _move_to_trash_locked(
                 # the trash would destroy one half of a session nobody knew was
                 # split. Put back whatever moved and leave the session alone.
                 _rollback(done)
+                if not _put_back_crew_logs(manifest, batch_id, uid):
+                    _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                    raise _crew_logs_left_staged(uid, target)
                 continue
             if files:
                 # The manifest is what makes a move reversible, so a session that
@@ -2969,9 +3393,12 @@ def _move_to_trash_locked(
                     except OSError:
                         logger.warning("could not rewind the manifest", exc_info=True)
                     _rollback(done)
+                    if not _put_back_crew_logs(manifest, batch_id, uid):
+                        _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                        raise _crew_logs_left_staged(uid, target)
                     continue
                 moved_sessions += 1
-                moved_bytes += sum(int(record["bytes"]) for record in files)
+                moved_bytes += sum(int(record["bytes"]) for record in files) + crew_bytes
                 # The attachments directories this unit drained are now empty
                 # shells; a restore recreates one on demand. Removed under the
                 # unit's transcript locks, re-taken for this step: a writer that
@@ -2994,6 +3421,19 @@ def _move_to_trash_locked(
                                 pass
                 except Exception:
                     logger.debug("could not take the lock to remove an empty attachments dir")
+            elif _staged_crew_dirs(batch_id, uid):
+                # A session made only of crew logs still needs its manifest entry: it
+                # is how restore finds the uid whose units to put back.
+                try:
+                    _append_entry(manifest, {"uid": uid, "files": []})
+                except OSError:
+                    logger.warning("could not record session %r; putting it back", uid)
+                    if not _put_back_crew_logs(manifest, batch_id, uid):
+                        _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                        raise _crew_logs_left_staged(uid, target)
+                    continue
+                moved_sessions += 1
+                moved_bytes += crew_bytes
         # Inside the handle's scope, so the manifest can still be synced through the
         # descriptor that wrote it. Closing only flushes to the OS.
         _sync_batch(target, staged_dirs, manifest, source_dirs)
@@ -3107,7 +3547,7 @@ def list_trash() -> list[TrashBatch]:
                 created_at=float(created) if isinstance(created, (int, float)) else 0.0,
                 reason=str(header.get("reason") or ""),
                 sessions=sessions,
-                bytes=staged_bytes,
+                bytes=staged_bytes + _tree_bytes(_crew_staging(candidate.name)),
             )
         )
     batches.sort(key=lambda b: b.created_at, reverse=True)
@@ -3196,7 +3636,22 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
                 blocked = True
                 break
             planned.append((src, origin))
+        if not blocked and not files and _staged_crew_dirs(batch_id, uid):
+            crew_only = _restore_crew_logs(batch_id, uid)
+            if crew_only is None:
+                remaining.append(entry)
+            else:
+                _release_restored_holds(crew_only)
+                _release_crew_holds(batch_id, uid)
+                restored += 1
+            continue
         if blocked or not planned:
+            remaining.append(entry)
+            continue
+        # The crew logs go back FIRST and are staged again if anything below fails,
+        # so a session is restored with all of its halves or left staged with all.
+        crew_back = _restore_crew_logs(batch_id, uid)
+        if crew_back is None:
             remaining.append(entry)
             continue
         crew_sessions = _crew_sessions_dir()
@@ -3223,6 +3678,7 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
         ):
             # A link where the sidecar directory should be would carry the
             # restore outside the session store; leave the batch staged.
+            _return_crew_logs(batch_id, uid, crew_back)
             remaining.append(entry)
             continue
         done_prelock: list[tuple[Path, Path]] = []
@@ -3245,6 +3701,7 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
                 done_prelock.append((origin, src))
             if lost_race:
                 _rollback(done_prelock)
+                _return_crew_logs(batch_id, uid, crew_back)
                 remaining.append(entry)
                 continue
 
@@ -3302,6 +3759,7 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
                     done_transcripts.clear()
             if lost_race:
                 _rollback(done_prelock)
+                _return_crew_logs(batch_id, uid, crew_back)
                 remaining.append(entry)
                 continue
         except (OSError, HistoryLockTimeout):
@@ -3310,8 +3768,11 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
             # archive rollback stays outside that lock because it can copy
             # unbounded files across filesystems.
             _rollback(done_prelock)
+            _return_crew_logs(batch_id, uid, crew_back)
             remaining.append(entry)
             continue
+        _release_restored_holds(crew_back)
+        _release_crew_holds(batch_id, uid)
         restored += 1
 
     if remaining:
@@ -4637,6 +5098,16 @@ def _empty_trash_locked(
             )
             _skipped(SKIP_UNLISTED_FILES)
             continue
+        stray_crew = _unlisted_crew_staging(resolved)
+        if stray_crew:
+            logger.warning(
+                "refusing to empty %r: crew logs of %d session(s) are staged but absent "
+                "from its manifest, so this would delete the only copy",
+                target.name,
+                len(stray_crew),
+            )
+            _skipped(SKIP_UNLISTED_FILES)
+            continue
         # An approval map that was SUPPLIED and does not name this batch is not the same as
         # no approval at all. `staged_targets` leaves out a batch whose identity it could not
         # read, and treating that as "nothing to check" would delete it unverified - the one
@@ -4656,4 +5127,6 @@ def _empty_trash_locked(
         freed += deleted
         if skip is not None:
             _skipped(skip)
+        else:
+            freed += _discard_crew_staging(target.name)
     return freed

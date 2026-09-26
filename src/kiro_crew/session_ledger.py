@@ -1891,7 +1891,9 @@ def _require_crew_log(session_id: str) -> Any:
     if not crew_log_emit.enabled():
         raise LedgerUnavailable(
             "the session ledger is recorded in this session's crew log, which is "
-            f"switched off; set {crew_log_emit.CREW_LOG_ENV}=1 to record one"
+            f"switched off because {crew_log_emit.CREW_LOG_ENV} is set to 0, false, no, off or an "
+            "unrecognised value; unset it (or remove it from ~/.kiro/crew/.env) and "
+            "restart the gateway to record one"
         )
     projection = _projection()
     from kiro_crew.crew_log.schema import KIND_SESSION

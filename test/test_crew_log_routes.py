@@ -542,6 +542,46 @@ async def test_the_batch_read_reports_whether_the_writer_owed_anything():
 
 
 @pytest.mark.asyncio
+async def test_the_fold_read_says_whether_the_gateway_is_recording(monkeypatch):
+    """An empty fold cannot say why, so the read names the flag state beside it."""
+    handle = _log()
+    _opened(handle)
+    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    on = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert on["recording"] is True
+    assert "flag_value" not in on
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "off")
+    off = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert off["recording"] is False
+    assert off["flag_value"] == "off"
+    assert off["flag_recognised"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_fold_read_quotes_only_the_flag_value_that_switched_recording_off(
+    monkeypatch,
+):
+    """The panel names the typo; nothing else from the environment is sent."""
+    handle = _log()
+    _opened(handle)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", " fasle\x1b[31m" + "x" * 80 + " ")
+    monkeypatch.setenv("KIROCREW_TEST_SECRET_NEIGHBOUR", "do-not-send")
+    off = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert off["recording"] is False
+    assert off["flag_value"].startswith("fasle[31m")
+    assert len(off["flag_value"]) == 40
+    assert "\x1b" not in off["flag_value"]
+    assert off["flag_recognised"] is False
+    assert "do-not-send" not in json.dumps(off)
+
+
+@pytest.mark.asyncio
 async def test_the_settle_step_waits_on_the_emitter_s_own_flush():
     """The drain must be the emitter's, not a local guess at what quiet means.
 
@@ -1127,13 +1167,13 @@ def test_the_flag_name_matches_the_emitters_own_constant():
 
 @pytest.mark.asyncio
 async def test_installing_with_the_flag_off_builds_nothing(monkeypatch):
-    """A launch without the flag must not pay for the subsystem it will not use.
+    """A launch with the flag off must not pay for the subsystem it will not use.
 
     The installer runs on the gateway's boot path. With the crew log off it returns
     without importing the emitter and without constructing a publisher, so a
     disabled launch does no optional work and registers no listener.
     """
-    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "0")
     monkeypatch.setattr(routes, "_publisher", None)
     from kiro_crew.crew_log import emit as crew_log_emit
 
@@ -1236,6 +1276,12 @@ def test_the_enable_hint_names_the_real_flag():
     assert routes.CREW_LOG_ENV in routes.CREW_LOG_ENABLE_HINT
 
 
+def test_the_enable_hint_says_to_unset_the_flag_not_to_set_it():
+    """The log is on by default, so the only way to be off is a falsy value."""
+    assert "unset" in routes.CREW_LOG_ENABLE_HINT
+    assert f"{routes.CREW_LOG_ENV}=1" not in routes.CREW_LOG_ENABLE_HINT
+
+
 def test_the_enable_hint_names_the_live_data_home_not_the_legacy_one():
     """An agent is told to edit this file, so naming the wrong one wastes the turn.
 
@@ -1266,13 +1312,22 @@ def test_the_page_reader_is_the_one_shared_implementation():
 
 def test_a_read_with_the_flag_off_says_how_to_switch_it_on(monkeypatch):
     """MUTATION-SENSITIVE: the agent learns the flag state from THIS refusal."""
-    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "0")
     request = _internal_request("/api/crew-log/sessions")
     response = asyncio.run(routes.api_crew_log_sessions(request))
     assert response.status == 422
     body = json.loads(response.text)
     assert body["code"] == "crew_log_disabled"
     assert routes.CREW_LOG_ENV in body["error"]
+
+
+def test_a_read_with_the_flag_unset_is_not_refused(monkeypatch):
+    """The crew log is on by default, so an install that never set the flag reads."""
+    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    request = _internal_request("/api/crew-log/sessions")
+    response = asyncio.run(routes.api_crew_log_sessions(request))
+    assert response.status != 422
+    assert json.loads(response.text).get("code") != "crew_log_disabled"
 
 
 #: A conductor, its child and its grandchild, plus a session in another tree. The

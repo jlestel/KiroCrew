@@ -4,10 +4,11 @@
 per-session crew log `kiro_crew.crew_log` keeps for each ACP session id. It is a **writer
 only**: it owns which facts matter and where they are known, not storage or its layout.
 
-The emitter is gated behind `KIROCREW_CREW_LOG=1` (`constants.env_flag_enabled`,
-read per call, truthy set `{1, true, yes, on}`) and defaults **OFF**, so this module is
-inert until a later change turns it on. With the flag off no per-session crew-log unit is
-created and no emitter call reaches the storage library. The shared `crew-log` root is still
+The emitter defaults **ON** and is switched off by `KIROCREW_CREW_LOG=0`
+(`constants.env_flag_default_on`, read per call, case- and space-insensitive: unset,
+empty or a truthy value `{1, true, yes, on}` leaves it on; `{0, false, no, off}` turns it
+off, and so does any other value, which is logged once as unrecognised). With the flag
+off no per-session crew-log unit is created and no emitter call reaches the storage library. The shared `crew-log` root is still
 pre-created by `ensure_data_home()` as a security boundary, and member-kind logs are governed
 independently by [member-event-log.md](member-event-log.md).
 
@@ -20,7 +21,7 @@ body checks the flag ITSELF, before doing that work -- `on_tool_called`,
 `on_tool_completed`, `on_message_received`, `on_message_sent`,
 `on_request_configured`. Hashing is proportional to payload size and
 redaction walks the whole body, both once per frame on the event loop, so leaving the check
-to the writer would charge every user for a feature that is off by default.
+to the writer would charge a user who switched the log off for work it then discards.
 
 ## Identity
 
@@ -920,9 +921,9 @@ an absence a reader cannot tell apart from a child that never existed is the one
 refuses to allow silently. Nothing is WRITTEN for it: no declared type describes a lost pin, and
 adding one would be a shape change made to record a bug rather than a fact of the session. The
 residual is bounded and visible: it takes the cap's worth of children running at once, and it
-reports itself when it happens. Admission is NOT gated on the cap -- this is a default-off log, and
-a log that refuses a real spawn to protect its own bookkeeping has become the more expensive
-failure.
+reports itself when it happens. Admission is NOT gated on the cap -- this is a record of the
+session, and a log that refuses a real spawn to protect its own bookkeeping has become the more
+expensive failure.
 
 A cap on the NUMBER of pins bounds memory only when each pin's own fields are bounded, and the
 session id a pin carries is authored by the provider. So a pin whose session id is longer than the
@@ -1019,10 +1020,9 @@ record a second time a fact another entry already carries. Removing them keeps t
 vocabulary a statement about what the log contains rather than a wish list, which is what
 makes a reader's `known=` set worth declaring.
 
-Any of them may come back when a real source exists: while the format is pre-release
-(`crew-log-core.md` section 5) that is an ordinary change, and after the freeze point it is
-an additive one, since re-adding a type is exactly the case the `ignorable` marker and the
-unknown-type refusal already handle.
+Any of them may come back when a real source exists: the format is past its freeze point
+(`crew-log-core.md` section 5), so that is an additive change, since re-adding a type is
+exactly the case the `ignorable` marker and the unknown-type refusal already handle.
 
 With the families this revision emits, nothing the vocabulary still declares is left
 waiting for a site: `approval/*`, `background/completed`, `subagent/*` and `plan/updated`

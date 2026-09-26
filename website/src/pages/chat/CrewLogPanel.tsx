@@ -27,13 +27,14 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react'
+import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react'
 import { api } from '../../api/client'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useAppSelector } from '../../store'
 import { selectComposerBusy, selectSlotStreamState } from '../../store/chatSlice'
 import { i18nT } from '../../i18n/t'
 import { fmtCompact, fmtElapsed, fmtNumber, fmtPercent, fmtTimeNumeric } from '../../i18n/format'
+import { splitOnPlaceholder } from '../../lib/splitOnPlaceholder'
 
 /** The five folds, in the order the backend declares them (`PROJECTION_NAMES`). */
 export const CREW_LOG_FOLDS = ['status', 'usage', 'timeline', 'tools', 'approvals'] as const
@@ -50,10 +51,20 @@ export type CrewLogBundle = Record<CrewLogFold, CrewLogProjection>
 /** What one read of the batch route answers: the five folds, plus the two things
  *  the folds themselves cannot say -- whether a unit was addressable for the id
  *  sent, and whether the writer owed entries as the fold was taken. */
+/** Where `off_body`'s `{{link}}` points: the reference for what the crew log stores. */
+const CREW_LOG_DOCS_URL =
+  'https://github.com/kirodotdev/KiroCrew/blob/main/docs/reference/crew-log/README.md'
+
 export type CrewLogRead = {
   folds: CrewLogBundle
   resolved: boolean
   writesDrained: boolean
+  /** False when the gateway reports recording switched off. */
+  recording: boolean
+  /** The KIROCREW_CREW_LOG value that switched it off; empty when none was sent. */
+  flagValue: string
+  /** False when that value is not one of the switch-off spellings. */
+  flagRecognised: boolean
 }
 
 /** Rows a table renders before it says how many names it left out. A narrow
@@ -645,6 +656,14 @@ export function CrewLogTab({ slot }: { slot: string }) {
   )
 
   const message = error ? (error instanceof Error ? error.message : String(error)) : null
+  // Recording switched off is said whenever the gateway reports it, above any entries
+  // an earlier run wrote: those stay readable, but nothing new is being added to them.
+  const recordingOff = data?.recording === false
+  // With recording off and nothing written, the footer's claims about the record -- how
+  // far it is folded, and which record "this session is writing now" -- would describe
+  // a record that does not exist. Only the refresh stays. A session that does have
+  // entries keeps them, because they still describe what is on screen.
+  const hideRecordClaims = recordingOff && seq === 0
 
   return (
     <div className="h-full flex flex-col bg-bg text-text" data-testid="crew-log-tab">
@@ -653,7 +672,42 @@ export function CrewLogTab({ slot }: { slot: string }) {
         {isLoading && !data && (
           <div className="px-3 py-3 text-[11.5px] text-muted">{i18nT('pages.chat.crewLog.loading')}</div>
         )}
-        {data && seq === 0 && (
+        {data && recordingOff && (
+          <div
+            className="mx-3 my-3 px-2.5 py-2 flex flex-col gap-1.5 rounded border border-warn/30 bg-warn-subtle"
+            role="status"
+            data-testid="crew-log-off"
+          >
+            <div className="text-[12px] font-semibold flex items-center gap-1.5 text-warn">
+              <AlertTriangle size={13} aria-hidden="true" className="shrink-0" />
+              {i18nT('pages.chat.crewLog.off_title')}
+            </div>
+            <div className="text-[11.5px] leading-snug text-text">
+              {splitOnPlaceholder(
+                !data.flagValue
+                  ? i18nT('pages.chat.crewLog.off_body_unknown')
+                  : i18nT(data.flagRecognised
+                    ? 'pages.chat.crewLog.off_body'
+                    : 'pages.chat.crewLog.off_body_unrecognised', { value: data.flagValue }),
+                'link',
+              ).map((part, i) =>
+                part === null ? (
+                  <a
+                    key="link"
+                    href={CREW_LOG_DOCS_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[var(--accent)] hover:underline"
+                  >
+                    {i18nT('pages.chat.crewLog.off_link')}
+                  </a>
+                ) : (
+                  <span key={i}>{part}</span>
+                ))}
+            </div>
+          </div>
+        )}
+        {data && seq === 0 && !recordingOff && (
           <div className="px-3 py-4 flex flex-col gap-1.5">
             {/* An id with no addressable unit is NOT the same as a session that
                 recorded nothing: an idle reset leaves the record on disk under the
@@ -692,7 +746,7 @@ export function CrewLogTab({ slot }: { slot: string }) {
         })}
       </div>
       <div className="flex items-center gap-2 px-3 py-1.5 border-t border-border bg-[var(--bg-accent)] text-[10.5px] text-muted">
-        <span className="tabular-nums truncate">
+        {!hideRecordClaims && <span className="tabular-nums truncate">
           {seq > 0
             ? i18nT('pages.chat.crewLog.folded_through', { seq: fmtNumber(seq) })
             : i18nT('pages.chat.crewLog.folded_nothing')}
@@ -701,7 +755,7 @@ export function CrewLogTab({ slot }: { slot: string }) {
               through entry N" for such a read would be the one claim in this
               footer that is not checkable from the record. */}
           {data && !data.writesDrained && ` · ${i18nT('pages.chat.crewLog.writes_pending')}`}
-        </span>
+        </span>}
         <button
           type="button"
           onClick={() => { void refetch() }}
@@ -717,9 +771,11 @@ export function CrewLogTab({ slot }: { slot: string }) {
           model switch or a compaction recycle starts a new one -- so a total here
           covers the record now in force, not the session's whole life. Left
           unsaid, a smaller total after a recycle reads as lost spend. */}
-      <div className="px-3 pb-1.5 bg-[var(--bg-accent)] text-[10.5px] text-muted leading-snug">
-        {i18nT('pages.chat.crewLog.scope_note')}
-      </div>
+      {!hideRecordClaims && (
+        <div className="px-3 pb-1.5 bg-[var(--bg-accent)] text-[10.5px] text-muted leading-snug">
+          {i18nT('pages.chat.crewLog.scope_note')}
+        </div>
+      )}
     </div>
   )
 }

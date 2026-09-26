@@ -112,7 +112,7 @@ class TestTheToolSetIsRatcheted:
 
     def test_tools_are_advertised_while_the_flag_is_off(self, monkeypatch) -> None:
         """An agent must learn the flag state from a refusal, not a missing tool."""
-        monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+        monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
         assert len(server._list_tools()) == 3
 
 

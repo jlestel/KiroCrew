@@ -811,7 +811,7 @@ class TestTheStoreDecidesNotTheMapping:
         """The gate is the flag, so a gateway with the crew log off pays nothing."""
         _store(PREDECESSOR)
         _store(NEWEST, previous=PREDECESSOR)
-        monkeypatch.delenv(emit.CREW_LOG_ENV)
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
         sessions = _Sessions(PREDECESSOR)
 
         resolved = await _slot_predecessor_store(sessions, _ChatSlot(SLOT), SLOT)

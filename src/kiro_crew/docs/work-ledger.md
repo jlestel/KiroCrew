@@ -66,16 +66,16 @@ worker cannot write a verdict, a state, or its own acceptance condition.
 
 ## The crew log must be on
 
-Every write here is recorded in the crew log, so the whole board depends on it:
-without `KIROCREW_CREW_LOG=1` set at gateway start, `work_ledger_record` and
-`work_report` both answer `409 crew_log_off`, and `work_ledger_rebuild` is refused
-for the same reason. Reads are unaffected.
+Every write here is recorded in the crew log, so the whole board depends on it.
+The crew log is on by default. With `KIROCREW_CREW_LOG` set to a falsy value (`0`,
+`false`, `no`, `off`) or to any value it does not recognise at gateway start, `work_ledger_record` and `work_report` both
+answer `409 crew_log_off`, and `work_ledger_rebuild` is refused for the same reason.
+Reads are unaffected. To switch it back on, unset the variable (or remove it from
+`~/.kiro/crew/.env`) and restart the gateway.
 
-The flag is off by default until #10705 lands, which is an UPGRADE REQUIREMENT and
-not merely a default: a deployment that ran conductors before this change has board
-writes that worked without any flag, and they stop working on upgrade until an
-operator sets it. Set it before the first conductor runs, rather than discovering
-the refusal from a worker that cannot report.
+A deployment that sets the flag off has no board writes at all, so leave it on
+wherever a conductor runs, rather than discovering the refusal from a worker that
+cannot report.
 
 **The acceptance condition is named before dispatch, not after.** It is one of
 three kinds: `pr_checks` (a pull request's checks are all green), `file` (a path

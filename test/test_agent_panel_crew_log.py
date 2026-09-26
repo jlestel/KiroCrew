@@ -135,7 +135,7 @@ def test_the_emitter_is_a_no_op_with_the_crew_log_off(monkeypatch):
     create a log behind the operator's back when the feature is off.
     """
     _unit()
-    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
     crew_log_emit.reset_caches()
 
     _publish()

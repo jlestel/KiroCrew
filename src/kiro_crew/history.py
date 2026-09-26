@@ -1086,7 +1086,7 @@ def _cleanup_expired_crew_logs(retention_days: int, now: float) -> None:
 
     Imported lazily and swallowed on failure for one reason each. Lazily because
     this module is imported on every startup while the crew log store is only
-    reachable behind ``KIROCREW_CREW_LOG``, and a launch without the flag
+    reachable behind ``KIROCREW_CREW_LOG``, and a launch with the flag off
     should not pay for the import. Swallowed because the caller is on the
     transcript ARCHIVE path: a crew log tree that cannot be swept is a disk-space
     problem, and letting it raise here would turn that into a failure to archive

@@ -1510,10 +1510,23 @@ def pytest_make_collect_report(collector):
         )
 
 
+def _pin_crew_log_off_for_the_process() -> None:
+    """``KIROCREW_CREW_LOG=0`` for the whole run, so a test opts IN to the crew log.
+
+    The gateway records a crew log by default. A test that drives the chat path for
+    some other reason would otherwise write one into its data home, and the logs
+    this suite asserts on would pick up entries from code the test never meant to
+    exercise. Every crew-log test sets the variable itself: ``"1"`` to record,
+    ``"0"`` to assert the off path, and ``monkeypatch.delenv`` to assert the default.
+    """
+    os.environ["KIROCREW_CREW_LOG"] = "0"
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Record the working directory pytest started in, before any test can move it."""
     _refuse_a_real_data_home()
     _pin_telemetry_off_for_the_process()
+    _pin_crew_log_off_for_the_process()
     _prefer_short_tmp_base()
     _install_short_tmp_root()
     _redirect_hypothesis_database()

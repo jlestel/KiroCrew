@@ -153,11 +153,15 @@ the shared sensitive-path floor, so a prompt-injected agent cannot read another
 unit's history or forge a line into its own. The crew log's own code opens the files
 directly and is unaffected.
 
-**Session emission is off by default.** The session emitter is inert unless
-`KIROCREW_CREW_LOG` is truthy. With the flag unset it creates no `session` unit and
-no session emit path reaches storage. The `member` event log is independent of
-that flag and continues to use the same store.
+**Session emission is on by default.** The session emitter writes unless
+`KIROCREW_CREW_LOG` is set to a falsy value (`0`, `false`, `no` or `off`). A value it
+does not recognise (a typo such as `fasle`) also switches it off, and the gateway logs
+a warning naming the value. With the
+flag off it creates no `session` unit and no session emit path reaches storage. The
+`member` event log is independent of that flag and continues to use the same store.
 
-**The session vocabulary is PRE-RELEASE.** Its shapes may change while session
-emission remains off by default. The shipped member-log contract is canonical in
+**The session vocabulary is past its freeze point.** Session emission is on by
+default, so installs hold session logs a later reader must still accept; see the
+core spec's session-log format section for the compatibility rule. The shipped
+member-log contract is canonical in
 [member-event-log.md](../../system-specs/modules/member-event-log.md).

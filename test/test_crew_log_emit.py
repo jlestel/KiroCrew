@@ -1916,7 +1916,7 @@ def test_an_empty_body_writes_no_sent_entry_at_all():
 
 def test_every_new_family_is_silent_with_the_flag_off(monkeypatch):
     _open_session()
-    monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     before = len(_body())
     emit.on_message_received(SESSION, 1, text="x")
     emit.on_message_sent(SESSION, 1, text="y")
@@ -1933,11 +1933,11 @@ def test_a_disabled_emitter_does_no_payload_work_at_all(monkeypatch):
 
     Hashing a tool result is proportional to its size and redaction walks a whole
     body, both once per frame on the event loop. An emitter that did that work and
-    then discarded it inside the writer would charge every user for a feature that
-    is off by default.
+    then discarded it inside the writer would charge a user who switched the log
+    off for work it then throws away.
     """
     _open_session()
-    monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     worked: list[str] = []
     monkeypatch.setattr(
         emit, "_payload_digest", lambda payload: worked.append("digest") or ("", -1)
@@ -3159,11 +3159,11 @@ def test_flag_off_writes_no_file_at_all(monkeypatch):
     assert not _store_root().exists()
 
 
-def test_flag_unset_writes_no_file_at_all(monkeypatch):
+def test_flag_unset_records_by_default(monkeypatch):
     monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
-    assert emit.enabled() is False
+    assert emit.enabled() is True
     _open_session()
-    assert not _store_root().exists()
+    assert _log_path().is_file()
 
 
 def test_flag_off_allocates_no_state_either(monkeypatch):
@@ -3204,14 +3204,16 @@ def test_a_flag_turned_off_mid_turn_still_releases_what_it_allocated(monkeypatch
     assert SESSION not in emit._pinned
 
 
-@pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on"])
-def test_the_flag_accepts_the_repo_truthy_spellings(monkeypatch, value):
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on", "", "  "])
+def test_the_flag_is_on_when_empty_or_truthy(monkeypatch, value):
     monkeypatch.setenv(emit.CREW_LOG_ENV, value)
     assert emit.enabled() is True
 
 
-@pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "2"])
-def test_the_flag_rejects_everything_else(monkeypatch, value):
+@pytest.mark.parametrize(
+    "value", ["0", "false", "FALSE", " no ", "off", "Off", "2", "disable", "fasle"]
+)
+def test_the_flag_is_off_for_a_falsy_or_unrecognised_spelling(monkeypatch, value):
     monkeypatch.setenv(emit.CREW_LOG_ENV, value)
     assert emit.enabled() is False
 
@@ -4829,7 +4831,7 @@ print(
 
 
 def _boot_probe(tmp_path: Path) -> dict:
-    """Import a boot-path module in a CLEAN interpreter with the flag unset.
+    """Import a boot-path module in a CLEAN interpreter with the flag off.
 
     A clean process is the only place this is observable: the suite has already
     imported both the emitter and its storage package, so an in-process check
@@ -4840,6 +4842,7 @@ def _boot_probe(tmp_path: Path) -> dict:
         "PATH": os.environ.get("PATH", ""),
         "TMPDIR": str(tmp_path),
         "KIROCREW_HOME": str(tmp_path / "home"),
+        "KIROCREW_CREW_LOG": "0",
     }
     if sys.platform == "win32":  # pragma: no cover - parity with the lease suite
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
@@ -4877,10 +4880,7 @@ def test_a_flag_off_launch_does_not_load_the_storage_subsystem(tmp_path: Path) -
     """
     seen = _boot_probe(tmp_path)
     assert seen["glue"], "the probe did not reach the emitter at all, so it proves nothing"
-    assert seen["storage"] == [], (
-        "a launch with KIROCREW_CREW_LOG unset imported the storage subsystem: "
-        f"{seen['storage']}"
-    )
+    assert seen["storage"] == [], f"a flag-off launch imported storage: {seen['storage']}"
 
 
 def test_a_flag_off_launch_registers_no_shutdown_hook(tmp_path: Path) -> None:

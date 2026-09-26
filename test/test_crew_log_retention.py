@@ -12,12 +12,14 @@ test rather than being covered incidentally by the happy path.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import multiprocessing
 import os
 import shutil
 import time
+from pathlib import Path
 
 import pytest
 from crew_log_type_helpers import minimal_data
@@ -56,10 +58,10 @@ def _closed_session(
 ) -> CrewLog:
     """A session log holding one ``session/closed`` written *closed_days_ago*.
 
-    The default *reason* is a real terminal one. It is not decoration: a unit is
-    collectable only when its close reason proves the gateway cleared that ACP id's
-    mapping, so a fixture with an invented reason would be a unit the sweep must
-    refuse -- which the non-terminal tests below use it for deliberately.
+    The default *reason* is one the sweep collects. It is not decoration: a unit is
+    collectable only on a close reason that says its writer finished, so a fixture
+    with an invented reason would be a unit the sweep must refuse -- which the
+    unrecognized-reason tests below use it for deliberately.
     """
     log = CrewLog.create(lg.KIND_SESSION, unit_id, owner=CREW, agent="kirocrew")
     closed_at = store.now_ms() - int(closed_days_ago * DAY_MS)
@@ -558,12 +560,12 @@ def test_the_sweep_re_decides_inside_the_lease_and_stands_down_on_a_revival():
     del log
     real_guard_input = store._expired_unit_id
 
-    def _revive_then_answer(directory, cutoff_ms):
+    def _revive_then_answer(directory, cutoff_ms, superseded=frozenset(), **kwargs):
         # Stand in for the revival landing after the scan and before the hold.
         if getattr(_revive_then_answer, "done", False):
-            return real_guard_input(directory, cutoff_ms)
+            return real_guard_input(directory, cutoff_ms, superseded, **kwargs)
         _revive_then_answer.done = True
-        answer = real_guard_input(directory, cutoff_ms)
+        answer = real_guard_input(directory, cutoff_ms, superseded, **kwargs)
         revived = CrewLog.open(lg.KIND_SESSION, SESSION)
         revived.append("session/opened", _opened(resumed=True), src="gateway")
         del revived
@@ -1231,21 +1233,16 @@ def test_only_a_destroy_close_authorizes_collection():
 
 
 @pytest.mark.parametrize(
-    "reason", ["reset", "discarded", "shutdown", "crashed", "evicted", "tab_closed", ""]
+    "reason", ["shutdown", "discarded", "crashed", "evicted", "tab_closed", ""]
 )
-def test_a_close_that_does_not_end_the_ids_life_is_never_collected(reason):
-    """The gateway stopped SERVING the session; the conversation can still come back.
+def test_a_close_that_does_not_say_the_writer_finished_is_never_collected(reason):
+    """A crash, an eviction and an unknown spelling state nothing about the writer.
 
-    ``reset`` is the one worth naming, because the intuitive reading is wrong: a
-    reset does cold-start its successor on a new id, but its own ``clear_sid`` is
-    guarded by ``if clear_conversation and session is not None``, so a reset that
-    keeps the conversation writes this close while LEAVING the old id mapped --
-    still resumable, and its log still needed. ``discarded`` clears the sid
-    unconditionally and would qualify on that test, but no path writes it into a
-    crew log today, so admitting it would be a rule about a file nothing produces.
-    A shutdown, a crash, an eviction and an unknown spelling all leave the id
-    mapped too. Retaining costs disk; deleting one of these destroys a live
-    conversation's history.
+    ``shutdown`` is here because no path writes it: a gateway restart leaves no close
+    at all, and the predecessor rule below is what collects those units.
+
+    Retaining costs disk; deleting one of these could destroy history a repair or a
+    resume still needs.
     """
     log = _closed_session(closed_days_ago=400, reason=reason)
     del log
@@ -1254,7 +1251,210 @@ def test_a_close_that_does_not_end_the_ids_life_is_never_collected(reason):
     assert CrewLog.exists(lg.KIND_SESSION, SESSION)
 
 
-def test_a_valid_empty_session_map_cannot_authorize_collecting_a_reset_closed_unit():
+def test_a_reset_close_ages_out_while_an_open_unit_stays():
+    """A reset predecessor follows archive retention.
+
+    Without it every reset would leave a unit that no sweep ever collects. The open
+    unit beside it is just as old and stays, because nothing closed it.
+    """
+    closed = _closed_session(closed_days_ago=90, reason="reset")
+    live = _open_session(unit_id="s-live", age_days=400)
+    del closed, live
+
+    assert store.sweep_expired(30) == (1, 0)
+    assert not CrewLog.exists(lg.KIND_SESSION, SESSION)
+    assert CrewLog.exists(lg.KIND_SESSION, "s-live")
+
+
+def test_a_reset_close_inside_the_window_is_kept():
+    log = _closed_session(closed_days_ago=5, reason="reset")
+    del log
+
+    assert store.sweep_expired(30) == (0, 0)
+    assert CrewLog.exists(lg.KIND_SESSION, SESSION)
+
+
+def _slot_unit(unit_id: str, created_at: int, *, age_days: float, closed: str = "") -> None:
+    """A unit of slot ``chat-1`` created at *created_at*, last written *age_days* ago.
+
+    *closed* is the reason of a ``session/closed`` written *age_days* ago; empty leaves
+    the unit open.
+    """
+    log = CrewLog.create(lg.KIND_SESSION, unit_id, owner=CREW, agent="kirocrew", slot="chat-1")
+    log.append("session/opened", _opened(resumed=False), src="gateway")
+    if closed:
+        _append_at(log, _CLOSED, {"reason": closed}, store.now_ms() - int(age_days * DAY_MS))
+    path = log.path
+    del log
+    header, *rest = path.read_text(encoding="utf-8").splitlines()
+    parsed = json.loads(header)
+    parsed["createdAt"] = created_at
+    header = json.dumps(parsed, separators=(",", ":"), sort_keys=True)
+    path.write_text("\n".join([header, *rest]) + "\n", encoding="utf-8")
+    _age_file(path, age_days)
+
+
+def test_expiring_units_an_earlier_build_kept_is_announced_once_before_the_first_goes(
+    caplog, monkeypatch
+):
+    """A reset close and a restart-orphaned predecessor were kept forever before.
+
+    The first pass that collects them says so once, with the count and the setting,
+    and the ``destroyed`` unit an earlier build already expired is not counted.
+    """
+    monkeypatch.setattr(store, "_EARLIER_BUILD_EXPIRY_ANNOUNCED", False)
+    _closed_session(unit_id="s-reset", closed_days_ago=90, reason="reset")
+    _closed_session(unit_id="s-destroyed", closed_days_ago=90, reason="destroyed")
+    _slot_unit("s-before-restart", 1, age_days=90)
+    _slot_unit("s-after-restart", 2, age_days=90, closed="destroyed")
+    seen_at_warning: "list[bool]" = []
+    real_warning = store.logger.warning
+
+    def _warning(msg, *args, **kwargs):
+        if msg.startswith("crew log: expiring"):
+            units = ("s-reset", "s-destroyed", "s-before-restart", "s-after-restart")
+            seen_at_warning.append(all(CrewLog.exists(lg.KIND_SESSION, u) for u in units))
+        real_warning(msg, *args, **kwargs)
+
+    monkeypatch.setattr(store.logger, "warning", _warning)
+    with caplog.at_level("WARNING", logger=store.logger.name):
+        assert store.sweep_expired(30) == (4, 0)
+        _closed_session(unit_id="s-reset-2", closed_days_ago=90, reason="reset")
+        assert store.sweep_expired(30) == (1, 0)
+
+    notices = [r.getMessage() for r in caplog.records if "earlier build" in r.getMessage()]
+    assert notices == [
+        "crew log: expiring 2 unit(s) kept by an earlier build under "
+        "session.archive_retention_days=30"
+    ]
+    assert seen_at_warning == [True]
+
+
+def test_no_upgrade_notice_when_only_destroyed_units_expire(caplog, monkeypatch):
+    monkeypatch.setattr(store, "_EARLIER_BUILD_EXPIRY_ANNOUNCED", False)
+    _closed_session(closed_days_ago=90, reason="destroyed")
+    with caplog.at_level("WARNING", logger=store.logger.name):
+        assert store.sweep_expired(30) == (1, 0)
+    assert "earlier build" not in caplog.text
+    assert store._EARLIER_BUILD_EXPIRY_ANNOUNCED is False
+
+
+@pytest.mark.parametrize("predecessor_close", ["", "reset", "destroyed"])
+def test_a_live_slot_keeps_every_predecessor_unit(predecessor_close):
+    """The slot's work-ledger record is folded from all its units, so none goes early.
+
+    The predecessor is old by every clock, closed or left open by a restart; the slot's
+    newest unit is open, so the slot is live and the sweep stands down.
+    """
+    _slot_unit("s-before", 1, age_days=90, closed=predecessor_close)
+    _slot_unit("s-live", 2, age_days=1)
+
+    assert store.sweep_expired(30) == (0, 0)
+    assert CrewLog.exists(lg.KIND_SESSION, "s-before")
+    assert CrewLog.exists(lg.KIND_SESSION, "s-live")
+
+
+def test_an_expired_slot_goes_whole_including_a_unit_a_restart_left_open():
+    """A gateway restart writes no close; the slot's expired newest unit ends it."""
+    _slot_unit("s-before-restart", 1, age_days=90)
+    _slot_unit("s-after-restart", 2, age_days=90, closed="destroyed")
+
+    assert store.sweep_expired(30) == (2, 0)
+    assert not CrewLog.exists(lg.KIND_SESSION, "s-before-restart")
+    assert not CrewLog.exists(lg.KIND_SESSION, "s-after-restart")
+
+
+def _withhold_header(unit_id: str, tmp_path) -> "tuple[Path, Path]":
+    """Move *unit_id*'s files aside, leaving its directory as ``create`` leaves it.
+
+    Returns ``(directory, stash)``; moving the stash's files back publishes the header.
+    """
+    directory = _unit_dir(lg.KIND_SESSION, unit_id)
+    stash = tmp_path / f"stash-{unit_id}"
+    stash.mkdir()
+    for child in list(directory.iterdir()):
+        shutil.move(str(child), str(stash / child.name))
+    return directory, stash
+
+
+def _publish(directory: Path, stash: Path) -> None:
+    for child in list(stash.iterdir()):
+        shutil.move(str(child), str(directory / child.name))
+
+
+def test_a_header_published_after_the_slot_snapshot_keeps_the_predecessor(tmp_path, monkeypatch):
+    """``create`` makes the directory first and publishes the header second.
+
+    The sweep's slot view is taken inside that window, so the new unit is invisible
+    to it; the header then lands inside a directory the view already listed. The
+    reset predecessor is the slot's newest unit only in the stale view -- the slot
+    is live, so it must be kept.
+    """
+    _slot_unit("s-before", 1, age_days=90, closed="reset")
+    _slot_unit("s-new", 2, age_days=0)
+    directory, stash = _withhold_header("s-new", tmp_path)
+    real_init = store._SlotView.__init__
+
+    def _snapshot_then_publish(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        _publish(directory, stash)
+
+    monkeypatch.setattr(store._SlotView, "__init__", _snapshot_then_publish)
+
+    assert store.sweep_expired(30) == (0, 0)
+    assert CrewLog.exists(lg.KIND_SESSION, "s-before")
+    assert CrewLog.exists(lg.KIND_SESSION, "s-new")
+
+
+def test_a_header_less_directory_holds_back_every_slot_units_verdict(tmp_path):
+    """A directory whose header is not published yet may be any slot's newest unit."""
+    _slot_unit("s-before", 1, age_days=90, closed="reset")
+    _slot_unit("s-new", 2, age_days=0)
+    _withhold_header("s-new", tmp_path)
+
+    assert store.sweep_expired(30) == (0, 0)
+    assert CrewLog.exists(lg.KIND_SESSION, "s-before")
+
+
+def test_a_header_less_directory_older_than_the_window_does_not_hold_the_sweep(tmp_path):
+    _slot_unit("s-before", 1, age_days=90, closed="reset")
+    _slot_unit("s-stray", 2, age_days=0)
+    directory, _stash = _withhold_header("s-stray", tmp_path)
+    _age_file(directory, 90)
+
+    assert store.sweep_expired(30) == (1, 0)
+    assert not CrewLog.exists(lg.KIND_SESSION, "s-before")
+
+
+def test_an_open_predecessor_written_inside_the_window_is_kept():
+    _slot_unit("s-before-restart", 1, age_days=5)
+    _slot_unit("s-after-restart", 2, age_days=90, closed="destroyed")
+
+    assert store.sweep_expired(30) == (1, 0)
+    assert CrewLog.exists(lg.KIND_SESSION, "s-before-restart")
+
+
+def test_a_slot_revived_between_the_scan_and_the_hold_keeps_its_predecessor(monkeypatch):
+    """The guard re-reads the slot's newest unit once its lease is held."""
+    _slot_unit("s-before", 1, age_days=90, closed="reset")
+    _slot_unit("s-after", 2, age_days=90, closed="destroyed")
+    real_hold = store._newest_unit_held
+
+    def _revive_newest_then_hold(directory, unit_id, slots):
+        if unit_id == "s-before":
+            revived = CrewLog.open(lg.KIND_SESSION, "s-after")
+            revived.append("session/opened", _opened(resumed=True), src="gateway")
+            del revived
+        return real_hold(directory, unit_id, slots)
+
+    monkeypatch.setattr(store, "_newest_unit_held", _revive_newest_then_hold)
+
+    assert store.sweep_expired(30) == (0, 0)
+    assert CrewLog.exists(lg.KIND_SESSION, "s-before")
+    assert CrewLog.exists(lg.KIND_SESSION, "s-after")
+
+
+def test_a_valid_empty_session_map_cannot_authorize_collecting_an_unrecognized_close():
     """The exact lever the review found, pinned shut.
 
     ``session_map.json`` is agent-WRITABLE while the crew log tree is bind-masked, and
@@ -1270,7 +1470,7 @@ def test_a_valid_empty_session_map_cannot_authorize_collecting_a_reset_closed_un
     path = config_dir() / SESSION_MAP_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{}", encoding="utf-8")
-    log = _closed_session(closed_days_ago=400, reason="reset")
+    log = _closed_session(closed_days_ago=400, reason="crashed")
     del log
 
     assert store.sweep_expired(30) == (0, 0)
@@ -1456,3 +1656,109 @@ async def test_a_session_opened_after_a_destroy_makes_the_unit_uncollectable_aga
         assert CrewLog.exists(lg.KIND_SESSION, "acp-revived")
     finally:
         emit.reset_caches()
+
+
+# --- staging a unit for the session trash ------------------------------------
+
+
+def _stage_target(unit_id: str):
+    return (
+        store.crew_log_trash_root() / "batch-1" / "uid-1" / _unit_dir(lg.KIND_SESSION, unit_id).name
+    )
+
+
+def test_staging_syncs_both_parents_after_the_rename(monkeypatch):
+    """A rename is not a move until both directories are on disk."""
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-stage")
+    del log
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-stage").parent
+    target = _stage_target("s-stage")
+    synced: list = []
+    monkeypatch.setattr(atomic_write, "fsync_dir", lambda path, **_k: synced.append(Path(path)))
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-stage", target) == store.REMOVE_REMOVED
+
+    assert target.is_dir()
+    assert target.parent in synced
+    assert source_parent in synced
+
+
+def test_a_sync_that_fails_after_the_rename_puts_the_unit_back(monkeypatch):
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-unsynced")
+    del log
+    target = _stage_target("s-unsynced")
+    calls = {"n": 0}
+    real_rename = os.rename
+
+    def _rename(src, dst):
+        calls["n"] += 1
+        real_rename(src, dst)
+
+    after_rollback: list = []
+
+    def _fsync(path, **_k):
+        if calls["n"] == 1:
+            raise OSError("sync failed")
+        if calls["n"] == 2:
+            after_rollback.append(Path(path))
+
+    monkeypatch.setattr(os, "rename", _rename)
+    monkeypatch.setattr(atomic_write, "fsync_dir", _fsync)
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-unsynced").parent
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-unsynced", target) == store.REMOVE_FAILED
+
+    assert CrewLog.exists(lg.KIND_SESSION, "s-unsynced")
+    assert not target.exists()
+    assert source_parent in after_rollback, "the rollback was not made durable"
+
+
+def test_the_windows_branch_stages_an_idle_unit_and_refuses_a_held_one(monkeypatch):
+    """Windows renames only after releasing the lease; the lease still refuses a holder."""
+    monkeypatch.setattr(store, "_RENAME_UNDER_LEASE", False)
+    idle = _closed_session(unit_id="s-idle")
+    del idle
+    held = _closed_session(unit_id="s-held")
+    held.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="gateway")
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-idle", _stage_target("s-idle")) == (
+        store.REMOVE_REMOVED
+    )
+    assert store.stage_unit(lg.KIND_SESSION, "s-held", _stage_target("s-held")) == (
+        store.REMOVE_OWNED
+    )
+    assert not CrewLog.exists(lg.KIND_SESSION, "s-idle")
+    assert CrewLog.exists(lg.KIND_SESSION, "s-held")
+    del held
+
+
+def test_the_newest_units_append_lock_is_held_across_a_predecessors_removal(monkeypatch):
+    """A resume appending to the newest unit waits for the removal, then lands."""
+    _slot_unit("s-before", 1, age_days=90, closed="reset")
+    _slot_unit("s-after", 2, age_days=90, closed="destroyed")
+    events: list = []
+    real_lock, real_remove = store._open_lock, store.remove_unit
+    newest_lock = store._lock_path(lg.KIND_SESSION, "s-after")
+
+    @contextlib.contextmanager
+    def _recording_lock(path):
+        with real_lock(path):
+            if path == newest_lock:
+                events.append("fence")
+            yield
+            if path == newest_lock:
+                events.append("unfence")
+
+    def _recording_remove(kind, unit_id, *, guard):
+        events.append(f"remove {unit_id}")
+        return real_remove(kind, unit_id, guard=guard)
+
+    monkeypatch.setattr(store, "_open_lock", _recording_lock)
+    monkeypatch.setattr(store, "remove_unit", _recording_remove)
+
+    assert store.sweep_expired(30) == (2, 0)
+    assert events[:3] == ["fence", "remove s-before", "unfence"]

@@ -3925,7 +3925,7 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
             # Imported here, not at module scope: this file is on the gateway boot
             # path, and the emitter is flag-gated behind KIROCREW_CREW_LOG.
             # AUTOSDE's no-new-work-on-gateway-boot-path rule asks for the IMPORT to
-            # be gated, not just the handler, so a launch with the flag unset pays
+            # be gated, not just the handler, so a launch with the flag off pays
             # nothing for a subsystem it will never call.
             from kiro_crew.crew_log import emit as crew_log_emit
 

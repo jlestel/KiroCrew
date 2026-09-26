@@ -409,7 +409,7 @@ def test_a_malformed_payload_is_refused_without_failing_the_caller():
 
 
 def test_the_flag_being_off_writes_nothing_and_creates_no_directory(monkeypatch):
-    monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     _seed_session()
     assert emit.on_crew_dispatch(CREW, DISPATCH_DATA) == 0
     assert emit.on_crew_report(CREW, {"item": "it_1", "status": "done"}, cite_unit=WORKER_UNIT) == 0
