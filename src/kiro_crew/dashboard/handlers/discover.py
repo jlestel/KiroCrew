@@ -11,9 +11,13 @@ through the same discovery policy.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
+import os
 import re
+import secrets
 import shutil
+from pathlib import Path
 
 from aiohttp import web
 
@@ -536,63 +540,107 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
             # DIRECTORY symlink needs SeCreateSymbolicLinkPrivilege but a
             # junction needs none — so the junction is the shape an unprivileged
             # process can actually plant, and `is_symlink` reports False for it.
-            # The defence then never fires and `shutil.rmtree` below REFUSES a
-            # junction just as it refuses a symlink, raising out of the
-            # `asyncio.to_thread` call, which has no `except` in scope.
+            # The defence then never fires and the swap below would rename the
+            # junction itself aside, leaving the old install reachable through it.
             # `unlink_link_or_junction` detaches a junction with `rmdir`, so the
             # target's contents are left alone exactly as `unlink` leaves a
             # symlink's.
             if platform_compat.is_link_or_junction(skill_dir):
                 logger.warning("Replacing linked skill dir: %s", skill_dir)
                 platform_compat.unlink_link_or_junction(skill_dir)
-            # Overwrite semantics: clear the previous install first so stale
-            # files from an older bundle version don't linger. The user
-            # explicitly consented via the 409 -> overwrite flow.
-            if overwrite and skill_dir.exists():
-                shutil.rmtree(skill_dir)
-            skill_dir.mkdir(parents=True, exist_ok=True)
-            resolved_root = skill_dir.resolve()
-            # Belt-and-suspenders: the (now symlink-free) skill dir must
-            # itself land under the canonical skills root.
+            # Build the new bundle in a dot-prefixed sibling (the loader skips
+            # dot dirs); the old install is only swapped out once it verifies.
+            skill_dir.parent.mkdir(parents=True, exist_ok=True)
+            # Plain mkdir (not the 0o700 of mkdtemp) so the installed dir keeps the usual mode.
+            stage = skill_dir.with_name(f".{skill_dir.name}.{secrets.token_hex(6)}")
+            stage.mkdir()
+            aside: Path | None = None
             try:
-                resolved_root.relative_to(skills_root)
-            except ValueError:
-                logger.warning("Refusing bundle write outside skills root: %s", skill_dir)
-                return 0
-            written = 0
-            for rel_path, file_content in bundle:
-                if ".." in rel_path or rel_path.startswith("/") or rel_path.startswith("./.."):
-                    continue
-                file_path = skill_dir / rel_path
-                # Path traversal defense: resolve and verify containment
+                resolved_root = stage.resolve()
+                # Belt-and-suspenders: the staging dir must itself land under
+                # the canonical skills root.
                 try:
-                    file_path.resolve().relative_to(resolved_root)
+                    resolved_root.relative_to(skills_root)
                 except ValueError:
-                    logger.warning("Skipping traversal path in bundle: %s", rel_path)
-                    continue
-                # Reject symlinks in parent chain
-                if file_path.parent.exists() and file_path.parent.is_symlink():
-                    logger.warning("Skipping symlink parent in bundle: %s", rel_path)
-                    continue
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                # newline="" disables platform newline translation: with the
-                # default, Windows rewrites \n to \r\n (and CRLF content to
-                # \r\r\n), so the installed file would parse differently from
-                # the preview. The loader's read_text normalizes on read, so
-                # preserving the provider's bytes keeps preview == installed
-                # on every platform.
-                file_path.write_text(file_content, encoding="utf-8", newline="")
-                written += 1
-            # Ensure SKILL.md exists (loader requires it for discovery).
-            # If only AGENTS.md was provided, copy it as SKILL.md.
-            if not (skill_dir / "SKILL.md").exists() and (skill_dir / "AGENTS.md").exists():
-                # newline="" on read and write keeps the copy byte-faithful.
-                with (skill_dir / "AGENTS.md").open("r", encoding="utf-8", newline="") as src:
-                    agents_content = src.read()
-                (skill_dir / "SKILL.md").write_text(agents_content, encoding="utf-8", newline="")
+                    logger.warning("Refusing bundle write outside skills root: %s", skill_dir)
+                    stage.rmdir()
+                    return 0
+                written = 0
+                for rel_path, file_content in bundle:
+                    if ".." in rel_path or rel_path.startswith("/") or rel_path.startswith("./.."):
+                        continue
+                    file_path = stage / rel_path
+                    # Path traversal defense: resolve and verify containment
+                    try:
+                        file_path.resolve().relative_to(resolved_root)
+                    except ValueError:
+                        logger.warning("Skipping traversal path in bundle: %s", rel_path)
+                        continue
+                    # Reject symlinks in parent chain
+                    if file_path.parent.exists() and file_path.parent.is_symlink():
+                        logger.warning("Skipping symlink parent in bundle: %s", rel_path)
+                        continue
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    # newline="" disables platform newline translation so the
+                    # installed bytes match the preview on every platform.
+                    file_path.write_text(file_content, encoding="utf-8", newline="")
+                    written += 1
+                # Ensure SKILL.md exists (loader requires it for discovery).
+                # If only AGENTS.md was provided, copy it as SKILL.md.
+                if not (stage / "SKILL.md").exists() and (stage / "AGENTS.md").exists():
+                    # newline="" on read and write keeps the copy byte-faithful.
+                    with (stage / "AGENTS.md").open("r", encoding="utf-8", newline="") as src:
+                        agents_content = src.read()
+                    (stage / "SKILL.md").write_text(agents_content, encoding="utf-8", newline="")
+                if not (stage / "SKILL.md").is_file():
+                    raise FileNotFoundError(errno.ENOENT, "bundle has no SKILL.md", "SKILL.md")
+                # No-replace publish: without consent an existing install (even empty) stays.
+                if overwrite and skill_dir.exists():
+                    old = stage.with_name(stage.name + ".old")
+                    os.rename(skill_dir, old)
+                    aside = old
+                platform_compat.publish_dir_noreplace(stage, skill_dir)
+            except BaseException:
+                # Put the old install back first; a failed restore must not mask the error.
+                try:
+                    if aside is not None and not skill_dir.exists():
+                        os.rename(aside, skill_dir)
+                except OSError:
+                    logger.warning("Could not restore previous install of %s", key)
+                finally:
+                    shutil.rmtree(stage, ignore_errors=True)
+                raise
+            if aside is not None:
+                shutil.rmtree(aside, ignore_errors=True)
             return written
 
-        file_count = await asyncio.to_thread(_write_bundle)
+        try:
+            file_count = await asyncio.to_thread(_write_bundle)
+        except OSError as exc:
+            from kiro_crew.platform import redact_log_via_context  # deferred, as above
+
+            scrubbed = redact_log_via_context(str(exc))
+            logger.warning("Skill bundle install failed for %s: %r", key, scrubbed)
+            _sel().log_tool_invocation(
+                session_key=request.get("session_key", "dashboard"),
+                tool_name="install_skill_from_provider",
+                tool_kind="skill_provider_install",
+                outcome="error",
+                downstream_service=provider_name,
+                resources=f"key={key}",
+                error=scrubbed,
+            )
+            failed = Path(exc.filename).name if exc.filename else type(exc).__name__
+            failed = _redact_external(failed)
+            reason = _redact_external(exc.strerror or type(exc).__name__)
+            return web.json_response(
+                {
+                    "error": f"Failed to write skill bundle ({failed}): {reason}",
+                    "code": "bundle_write_failed",
+                    "key": key,
+                },
+                status=500,
+            )
         # Invalidate the loader's cache so the skill is immediately discoverable.
         skills._invalidate_iter_cache()
         kind = "updated" if already_exists else "created"
