@@ -1600,7 +1600,7 @@ class TestUnattendedApprovalIsAudited:
 
         asyncio.run(self._runner()._approve(_P(), "r1", tool="fs_write", session_key="s"))
         assert calls == ["approve:r1"]
-        assert logged and logged[0]["outcome"] == "auto_approved"
+        assert [row["outcome"] for row in logged] == ["approval_pending", "auto_approved"]
         # critical=True is what makes a write failure raise, which is what lets us deny.
         assert logged[0]["critical"] is True
 

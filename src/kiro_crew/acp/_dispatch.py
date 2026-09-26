@@ -21,7 +21,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from kiro_crew import mcp_apps_render, session_directive
 from kiro_crew.acp.types import (
@@ -1396,7 +1396,7 @@ def build_permission_event(
     diff_path_cache: dict[str, str] | None = None,
     gate_envelope_nonce: str | None = None,
     kas_consent_meta: bool = False,
-) -> tuple[AcpEvent, dict[str, str] | None]:
+) -> tuple[AcpEvent | None, dict[str, str] | None]:
     """Build an ``EVENT_PERMISSION_REQUEST`` from a ``session/request_permission``.
 
     ``gate_envelope_nonce`` is set only by a caller whose session runs Kiro Crew's
@@ -1428,7 +1428,14 @@ def build_permission_event(
     permission payload's own ``kind`` is agent-influenced and must not waive the
     tool-name length cap).
     """
-    request_id = msg.id if msg.id is not None else ""
+    if not isinstance(msg.id, (str, int, float)) or isinstance(msg.id, bool):
+        logger.debug(
+            "Ignoring permission request with unsupported id type: %s",
+            type(msg.id).__name__,
+        )
+        return None, None
+    # A float id is kept exactly as the frame sent it, so the answer echoes it.
+    request_id = cast("str | int", msg.id)
     params = msg.params or {}
     tool_call = params.get("toolCall", {})
     tool_call = tool_call if isinstance(tool_call, dict) else {}
@@ -1445,11 +1452,13 @@ def build_permission_event(
             "kind": envelope["kind"],
             "input": envelope["input"],
         }
-    title = _redact(tool_call.get("title", "unknown"))
+    raw_title = tool_call.get("title", "unknown")
+    title = _redact(raw_title if isinstance(raw_title, str) else "")
     # The ACP toolCall carries a `kind` ("execute" for Bash, "read"/"edit"/…).
     # Carry it onto the event as display/telemetry metadata only — the is_shell
     # length-cap exemption resolves from shell_cache below, never this field.
-    tool_kind = tool_call.get("kind", "")
+    raw_tool_kind = tool_call.get("kind", "")
+    tool_kind = raw_tool_kind if isinstance(raw_tool_kind, str) else ""
 
     # ACP spec uses optionId/name + kind ("allow_once"|"allow_always"|
     # "reject_once"|"reject_always"); kiro-cli uses id/label with id
@@ -1516,7 +1525,8 @@ def build_permission_event(
     # Resolve full tool input — the preceding tool_call notification carries the
     # complete params cached by toolCallId; the permission message only has a
     # truncated human-readable title.
-    tool_call_id = tool_call.get("toolCallId", "")
+    raw_tool_call_id = tool_call.get("toolCallId", "")
+    tool_call_id = raw_tool_call_id if isinstance(raw_tool_call_id, str) else ""
     # ORIGIN-BOUND cache key. toolCallIds are backend/LLM-authored: without
     # scoping, a child session could replay a consumed parent toolCallId and
     # inherit the parent's trusted provenance (params/shell/MCP identity) for

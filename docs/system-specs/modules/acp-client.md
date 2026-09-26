@@ -547,9 +547,17 @@ cancelled caller still lets the worker settle).
 
 Both the shared runtime and the legacy direct `AcpClient` route permission
 frames through `_dispatch.build_permission_event`, including the same provenance
-flags. A shell-cache hit whose value is `False` sets `shell_classified=True` —
-it is a resolved non-shell call, not a cache miss — and a structured-params
-cache hit sets `raw_params_trusted=True`.
+flags. The builder accepts string, integer, and float request ids, with booleans
+excluded. A float id (`5.0`) stays a float in the pending-request maps and is
+echoed unchanged by either an approval or rejection. A boolean, list, dict, or
+null id produces no event. A non-null invalid id is answered exactly once with
+JSON-RPC `-32600` (`"invalid request id"`) and touches no pending-request map; a
+null id remains a notification and is skipped without a reply or audit row.
+String-valued `toolCall` fields (`title`, `kind`, and `toolCallId`) normalize a non-string value
+to an empty string before redaction, cache lookup, or event construction. A
+shell-cache hit whose value is `False` sets `shell_classified=True` — it is a
+resolved non-shell call, not a cache miss — and a structured-params cache hit
+sets `raw_params_trusted=True`.
 
 The shell cache is written **only** from a usable backend `kind` string. A
 `tool_call` frame that omits `kind` writes nothing — even when its
@@ -636,6 +644,32 @@ genuine miss may carry inline data for display, but both provenance flags remain
 false and consumers that need trusted arguments fail closed.
 
 The host always sends one-shot approvals (`always=False`, the default). Kiro Crew — not the agent — owns the trust scope (`slot._trust`, `slot._trust_reads`, `slot._trusted_patterns`, `safety_override`, `channel.trusted`, parent session `approval_policy`). Per-call `session/request_permission` is required so Kiro Crew's PreToolUse hooks (`auto_deny_tools`, sensitive-path checks, credential redaction) fire on every tool invocation. The `always=True` path is reserved for a future "skip Kiro Crew hooks for this exact tool" feature; no caller passes it today.
+
+### Approval floor in `approve_tool` (`permission_floor.py`)
+
+Both transports' `approve_tool` methods (`AcpClient`, `AcpSessionHandle`) run the
+tool gate's security tiers before sending an `allow`: `_build_permission_event`
+records each event by request id in `_permission_gate_events`, and `approve_tool`
+pops it and calls `permission_floor.refusal_for(event)` off the loop. A SECURITY
+deny (the denied-command floor, the sensitive-path read and write checks, the
+unverifiable-shell refusal) or an id with no recorded event is answered with
+`reject_tool` and a `rejected_transport_floor` SEL row; a gate that cannot be
+built or consulted refuses (fail closed). Refusal reasons keep their original text
+for the in-band result, while operator logs and SEL metadata use the shared
+fail-closed redaction helper. Both methods return `True` only after they send an
+allow answer and `False` when this floor sends a rejection instead.
+Every production caller consumes that result before it records approved state or
+activity. This transport consultation is uncounted and writes no
+`governance_decision` row (`hooks.uncounted_gate`) because the consumer's
+identity-bearing consultation owns the gate decision and its audit.
+Governance (identity-scoped policy) stays with the caller identity: approval
+consumers call `HookManager.on_tool_call` or `refusal_for(event,
+session_key=..., agent=..., security_only=False)` before their approval tiers.
+This includes `stream_and_collect` under `AUTO_APPROVE`, the `AcpClient` internal
+auto-approve path, the evaluation runner, and the code-review pool. When an
+automatic helper resolves a request, it calls the shared identity-aware
+`refusal_for` body off the event loop. Provider adapters only forward an approval
+from a consumer that has completed that consultation.
 
 The rendered tool-input cache is consumed by the first permission event, but
 structured raw params remain keyed by `toolCallId` for the whole turn. A repeated

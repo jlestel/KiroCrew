@@ -431,6 +431,45 @@ class TestPermissionFlow:
         assert rejected == []
 
     @pytest.mark.asyncio
+    async def test_policy_deny_is_rejected_before_safe_tool_approval(self, monkeypatch):
+        approved = []
+        rejected = []
+        seen = {}
+
+        class PermProvider(MockProvider):
+            async def stream(self, message):
+                yield LLMEvent(
+                    kind=EVENT_PERMISSION_REQUEST,
+                    title="WorkspaceSearch",
+                    tool_input='{"searchQuery": "hello"}',
+                    request_id="r-policy",
+                )
+                yield LLMEvent(kind=EVENT_COMPLETE)
+
+            async def approve_tool(self, request_id):
+                approved.append(request_id)
+
+            async def reject_tool(self, request_id):
+                rejected.append(request_id)
+
+        def _deny(event, **kwargs):
+            seen.update(kwargs)
+            return "policy"
+
+        runner_module = __import__("kiro_crew.eval.runner", fromlist=["refusal_for"])
+        refusal_for = getattr(runner_module, "refusal_for", None)
+        assert refusal_for is not None, "eval runner has no identity-bearing permission gate"
+        monkeypatch.setattr(runner_module, "refusal_for", _deny)
+        runner = EvalRunner(provider_factory=lambda key, **kw: PermProvider())
+
+        await runner._run_turn(PermProvider(), Turn(user="search"), "eval-session")
+
+        assert approved == []
+        assert rejected == ["r-policy"]
+        assert seen["session_key"] == "eval-session"
+        assert seen["security_only"] is False
+
+    @pytest.mark.asyncio
     async def test_prefix_match_no_path_rejected(self):
         """Prefix-match tool with non-empty input but no extractable path is rejected."""
         approved = []
@@ -562,6 +601,100 @@ class TestPermissionFlow:
         await runner.run_scenario(scenario)
         assert approved == []
         assert rejected == ["r1"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("title", "tool_input"),
+        [("WorkspaceSearch", '{"searchQuery": "hello"}'), ("read_file", '{"path": "/tmp/safe.txt"}')],
+    )
+    @pytest.mark.parametrize(
+        ("approval_sent", "expected"),
+        [(True, "approved"), (False, "rejected_transport_floor")],
+    )
+    async def test_safe_tool_writes_pending_then_the_outcome(
+        self, monkeypatch, title, tool_input, approval_sent, expected
+    ):
+        """A pending row precedes the wire call; the definitive row follows the answer."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew.permission_floor import (
+            OUTCOME_PENDING_APPROVAL,
+            OUTCOME_REJECTED_TRANSPORT_FLOOR,
+        )
+
+        assert OUTCOME_REJECTED_TRANSPORT_FLOOR == "rejected_transport_floor"
+        audit = MagicMock()
+        monkeypatch.setattr("kiro_crew.eval.runner.sel", lambda: audit)
+
+        class PermProvider(MockProvider):
+            async def stream(self, message):
+                yield LLMEvent(
+                    kind=EVENT_PERMISSION_REQUEST,
+                    title=title,
+                    tool_input=tool_input,
+                    request_id="r1",
+                )
+                yield LLMEvent(kind=EVENT_COMPLETE)
+
+            async def approve_tool(self, request_id):
+                return approval_sent
+
+            async def reject_tool(self, request_id):
+                raise AssertionError("a safe tool is never rejected by the runner")
+
+        runner = EvalRunner(provider_factory=lambda key, **kw: PermProvider())
+        await runner._run_turn(PermProvider(), Turn(user="go"), "eval-session")
+        outcomes = [
+            call.kwargs.get("outcome")
+            for call in audit.log_tool_invocation.call_args_list
+            if call.kwargs.get("tool_name") == title
+        ]
+        assert outcomes == [OUTCOME_PENDING_APPROVAL, expected]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("title", "tool_input"),
+        [("WorkspaceSearch", '{"searchQuery": "hello"}'), ("read_file", '{"path": "/tmp/safe.txt"}')],
+    )
+    async def test_safe_tool_approval_is_audited_when_the_transport_raises(
+        self, monkeypatch, title, tool_input
+    ):
+        """``approve_tool`` can raise (a dead runtime); the decision must already be on record."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew.acp.session_handle import AcpRuntimeDead
+        from kiro_crew.permission_floor import OUTCOME_PENDING_APPROVAL
+
+        audit = MagicMock()
+        monkeypatch.setattr("kiro_crew.eval.runner.sel", lambda: audit)
+
+        class PermProvider(MockProvider):
+            async def stream(self, message):
+                yield LLMEvent(
+                    kind=EVENT_PERMISSION_REQUEST,
+                    title=title,
+                    tool_input=tool_input,
+                    request_id="r-dead",
+                )
+                yield LLMEvent(kind=EVENT_COMPLETE)
+
+            async def approve_tool(self, request_id):
+                raise AcpRuntimeDead("runtime gone")
+
+            async def reject_tool(self, request_id):
+                raise AssertionError("a safe tool is never rejected by the runner")
+
+        runner = EvalRunner(provider_factory=lambda key, **kw: PermProvider())
+        with pytest.raises(AcpRuntimeDead):
+            await runner._run_turn(PermProvider(), Turn(user="go"), "eval-session")
+        rows = [
+            call.kwargs
+            for call in audit.log_tool_invocation.call_args_list
+            if call.kwargs.get("tool_name") == title
+        ]
+        assert [row["outcome"] for row in rows] == [OUTCOME_PENDING_APPROVAL]
+        assert rows[0]["session_key"] == "eval-session"
+        assert rows[0]["source"] == "eval_runner"
 
 
 # ── Dimension Scoring Tests ──

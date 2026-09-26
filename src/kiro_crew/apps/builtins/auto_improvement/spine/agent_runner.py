@@ -46,6 +46,10 @@ from kiro_crew.hooks import (
     hook_gate_kwargs,
     hooks_config_from_config_dict,
 )
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+)
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import SIGKILL, kill_process_tree
 from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
@@ -1663,7 +1667,7 @@ class SessionAgentRunner:
                 source="auto_improvement_loop",
                 tool_name=tool or "tool",
                 tool_kind=tool,
-                outcome="auto_approved",
+                outcome=OUTCOME_PENDING_APPROVAL,
                 request_id=rid,
                 metadata={"unattended": True, "containment": "worktree+allowlist+gate"},
                 critical=True,
@@ -1684,7 +1688,20 @@ class SessionAgentRunner:
             # unattended loop is exactly the caller that must not buy a blanket exemption
             # with its first approval; re-deciding per call is the whole point of routing
             # through here.
-            await provider.approve_tool(rid)
+            approval_sent = await provider.approve_tool(rid)
+            outcome = (
+                OUTCOME_REJECTED_TRANSPORT_FLOOR if approval_sent is False else "auto_approved"
+            )
+            sel().log_tool_invocation(
+                session_key=session_key or "auto-improvement",
+                agent="auto-improvement",
+                source="auto_improvement_loop",
+                tool_name=tool or "tool",
+                tool_kind=tool,
+                outcome=outcome,
+                request_id=rid,
+                metadata={"unattended": True, "containment": "worktree+allowlist+gate"},
+            )
         except Exception:  # noqa: BLE001
             pass
 

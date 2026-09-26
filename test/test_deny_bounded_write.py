@@ -1122,12 +1122,15 @@ class TestEveryBackendIdLogSiteIsSanitized:
             "Deferring non-matching response: id=%s (waiting for %d)",
             "ACP event: method=%s id=%s action=%s",
             "Permission requested for tool: %s (req=%s)",
+            "approve_tool: security floor rejected req=%s: %s",
+            "auto-approve identity gate rejected req=%s: %s",
         ],
         "src/kiro_crew/acp/session_handle.py": [
             "reject_tool: no deny option advertised for req=%s",
             "rejected permission request id=%s stranded in the ",
             "Dropping stray response frame id=%s (no waiter)",
             "id=%s for fidelity-unaware consumer (child=%s)",
+            "approve_tool: security floor rejected req=%s: %s",
         ],
         "src/kiro_crew/acp/runtime.py": [
             "send_notification method=%s: %s; activity clock not refreshed",
@@ -1185,6 +1188,8 @@ class TestEveryBackendIdLogSiteIsSanitized:
         "auto-rejected permission request id=%s for session %s ": 3,  # title, reason, outcome
         "answer-task cap (%d) reached at %s request id=%s%s and no ": 2,  # kind, suffix
         "ACP event: method=%s id=%s action=%s": 1,  # action
+        "approve_tool: security floor rejected req=%s: %s": 1,  # reason
+        "auto-approve identity gate rejected req=%s: %s": 1,  # reason
         "send_notification method=%s: %s; activity clock not refreshed": 1,  # outcome
         "Permission requested for tool: %s (req=%s)": 1,  # title (redacted upstream)
     }

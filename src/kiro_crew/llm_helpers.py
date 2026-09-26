@@ -19,7 +19,7 @@ from dataclasses import field as dataclass_field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew import name_grant
+from kiro_crew import name_grant, permission_floor
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
@@ -34,6 +34,7 @@ from kiro_crew.hooks import (
 )
 from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.messaging.link import canonical_key
+from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.platform.tool_paths import (
     command_shaped_strings,
     edit_target_candidates,
@@ -2138,6 +2139,8 @@ async def stream_and_collect(
         message: The prompt to send.
         approval_policy: How to handle tool permission requests.
         hooks: HookManager for the HOOK_BASED and READ_ONLY approval policies.
+            AUTO_APPROVE consults the shared identity-aware permission floor
+            directly.
         on_chunk: Optional callback invoked with each text chunk (for progress).
         on_tool_approval: Optional async callback for interactive approval.
         on_steer_consumed: Optional callback invoked with the backend's
@@ -2177,14 +2180,11 @@ async def stream_and_collect(
         app: Owning app name, forwarded to the gate so the app's governance
             PROFILE is resolved — not just the enterprise ceiling.
 
-            All three matter for ``HOOK_BASED`` and ``READ_ONLY`` callers
-            specifically. The gate
-            resolves ``ceiling ∩ profile``, and it can only look up a profile it
-            has been told the name of; with all three empty it applied the
-            ceiling alone, so an app profile narrowing (say) ``filesystem.write``
-            was silently not enforced for tools this helper approved. Callers
-            using ``REJECT_ALL`` or ``AUTO_APPROVE`` are unaffected — the first
-            runs no tools, the second never consults the gate.
+            All three matter for ``AUTO_APPROVE``, ``HOOK_BASED``, and
+            ``READ_ONLY`` callers. The gate resolves ``ceiling ∩ profile``, and
+            it can only look up a profile it has been told the name of; with all
+            three empty it applies the ceiling alone. ``REJECT_ALL`` runs no
+            tools. Every other policy consults the gate before an approval.
         fallback_models: Ordered chain of model ids tried when the same-model
             transient budget exhausts on a throttle/capacity error (Case 2.75).
             Empty (the default) disables the chain — behavior is byte-for-byte
@@ -2817,6 +2817,24 @@ async def _resolve_permission(
         _log("rejected", metadata={"reason": "read_only_policy_no_hooks"})
         return False
 
+    if policy == ToolApprovalPolicy.AUTO_APPROVE:
+        reason = await asyncio.to_thread(
+            permission_floor.refusal_for,
+            event,
+            session_key=session_key,
+            agent=agent,
+            app=app,
+            security_only=False,
+        )
+        if reason is not None:
+            _log(
+                "denied",
+                error=reason,
+                metadata={"mechanism": "policy_deny"},
+            )
+            await provider.reject_tool(event.request_id)
+            return False
+
     if policy in (ToolApprovalPolicy.HOOK_BASED, ToolApprovalPolicy.READ_ONLY) and hooks:
         tool_result = hooks.on_tool_call(
             event.title,
@@ -2876,9 +2894,15 @@ async def _resolve_permission(
             # silent auto-approve of a shadowed name on an unwatched turn.
             _ng_refusal = await name_grant.refusal_for_event(event)
             if _ng_refusal is None:
-                await provider.approve_tool(event.request_id)
-                _log("auto_approved", metadata={"reason": "hook_auto_approve"})
-                return True
+                approval_sent = await provider.approve_tool(event.request_id)
+                if approval_sent is not False:
+                    _log("auto_approved", metadata={"reason": "hook_auto_approve"})
+                else:
+                    _log(
+                        OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                        metadata={"mechanism": "always_deny_transport"},
+                    )
+                return approval_sent is not False
             if name_grant.should_log_decline(session_key, _ng_refusal):
                 logger.warning(
                     "declining a hook auto-approve: %s; the request falls through "
@@ -2924,9 +2948,12 @@ async def _resolve_permission(
             return False
 
     # Default: auto-approve
-    await provider.approve_tool(event.request_id)
-    _log("auto_approved")
-    return True
+    approval_sent = await provider.approve_tool(event.request_id)
+    if approval_sent is not False:
+        _log("auto_approved")
+    else:
+        _log(OUTCOME_REJECTED_TRANSPORT_FLOOR, metadata={"mechanism": "always_deny_transport"})
+    return approval_sent is not False
 
 
 # ── JSON Parsing ──

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
-from kiro_crew import name_grant
+from kiro_crew import name_grant, permission_floor
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import live
 from kiro_crew.config.paths import config_dir
@@ -1207,25 +1207,71 @@ async def _stream_task(
                         session_key=agent.session_key,
                         agent=agent.agent_name,
                         source="channel",
-                        tool_name=event.text,
+                        tool_name=event.text or event.title or "",
                         outcome="rejected_blocked_tool",
+                    )
+                    await client.reject_tool(event.request_id)
+                    continue
+                # The PreToolUse gate outranks every approval tier below: YOLO,
+                # channel trust, a command grant and the human card all sit
+                # behind it, as session trust does on every other surface.
+                # Asked with this agent's session and name so its governance
+                # profile applies; any deny refuses. This is the channel's own
+                # (counted) gate decision; the transport's approve_tool runs the
+                # identity-free security floor again, uncounted.
+                _gate_reason = await asyncio.to_thread(
+                    permission_floor.refusal_for,
+                    event,
+                    session_key=agent.session_key,
+                    agent=agent.agent_name,
+                    security_only=False,
+                )
+                if _gate_reason is not None:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        # Permission events populate ``title``; ``text`` is empty.
+                        tool_name=event.text or event.title,
+                        outcome="rejected_hook_deny",
+                        metadata={"reason": _gate_reason},
                     )
                     await client.reject_tool(event.request_id)
                     continue
                 # YOLO mode (global) or channel trust — auto-approve
                 if (is_yolo and is_yolo()) or channel.trusted:
+                    approval_outcome = (
+                        "auto_approved_yolo"
+                        if (is_yolo and is_yolo())
+                        else "auto_approved_channel_trust"
+                    )
+                    # Audit BEFORE the wire call: approve_tool can raise, and a
+                    # decision that reached the transport must not vanish from
+                    # the SEL when it does. The definitive row follows below.
                     sel().log_tool_invocation(
                         session_key=agent.session_key,
                         agent=agent.agent_name,
                         source="channel",
-                        tool_name=event.text,
-                        outcome=(
-                            "auto_approved_yolo"
-                            if (is_yolo and is_yolo())
-                            else "auto_approved_channel_trust"
-                        ),
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
                     )
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is False:
+                        sel().log_tool_invocation(
+                            session_key=agent.session_key,
+                            agent=agent.agent_name,
+                            source="channel",
+                            tool_name=event.text or event.title or "",
+                            outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                        )
+                    else:
+                        sel().log_tool_invocation(
+                            session_key=agent.session_key,
+                            agent=agent.agent_name,
+                            source="channel",
+                            tool_name=event.text or event.title or "",
+                            outcome=approval_outcome,
+                        )
                     continue
                 # Per-command trust grants (trust_command / trust_base) — agent-
                 # scoped patterns granted via the approve endpoint. Security:
@@ -1260,15 +1306,34 @@ async def _stream_task(
                         # tier still auto-approves.
                         _ng_refusal = await name_grant.refusal_for_command_off_loop(_cmd)
                         if _ng_refusal is None:
+                            # Audit BEFORE the wire call (approve_tool can raise);
+                            # the definitive row follows below.
                             sel().log_tool_invocation(
                                 session_key=agent.session_key,
                                 agent=agent.agent_name,
                                 source="channel",
                                 tool_name=event.text or event.title or "",
-                                outcome="auto_approved_trusted_pattern",
+                                outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
                                 metadata={"pattern": matched},
                             )
-                            await client.approve_tool(event.request_id)
+                            approval_sent = await client.approve_tool(event.request_id)
+                            if approval_sent is False:
+                                sel().log_tool_invocation(
+                                    session_key=agent.session_key,
+                                    agent=agent.agent_name,
+                                    source="channel",
+                                    tool_name=event.text or event.title or "",
+                                    outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                )
+                            else:
+                                sel().log_tool_invocation(
+                                    session_key=agent.session_key,
+                                    agent=agent.agent_name,
+                                    source="channel",
+                                    tool_name=event.text or event.title or "",
+                                    outcome="auto_approved_trusted_pattern",
+                                    metadata={"pattern": matched},
+                                )
                             continue
                         name_grant.log_decline(
                             source="channel",
@@ -1430,14 +1495,6 @@ async def _stream_task(
                 if decision not in ("approved", "rejected", "trust"):
                     decision = "rejected"
 
-                sel().log_tool_invocation(
-                    session_key=agent.session_key,
-                    agent=agent.agent_name,
-                    source="channel",
-                    tool_name=event.text,
-                    outcome=decision,
-                )
-
                 if decision in ("approved", "trust") and _is_shell and _cmd:
                     # A human read this exact command and said yes: record the
                     # identity of the file behind each program name (same
@@ -1448,13 +1505,52 @@ async def _stream_task(
                     # and get the replacement pinned. Runs off-loop (stats +
                     # digests files).
                     await asyncio.to_thread(name_grant.pin_human_approval, _cmd)
+                if decision in ("approved", "trust"):
+                    # Audit BEFORE the wire call (approve_tool can raise); the
+                    # definitive row follows below. A rejection is audited once.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
+                        metadata={"human_decision": decision},
+                    )
                 if decision == "trust":
                     channel.trusted = True
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
                 elif decision == "approved":
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
                 else:
+                    # A rejection is audited once, BEFORE the wire call:
+                    # reject_tool can raise when the ACP child is gone, and
+                    # the human's "no" must reach the log either way.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=decision,
+                    )
                     await client.reject_tool(event.request_id)
+                    continue
+                if approval_sent is False:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                        metadata={"human_decision": decision},
+                    )
+                else:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=decision,
+                    )
 
             elif event.kind == EVENT_COMPLETE:
                 break

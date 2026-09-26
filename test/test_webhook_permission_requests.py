@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from kiro_crew import name_grant
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
@@ -35,6 +37,10 @@ from kiro_crew.dashboard.handlers.hooks import (
     _run_hook_inner,
 )
 from kiro_crew.hooks import TOOL_ALLOW, TOOL_AUTO_APPROVE, TOOL_DENY, ToolHookResult
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+)
 
 _REQUEST_ID = "perm-req-9790"
 
@@ -58,10 +64,13 @@ def _permission_event(**overrides: object) -> AcpEvent:
 class _FakeClient:
     """Stand-in for the ACP client: one permission request, then complete."""
 
-    def __init__(self, permission_event: AcpEvent | None = None) -> None:
+    def __init__(
+        self, permission_event: AcpEvent | None = None, *, approval_sent: bool = True
+    ) -> None:
         self.approved: list[str | int] = []
         self.rejected: list[str | int] = []
         self._permission_event = permission_event or _permission_event()
+        self._approval_sent = approval_sent
         # read_effective_agent / _resolve_model walk the wrapper chain for these.
         self._agent = "kirocrew"
         self._model = "claude-test"
@@ -72,8 +81,9 @@ class _FakeClient:
         yield AcpEvent(kind=EVENT_TEXT_CHUNK, text="world")
         yield AcpEvent(kind=EVENT_COMPLETE, usage=TurnUsage(duration_ms=0, credits=1.0))
 
-    async def approve_tool(self, request_id, *, always: bool = False) -> None:
+    async def approve_tool(self, request_id, *, always: bool = False) -> bool:
         self.approved.append(request_id)
+        return self._approval_sent
 
     async def reject_tool(self, request_id) -> None:
         self.rejected.append(request_id)
@@ -129,7 +139,14 @@ class _RecordingSel:
         return lambda *a, **k: None
 
 
-def _drive(monkeypatch, gate_action: str | None, *, gate_result=None, event=None):
+def _drive(
+    monkeypatch,
+    gate_action: str | None,
+    *,
+    gate_result=None,
+    event=None,
+    approval_sent: bool = True,
+):
     """Run one webhook turn; return (client, sel, gate, result_text)."""
     sel = _RecordingSel()
     # _sel() in handlers/hooks.py resolves through the handlers package's
@@ -141,7 +158,7 @@ def _drive(monkeypatch, gate_action: str | None, *, gate_result=None, event=None
     # tests intercept).
     monkeypatch.setattr(usage, "_write_token_record", lambda _record, _now: None)
 
-    client = _FakeClient(event)
+    client = _FakeClient(event, approval_sent=approval_sent)
     if gate_result is None and gate_action is not None:
         gate_result = ToolHookResult(action=gate_action)
     gate = _FakeGate(gate_result) if gate_result is not None else None
@@ -219,6 +236,18 @@ def test_gate_auto_approve_approves_once_and_audits(monkeypatch):
     assert approvals[0]["source"] == "webhook"
     assert approvals[0]["request_id"] == _REQUEST_ID
     assert result_text == "hello world"
+
+
+@pytest.mark.parametrize("approval_sent", [True, False])
+def test_auto_approve_audits_pending_then_transport_result(monkeypatch, approval_sent):
+    client, sel, _gate, _text = _drive(monkeypatch, TOOL_AUTO_APPROVE, approval_sent=approval_sent)
+
+    expected = "auto_approved" if approval_sent else OUTCOME_REJECTED_TRANSPORT_FLOOR
+    outcomes = [row["outcome"] for row in sel.tool_rows]
+    assert outcomes == [OUTCOME_PENDING_APPROVAL, expected]
+    assert client.approved == [_REQUEST_ID]
+    if not approval_sent:
+        assert "auto_approved" not in outcomes
 
 
 def test_gate_exception_denies_and_still_answers(monkeypatch):
@@ -299,7 +328,7 @@ def test_unauditable_auto_approve_is_denied(monkeypatch):
     class _RaisingSel(_RecordingSel):
         def log_tool_invocation(self, **kwargs) -> None:
             sel_calls.append(kwargs)
-            if kwargs.get("outcome") == "auto_approved":
+            if kwargs.get("outcome") == OUTCOME_PENDING_APPROVAL:
                 raise OSError("audit disk full")
 
     import kiro_crew.dashboard.handlers as handlers_pkg
@@ -320,8 +349,8 @@ def test_unauditable_auto_approve_is_denied(monkeypatch):
     assert client.rejected == [_REQUEST_ID], "unaudited approval must become a reject"
     assert client.approved == []
     assert result_text == "hello world"
-    # The auto-approve audit was ATTEMPTED with critical=True before the wire.
-    attempted = [c for c in sel_calls if c.get("outcome") == "auto_approved"]
+    # The pending audit was ATTEMPTED with critical=True before the wire.
+    attempted = [c for c in sel_calls if c.get("outcome") == OUTCOME_PENDING_APPROVAL]
     assert attempted and attempted[0].get("critical") is True
     # The decision itself is still recorded: a best-effort denial row names
     # the audit failure so the permission decision cannot vanish from SEL.

@@ -26,7 +26,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from kiro_crew import acp_tool_gate, model_registry
+from kiro_crew import acp_tool_gate, model_registry, permission_floor
 from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
     DRAIN_YIELD_AFTER_S,
@@ -1118,6 +1118,10 @@ class AcpSessionHandle:
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
         self._permission_options: dict[str | int, dict[str, str]] = {}
+        # Request id -> the permission event built for it, so approve_tool can
+        # put the request through the security floor (``permission_floor``)
+        # whichever consumer answers it.
+        self._permission_gate_events: dict[str | int, AcpEvent] = {}
         # req_ids of in-flight _wait_for_response calls (send_command /
         # set_config_option / compact). The prompt dispatch loop shares this
         # session's queue, so when it dequeues one of these responses it uses
@@ -1431,6 +1435,7 @@ class AcpSessionHandle:
         self._tool_call_tool_name.clear()
         self._native_child_tool_call_ids.clear()
         self._permission_options.clear()
+        self._permission_gate_events.clear()
         # Per-turn reset (parity with kiro-cli's authoritative full subagent_list
         # each turn): otherwise a completed sub-agent from a prior turn stays in
         # the roster and is re-emitted in the next turn's EVENT_SUBAGENT_LIST,
@@ -1882,7 +1887,7 @@ class AcpSessionHandle:
 
     # ── Tool Approval ──
 
-    async def approve_tool(self, request_id: str | int, option_id: str | None = None) -> None:
+    async def approve_tool(self, request_id: str | int, option_id: str | None = None) -> bool:
         """Approve a pending permission request.
 
         ``option_id`` overrides the auto-resolved id when provided. Otherwise the
@@ -1892,7 +1897,30 @@ class AcpSessionHandle:
         literals when nothing was recorded. This keeps kiro-cli
         ("allow_once"/"allow_always") and claude-agent-acp ("allow"/"allow_always")
         working without the caller knowing the backend.
+
+        Every approval first passes the security floor
+        (:mod:`kiro_crew.permission_floor`): a request the deny floor or the
+        sensitive-path checks refuse is REJECTED here, whichever consumer asked
+        to approve it and whether or not that consumer consulted the gate.
         """
+        gate_event = self._permission_gate_events.pop(request_id, None)
+        # No recorded event means no request this transport built, so there is
+        # nothing the floor could judge: refuse rather than approve unjudged.
+        if gate_event is None:
+            reason: str | None = permission_floor.REASON_NO_EVENT
+        else:
+            reason = await asyncio.to_thread(permission_floor.refusal_for, gate_event)
+        if reason is not None:
+            logger.warning(
+                "approve_tool: security floor rejected req=%s: %s",
+                _loggable_request_id(request_id),
+                permission_floor.loggable_reason(reason),
+            )
+            await asyncio.to_thread(
+                permission_floor.audit_refusal, gate_event, reason, request_id=request_id
+            )
+            await self.reject_tool(request_id)
+            return False
         resolved_id = option_id
         recorded = self._permission_options.pop(request_id, None)
         # Answered — the turn is no longer waiting on a human. Also closes the
@@ -1912,6 +1940,7 @@ class AcpSessionHandle:
             request_id,
             {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": resolved_id}},
         )
+        return True
 
     async def reject_tool(self, request_id: str | int) -> None:
         """Reject a pending permission request.
@@ -1925,6 +1954,7 @@ class AcpSessionHandle:
         later tool call in it without prompting.
         """
         recorded = self._permission_options.pop(request_id, None)
+        self._permission_gate_events.pop(request_id, None)
         # Answered (see approve_tool) — a rejection ends the human wait too.
         self._end_human_wait()
         reject_id = recorded.get("reject") if recorded else None
@@ -2116,7 +2146,7 @@ class AcpSessionHandle:
         is stored.
         """
         safe_title = redact_text(str(title)[:4096])[:120] if title else "<unknown>"
-        rid = request_id if isinstance(request_id, (str, int)) else ""
+        rid = request_id if isinstance(request_id, (str, int, float)) else ""
         # Hang-resilience series: handle-owned denials (fail-close fidelity
         # gate, pre-turn drain). CHILD-origin only — the pre-turn drain also
         # answers abandoned PARENT-turn requests (sub_session_id empty), and
@@ -3975,6 +4005,10 @@ class AcpSessionHandle:
 
                 if action == "permission":
                     _perm_event = self._build_permission_event(msg)
+                    if _perm_event is None:
+                        if msg.id is not None:
+                            await self._runtime.send_error(msg.id, -32600, "invalid request id")
+                        continue
                     # Before the fidelity gate: a tool the spec switched off is
                     # refused whether or not this consumer opted into the child
                     # contract, and naming that reason in the audit is more use
@@ -5020,7 +5054,7 @@ class AcpSessionHandle:
         except Exception:
             logger.warning("KAS executeHook refusal undeliverable for %s", self._session_id)
 
-    def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
+    def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent | None:
         """Build an AcpEvent for a permission request via the shared parser.
 
         Delegates to _dispatch.build_permission_event so this transport reads the
@@ -5045,8 +5079,12 @@ class AcpSessionHandle:
             cache_scope=str(_perm_params.get("sessionId") or self._session_id),
             kas_consent_meta=self._runtime.acp_backend == ACP_BACKEND_KAS,
         )
+        if event is None:
+            return None
         if recorded is not None and event.request_id != "":
             self._permission_options[event.request_id] = recorded
+        if event.request_id != "":
+            self._permission_gate_events[event.request_id] = event
         # A frame the runtime routed here for a backend-internal subagent
         # carries the CHILD's sessionId, not this handle's. Mark the origin so
         # the policy consumer can tell reduced-fidelity requests apart. Child

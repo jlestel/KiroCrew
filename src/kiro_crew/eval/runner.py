@@ -21,6 +21,11 @@ from typing import Any
 from kiro_crew.eval.scenario import Assertion, AssertionType, Scenario, SeedProfile, Session, Turn
 from kiro_crew.memory import MemoryStore
 from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+    refusal_for,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -480,29 +485,71 @@ class EvalRunner:
             elif event.kind == EVENT_PERMISSION_REQUEST:
                 from kiro_crew.security import is_sensitive_path
 
-                safety = self._classify_safe_tool(event)
-                if safety in ("exact", "prefix_api"):
-                    # Known read-only API — approve without path check
+                reason = await asyncio.to_thread(
+                    refusal_for,
+                    event,
+                    session_key=session_key,
+                    agent="",
+                    security_only=False,
+                )
+                if reason is not None:
+                    logger.warning("Rejected tool by permission gate: %s", event.title)
                     sel().log_tool_invocation(
                         session_key=session_key,
                         tool_name=event.title,
-                        outcome="approved",
+                        outcome="rejected_hook_deny",
                         source="eval_runner",
                     )
-                    await provider.approve_tool(event.request_id)
+                    await provider.reject_tool(event.request_id)
+                    continue
+
+                safety = self._classify_safe_tool(event)
+                if safety in ("exact", "prefix_api"):
+                    # Known read-only API — approve without path check.
+                    # Audit BEFORE the wire call (approve_tool can raise); the
+                    # definitive row follows.
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        tool_name=event.title,
+                        outcome=OUTCOME_PENDING_APPROVAL,
+                        source="eval_runner",
+                    )
+                    approval_sent = await provider.approve_tool(event.request_id)
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        tool_name=event.title,
+                        outcome=(
+                            "approved"
+                            if approval_sent is not False
+                            else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                        ),
+                        source="eval_runner",
+                    )
                 elif safety == "prefix_fs":
                     # Filesystem operation — deny-by-default path check
                     target = self._extract_path_from_input(event.tool_input or "")
                     if target:
                         target = str(Path(target).expanduser().resolve())
                     if target and not is_sensitive_path(target):
+                        # Audit BEFORE the wire call (approve_tool can raise);
+                        # the definitive row follows.
                         sel().log_tool_invocation(
                             session_key=session_key,
                             tool_name=event.title,
-                            outcome="approved",
+                            outcome=OUTCOME_PENDING_APPROVAL,
                             source="eval_runner",
                         )
-                        await provider.approve_tool(event.request_id)
+                        approval_sent = await provider.approve_tool(event.request_id)
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            tool_name=event.title,
+                            outcome=(
+                                "approved"
+                                if approval_sent is not False
+                                else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                            ),
+                            source="eval_runner",
+                        )
                     else:
                         outcome = "rejected_sensitive" if target else "rejected_no_path"
                         logger.warning("Rejected tool (path check failed): %s", event.title)

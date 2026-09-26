@@ -29,6 +29,10 @@ from kiro_crew.hooks import (
     mcp_identity_ref,
     target_paths,
 )
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -998,7 +1002,7 @@ async def _answer_permission(
         # best-effort by necessity -- the writer that just failed is the only one
         # available -- so it is attempted and its own failure only logged.
         try:
-            await _audit_off_loop(gate, event, "allowed", critical=True)
+            await _audit_off_loop(gate, event, OUTCOME_PENDING_APPROVAL, critical=True)
         except Exception:
             logger.warning("SEL audit unwritable; refusing the approved call", exc_info=True)
             await _audit_refusal(gate, event, error=_UNAUDITABLE_CODE)
@@ -1013,7 +1017,9 @@ async def _answer_permission(
             except Exception:
                 logger.warning("Could not prepare the CLI audit-denial notice", exc_info=True)
             return
-        await provider.approve_tool(event.request_id)
+        approval_sent = await provider.approve_tool(event.request_id)
+        outcome = OUTCOME_REJECTED_TRANSPORT_FLOOR if approval_sent is False else "allowed"
+        await _audit_off_loop(gate, event, outcome)
     else:
         # Deliberately NOT critical, and the asymmetry is the point: this call is
         # already being refused, so a lost record cannot authorize anything. Making

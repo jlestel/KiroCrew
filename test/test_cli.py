@@ -7181,6 +7181,7 @@ class TestChatPermissionRequest:
         async def approve_tool(self, request_id, *, always: bool = False):
             self.trace.append(("approve", request_id, always))
             self.answered.set()
+            return True
 
         async def reject_tool(self, request_id):
             self.trace.append(("reject", request_id, False))
@@ -7250,7 +7251,11 @@ class TestChatPermissionRequest:
             ),
             timeout=self._TIMEOUT,
         )
-        return provider, [t[1] for t in trace if t[0] == "sel"], reads
+        return (
+            provider,
+            [t[1] for t in trace if t[0] == "sel" and t[1].get("outcome") != "approval_pending"],
+            reads,
+        )
 
     # ── The security gate ────────────────────────────────────────────────
 
@@ -7302,7 +7307,7 @@ class TestChatPermissionRequest:
         "event_kw,answer,order,code",
         [
             (dict(title="x", command="rm -rf /"), "a", ["sel", "reject"], "hook_deny"),
-            ({}, "a", ["sel", "approve"], ""),
+            ({}, "a", ["sel", "approve", "sel"], ""),
             ({}, "d", ["sel", "reject"], "user_denied"),
         ],
     )
@@ -7647,7 +7652,10 @@ class TestChatPermissionRequest:
 
         assert provider.calls == [("reject", 7, False)], "the tool must not run unaudited"
         outcomes = [(s[1]["outcome"], s[1].get("error", "")) for s in trace if s[0] == "sel"]
-        assert ("allowed", "") in outcomes, "the critical attempt must have been made"
+        assert (
+            "approval_pending",
+            "",
+        ) in outcomes, "the critical pending record must have been attempted"
         assert ("denied", "audit_unwritable") in outcomes, (
             "the downgrade must be recorded under its OWN code -- the operator said "
             "yes, so an audit reader must not be told they refused"
@@ -7676,8 +7684,40 @@ class TestChatPermissionRequest:
         await _drive("a", "allow")
         await _drive("d", "deny")
 
-        assert seen["allow"] == [True], "the approval must be audit-or-deny"
+        assert seen["allow"] == [
+            True,
+            False,
+        ], "the pending record must be audit-or-deny and the result must follow the wire"
         assert seen["deny"] == [False], "a refusal must not be gated on its own audit"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("approval_sent", [True, False])
+    async def test_approval_audit_records_pending_then_transport_result(
+        self, monkeypatch, approval_sent
+    ):
+        import kiro_crew.cli_chat as cli_chat
+
+        trace: list = []
+
+        class _Provider(self._GatedProvider):
+            async def approve_tool(self, request_id, *, always: bool = False):
+                self.trace.append(("approve", request_id, always))
+                self.answered.set()
+                return approval_sent
+
+        self._patch_env(monkeypatch, trace=trace, answer="a")
+        provider = _Provider(self._event(), trace)
+        await asyncio.wait_for(
+            cli_chat._send_and_print(provider, "run it", interactive=True, gate=self._gate()),
+            timeout=self._TIMEOUT,
+        )
+
+        outcomes = [entry[1]["outcome"] for entry in trace if entry[0] == "sel"]
+        expected = "allowed" if approval_sent else cli_chat.OUTCOME_REJECTED_TRANSPORT_FLOOR
+        assert outcomes == [cli_chat.OUTCOME_PENDING_APPROVAL, expected]
+        assert provider.calls == [("approve", 7, False)]
+        if not approval_sent:
+            assert "allowed" not in outcomes
 
     @pytest.mark.asyncio
     async def test_the_prompt_and_the_gate_share_one_set_of_path_spellings(self, monkeypatch):

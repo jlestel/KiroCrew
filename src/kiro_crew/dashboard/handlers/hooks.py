@@ -26,6 +26,10 @@ from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, clear_session_execution
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import sanitize_string
 
@@ -1331,7 +1335,7 @@ async def _run_hook_inner(
                             agent=agent or "kirocrew",
                             tool_name=event.title or "unknown",
                             tool_kind=event.tool_kind,
-                            outcome="auto_approved",
+                            outcome=OUTCOME_PENDING_APPROVAL,
                             source="webhook",
                             request_id=str(event.request_id),
                             critical=True,
@@ -1357,7 +1361,21 @@ async def _run_hook_inner(
                         logger.debug("denial record after audit failure also failed", exc_info=True)
                     await client.reject_tool(event.request_id)
                 else:
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    outcome = (
+                        OUTCOME_REJECTED_TRANSPORT_FLOOR
+                        if approval_sent is False
+                        else "auto_approved"
+                    )
+                    _sel().log_tool_invocation(
+                        session_key=session_key,
+                        agent=agent or "kirocrew",
+                        tool_name=event.title or "unknown",
+                        tool_kind=event.tool_kind,
+                        outcome=outcome,
+                        source="webhook",
+                        request_id=str(event.request_id),
+                    )
             else:
                 # Audit the denial BEFORE rejecting, for the same reason.
                 _sel().log_tool_invocation(
