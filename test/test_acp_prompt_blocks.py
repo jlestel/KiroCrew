@@ -750,6 +750,35 @@ class TestImageDownscale:
         assert blocks[1]["mimeType"] == "image/jpeg"
         assert max(_decoded_size(blocks[1])) <= MAX_IMAGE_EDGE_PX
 
+    def test_phone_photo_mpo_keeps_jpeg_both_ways(self, tmp_path):
+        """A JPEG carrying MPF data (phone photo) decodes as Pillow format
+        ``MPO``. Within the cap it rides through byte-identical as
+        ``image/jpeg``; over the cap it is re-encoded as JPEG, not as the far
+        larger PNG a format outside the table converts to."""
+        pil = pytest.importorskip("PIL.Image")
+
+        def _mpo(path, w, h):
+            primary = pil.new("RGB", (w, h), (10, 20, 30))
+            second = pil.new("RGB", (w // 2, h // 2), (40, 50, 60))
+            primary.save(path, format="MPO", save_all=True, append_images=[second])
+            with pil.open(path) as im:
+                assert im.format == "MPO"
+            return path
+
+        small = _mpo(tmp_path / "portrait.jpg", 800, 600)
+        blocks = build_prompt_blocks(f"see {small}")
+        assert blocks[1]["mimeType"] == "image/jpeg"
+        assert base64.b64decode(blocks[1]["data"]) == small.read_bytes()
+
+        big = _mpo(tmp_path / "wide.jpg", 3000, 1000)
+        blocks = build_prompt_blocks(f"see {big}")
+        assert blocks[1]["mimeType"] == "image/jpeg"
+        out = base64.b64decode(blocks[1]["data"])
+        assert out.startswith(b"\xff\xd8\xff")
+        with pil.open(io.BytesIO(out)) as im:
+            assert im.format == "JPEG"
+            assert im.size == (2000, 667)
+
     def test_oversized_gif_becomes_png_still(self, tmp_path):
         """GIF re-encodes to a PNG first frame: the vision model reads frame 0
         only, and palette rescaling is lossy, so a lossless still is faithful."""
