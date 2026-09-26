@@ -1499,9 +1499,210 @@ def _substitution_depth_delta(token: str) -> int:
     indistinguishable from a real one here and a window bounded by this delta
     under-runs on decoyed input.  The bare-``kill`` window recovers by
     re-deriving its bodies from the raw text, where the quotes still exist
-    (:func:`_bare_kill_raw_bodies`).
+    (:func:`_bare_kill_raw_bodies`).  A ``case`` PATTERN's ``)`` is the other
+    shape it cannot tell apart: the argv windows use :class:`_SubstitutionDepth`.
     """
     return token.count("$(") + token.count("`") // 2 - token.count(")")
+
+
+def _outside_expansions(token: str) -> str:
+    """*token* with each ``${ … }`` expansion reduced to the ``$( … )`` it opens.
+
+    A ``)`` inside a parameter expansion (``${v:-x)}``) is expansion text, not a
+    closer; a ``$(`` opened INSIDE it is real and kept with its own closers.
+    """
+    if "${" not in token:
+        return token
+    out: list[str] = []
+    braces = 0
+    open_subs = [0]  # ``$(`` opened per brace level
+    i = 0
+    while i < len(token):
+        if token.startswith("$(", i):
+            open_subs[-1] += 1
+            out.append("$(")
+            i += 2
+            continue
+        if token.startswith("${", i):
+            braces += 1
+            open_subs.append(0)
+            i += 2
+            continue
+        ch = token[i]
+        i += 1
+        if braces and ch == "}":
+            braces -= 1
+            open_subs[-1] += open_subs.pop()  # still-open ``$(`` stay open
+            continue
+        if ch == ")":
+            if open_subs[-1]:
+                open_subs[-1] -= 1
+            elif braces:
+                continue  # an unpaired ``)`` inside ``${ … }`` is text
+        out.append(ch)
+    return "".join(out)
+
+
+class _SubstitutionDepth:
+    """Stateful successor to :func:`_substitution_depth_delta` for argv windows.
+
+    An argv window stops at the first token that ends the argv while NO command
+    substitution is open.  The bare counter cannot judge a ``case`` compound:
+    its grammar reuses ``)`` to close a PATTERN, so ``x)`` scored as a closer,
+    ``x|y)`` as a separator, and every clause after ``esac`` fell out of the
+    window (``kill $(case x in x) :;; esac; pgrep -f <name>)`` -- measured).
+
+    The walker tracks ``case … in … esac``: after ``in`` and after ``;;`` /
+    ``;&`` / ``;;&`` the tokens up to the unbalanced ``)`` are the pattern;
+    ``esac`` leaves the innermost compound; nesting is a counter.  ``case`` and
+    ``esac`` are reserved words only in COMMAND POSITION -- the token-level twin
+    of :func:`_matching_close_paren`'s rule: after a separator, an opener, a
+    keeper (:data:`_KEEPS_COMMAND_POSITION`, ``function``/``coproc`` + name), a
+    bare or pattern ``)``, or through an option word; never right after an
+    ordinary verb (``echo case x in y)`` arms nothing).  A window's first token
+    is an ARGUMENT unless the caller says it starts in command position.  All
+    else is still the character count (the quoted-paren limit stands; see
+    :func:`_bare_kill_raw_bodies`), and a misread only ever KEEPS a window open.
+    """
+
+    __slots__ = (
+        "depth", "_cases", "_await", "_word_depth", "_pattern", "_fresh",
+        "_pattern_chars", "_groups", "_command_next", "_name_next",
+    )  # fmt: skip
+
+    def __init__(self, command_position: bool = False) -> None:
+        self.depth = 0
+        self._cases = 0  # ``case`` compounds currently open
+        self._await = 0  # 1: inside the WORD after ``case``; 2: ``in`` is next
+        self._word_depth = 0  # depth the WORD must return to before ``in``
+        self._pattern = False  # the next tokens are a case pattern
+        self._fresh = False  # no pattern token consumed yet (a leading ``(`` is legal)
+        self._pattern_chars = 0
+        self._groups: list[str] = []  # open pattern groups: "sub" ``$(``, "paren", "brace"
+        self._command_next = command_position  # the next token is in command position
+        self._name_next = False  # the next token is a ``function``/``coproc`` NAME
+
+    @property
+    def top_level(self) -> bool:
+        """True while no command substitution is open."""
+        return self.depth <= 0
+
+    def _arm_pattern(self) -> None:
+        self._pattern = True
+        self._fresh = True
+        self._pattern_chars = 0
+        self._groups = []
+        self._command_next = True  # only ``esac`` reads as a word here
+
+    def _feed_pattern(self, token: str) -> str:
+        """Consume *token* as pattern text; return what follows the pattern's ``)``.
+
+        Tokens are de-quoted.  Bash refuses an unquoted ``)`` as a pattern's FIRST
+        character and refuses ``))`` (measured), so a ``)`` there was quoted and is
+        text: the terminator is the LAST ``)`` of the run.  A bare ``)`` token is
+        the EMPTY pattern (``'')``) and terminates; ``')' )`` and ``'x)'y)`` are the
+        counter's documented quoted-paren limit.  Inside ``${ … }`` a ``)`` is text
+        unless a ``$(`` opened in the same expansion.
+        """
+        i = 1 if self._fresh and token.startswith("(") and not token.startswith("$(") else 0
+        self._fresh = False
+        self._command_next = False
+        while i < len(token):
+            if token.startswith("$(", i):
+                self._groups.append("sub")
+                self.depth += 1
+                i += 2
+                self._pattern_chars += 2
+                continue
+            if token.startswith("${", i):
+                self._groups.append("brace")
+                i += 2
+                self._pattern_chars += 2
+                continue
+            ch = token[i]
+            i += 1
+            self._pattern_chars += 1
+            if ch == "(":
+                self._groups.append("paren")
+            elif ch == "}":
+                if self._groups and self._groups[-1] == "brace":
+                    self._groups.pop()
+            elif ch == ")":
+                if self._groups:
+                    if self._groups[-1] != "brace" and self._groups.pop() == "sub":
+                        self.depth -= 1
+                    continue
+                if self._pattern_chars == 1 and i < len(token):
+                    continue  # a leading ``)`` with text behind it is quoted
+                while i < len(token) and token[i] == ")":
+                    i += 1  # ``))``: the earlier parens are quoted
+                self._pattern = False
+                self._command_next = True  # the clause body opens here
+                return token[i:]
+        return ""
+
+    def feed_data(self, token: str) -> bool:
+        """A token the caller skips as DATA: inert, unless a ``case`` WORD or
+        pattern is pending -- bash reads it as that word (``case $1 in -c)``)."""
+        return self.feed(token) if self._pattern or self._await else False
+
+    def feed(self, token: str) -> bool:
+        """Account for *token*; True if it ends the argv at top level."""
+        if token in (";", "\n") and (self._await == 2 or (self._pattern and self._fresh)):
+            # A frame renders a NEWLINE as a standalone ``;``; bash allows one here
+            # and refuses a real ``;``, so the state holds across it.
+            return False
+        if (
+            self._cases
+            and self._command_next
+            and token.startswith("esac")
+            and (len(token) == 4 or token[4] in ";)&|`<>")
+        ):
+            # ``esac`` closes the innermost compound; whatever rides on it
+            # (``esac;``, ``esac)``, ``esac>/dev/null``) is fed again as its own token.
+            self._cases -= 1
+            self._pattern = False
+            self._command_next = False
+            return self.feed(token[4:]) if len(token) > 4 else False
+        elif self._pattern:
+            # A clause body glued to its pattern (``x)case y in``) is fed again too.
+            rest = self._feed_pattern(token)
+            return self.feed(rest) if rest else False
+        elif self._await == 2:
+            self._await = 0
+            if token == "in":
+                self._cases += 1
+                self._arm_pattern()
+                return False
+        elif self._await == 1:
+            # The WORD may span tokens (``case $(echo x) in``): ``in`` can only
+            # follow once the word's own substitutions have closed again.
+            self.depth = max(self.depth + _substitution_depth_delta(_outside_expansions(token)), 0)
+            if self.depth <= self._word_depth:
+                self._await = 2
+            self._command_next = False
+            return False
+        elif token.lstrip("$(`") == "case" and (self._command_next or len(token) > 4):
+            self._await = 1
+            self.depth += _substitution_depth_delta(token[:-4])
+            self._word_depth = self.depth
+            self._command_next = False
+            return False
+        self.depth = max(self.depth + _substitution_depth_delta(_outside_expansions(token)), 0)
+        if self._cases and token.endswith((";;", ";&")):
+            self._arm_pattern()
+        else:
+            word = token.lstrip("$(`")  # ``$(if`` keeps position the way ``if`` does
+            self._command_next = (
+                self._name_next
+                or _ends_argv(token)
+                or token.endswith(("(", "`"))
+                or token == ")"
+                or word in _KEEPS_COMMAND_POSITION
+                or (word.startswith("-") and self._command_next)
+            )
+        self._name_next = token.lstrip("$(`") in ("function", "coproc")
+        return self.depth <= 0 and _ends_argv(token)
 
 
 def _ends_argv(token: str) -> bool:
