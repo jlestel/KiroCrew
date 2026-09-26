@@ -22,7 +22,7 @@ from kiro_crew.knowledge.store import KnowledgeStore
 
 @pytest.fixture()
 def store(tmp_path, opened):
-    """A store closed on EVERY thread at teardown (rootdir conftest ``opened``).
+    """A store closed on EVERY thread at teardown (``test/conftest.py``'s ``opened``).
 
     ``add_source`` claims and ingests off the loop, so the handler opens a second
     per-thread connection on a worker; ``close()`` releases only the calling

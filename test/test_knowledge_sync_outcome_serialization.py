@@ -49,7 +49,7 @@ async def off(fn, *args, **kwargs):
 @pytest.fixture()
 def strict_store(monkeypatch, tmp_path, opened):
     """Every take here runs on a worker thread, so the store holds one connection
-    per thread that touched it; the rootdir conftest's ``opened`` closes them
+    per thread that touched it; ``test/conftest.py``'s ``opened`` closes them
     all, where ``close()`` would release only the loop thread's (usually none)."""
     monkeypatch.setenv(STORE_STRICT_ENV, "1")
     return opened(KnowledgeStore(str(tmp_path / "knowledge.db")))

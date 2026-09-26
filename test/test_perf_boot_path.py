@@ -360,7 +360,7 @@ class TestFolderWatcherScanQueryCount:
     """A scan re-read ``sources.properties`` and issued a ``last_seen`` UPDATE
     once per discovered file — up to 10,000 on-loop sqlite ops per scan.
 
-    Each store goes through the rootdir conftest's ``opened`` fixture: the
+    Each store goes through ``test/conftest.py``'s ``opened`` fixture: the
     batched ``last_seen`` flush runs on a worker connection, which a per-thread
     ``close()`` from the test thread never reached.
     """

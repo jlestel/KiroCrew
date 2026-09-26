@@ -875,7 +875,7 @@ class TestCompanionRuntimeGuard:
 
 
 class TestTheSuiteNeverRunsTheBootSandboxSweep:
-    """The rootdir conftest pins the session module's boot sandbox sweep to a no-op.
+    """``test/conftest.py`` pins the session module's boot sandbox sweep to a no-op.
 
     ``SessionManager.get_or_create`` arms the cleanup loop, whose boot reclaim
     submits ``kiro_crew.session.cleanup_stale_sandbox_profiles`` -- the real
@@ -897,5 +897,5 @@ class TestTheSuiteNeverRunsTheBootSandboxSweep:
         assert (
             session_mod.cleanup_stale_sandbox_profiles
             is not sandbox_mod.cleanup_stale_sandbox_profiles
-        ), "the rootdir conftest does not pin kiro_crew.session.cleanup_stale_sandbox_profiles"
+        ), "test/conftest.py does not pin kiro_crew.session.cleanup_stale_sandbox_profiles"
         assert session_mod.cleanup_stale_sandbox_profiles(data_home=Path("/nonexistent")) == 0

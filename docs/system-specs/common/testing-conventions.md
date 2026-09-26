@@ -2709,10 +2709,13 @@ went red, or the fix lands in the wrong file and the leak stays.
   second record was `kiro_crew.sandbox`'s mount-source sweep, finishing on the shared
   `mc-maint` executor seconds after the `SessionManager` test that armed it had torn down
   (`close_all()` cancels the asyncio task but cannot stop an executor thread mid-`/proc`
-  scan). Two fixes, in two places: the helper filters `rec.name == _RUNNER_LOGGER`, and the
-  rootdir conftest's autouse `_no_boot_sandbox_sweep` pins
-  `kiro_crew.session.cleanup_stale_sandbox_profiles` to a no-op for every test (a test of
-  the sweep itself patches the same name inside its body and so still wins). Measured
+  scan). Two fixes, in two places: the helper filters `rec.name == _RUNNER_LOGGER`, and
+  `test/conftest.py`'s autouse `_no_boot_sandbox_sweep` pins
+  `kiro_crew.session.cleanup_stale_sandbox_profiles` to a no-op for every test under
+  `test/` -- the app test trees under `src/kiro_crew/apps/builtins` do not load
+  `test/conftest.py` and so get no such pin (the table in § Which conftest you are
+  standing on says which floors each testpath gets); a test of the sweep itself patches
+  the same name inside its body and so still wins. Measured
   over `test_session.py` alone: 138 real sweeps on `mc-maint_*` threads without the pin, 0
   with it.
 
@@ -2749,7 +2752,9 @@ went red, or the fix lands in the wrong file and the leak stays.
   `KnowledgeStore._close_all_for_tests()` -- test-private on purpose: production has no
   moment at which every thread is provably idle short of process exit, so it gets no
   consumer there -- built from a module flag (`_ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS`) that
-  the rootdir test conftest flips once per session, under which a connection opens
+  `test/conftest.py` flips once per session (so only the `test/` testpath has it: the app
+  test trees under `src/kiro_crew/apps/builtins` do not load `test/conftest.py` and do not
+  activate the flip themselves), under which a connection opens
   `check_same_thread=False` through a factory that re-applies the thread-affinity guard in
   Python on every statement entry point the store uses (`cursor`, `execute*`, `commit`,
   `rollback`), leaving only `close()` cross-thread, and is registered for the teardown close, while
@@ -2760,7 +2765,7 @@ went red, or the fix lands in the wrong file and the leak stays.
   and `VectorMemoryStore.init()` on an already-open store now closes the handle it replaces
   instead of orphaning it (`test_a_repeated_init_closes_the_handle_it_replaces`; the CLI's
   `_learn` re-inits the store it is handed, so every learn test paid this). Tests route
-  every inline construction through the rootdir conftest's `opened` register-and-close
+  every inline construction through `test/conftest.py`'s `opened` register-and-close
   fixture (one definition, not one per module: a `KnowledgeStore` is closed through its
   test-only every-thread seam, everything else through `close()`), modules that build
   `ContextBuilder`s request the conftest's opt-in `close_skills_loaders` from a one-line
@@ -2971,7 +2976,7 @@ inherits, not in the test that noticed.
   deliberate descriptor stays and the docstring now says why.
 - **`fd_leak`: the tenth pass's seams, applied.** Thirteen tests at +5..+10 in eight
   files, all unclosed SQLite handles or a dashboard boot's process handles: stores routed
-  through the rootdir `opened` fixture (a `KnowledgeStore` per-thread `close()` never
+  through `test/conftest.py`'s `opened` fixture (a `KnowledgeStore` per-thread `close()` never
   reaches the connection a `to_thread` worker opened; the test-only every-thread close
   does), `close_skills_loaders` requested from module autouse fixtures where
   `ContextBuilder`s or an `env` fixture build a `SkillsLoader`, `SubagentManager`s tracked

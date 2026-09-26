@@ -147,7 +147,11 @@ class TestKnowledgeStore:
         thread-affinity guard, so a handle cached from ``store.db`` and used on
         another thread is refused rather than raced; and the every-thread close
         refuses to run at all, because production has no moment at which every
-        thread is provably idle short of process exit.
+        thread is provably idle short of process exit. The refusal names the
+        file that flips the flag -- ``test/conftest.py``, which only the
+        ``test/`` testpath loads -- and says that the app test trees under
+        ``src/kiro_crew/apps/builtins`` do not activate the flip themselves,
+        rather than pointing at a conftest that holds none.
         """
         from kiro_crew._sqlite_compat import sqlite3
         from kiro_crew.knowledge import store as store_mod
@@ -171,10 +175,14 @@ class TestKnowledgeStore:
             assert outcome and isinstance(outcome[0], sqlite3.ProgrammingError), (
                 "a production connection used from another thread was not refused: " f"{outcome!r}"
             )
-            with pytest.raises(RuntimeError, match="test seam"):
+            with pytest.raises(RuntimeError, match="test seam") as excinfo:
                 prod._close_all_for_tests()
         finally:
             prod.close()
+        message = str(excinfo.value)
+        assert "test/conftest.py" in message, message
+        assert "rootdir" not in message, message
+        assert "src/kiro_crew/apps/builtins" in message, message
 
     def test_the_test_mode_connection_still_refuses_another_threads_use(self, store):
         """Relaxing SQLite's guard for the teardown close does not relax it for USE.

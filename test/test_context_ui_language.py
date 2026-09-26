@@ -32,7 +32,7 @@ from kiro_crew.skills import SkillsLoader
 
 @pytest.fixture(autouse=True)
 def _close_skills_loaders(close_skills_loaders):
-    """Every test here builds a ``ContextBuilder``: close its ``SkillsLoader`` (rootdir conftest)."""
+    """Every test here builds a ``ContextBuilder``: close its ``SkillsLoader`` (``test/conftest.py``)."""
 
 
 def _seed_language(language: str) -> None:

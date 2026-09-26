@@ -23,12 +23,15 @@ from .._sqlite_compat import fts5_cjk_match_groups, fts5_segment_for_index, sqli
 #: Test-only switch. ``False`` in production: every connection keeps SQLite's
 #: own thread-affinity guard (``check_same_thread=True``), so a caller that
 #: caches ``store.db`` and uses it from another thread is refused with
-#: ``ProgrammingError`` instead of racing the owner. The rootdir test conftest
-#: flips this to ``True`` once per session so ``_close_all_for_tests()`` can
-#: close the handles other (usually exited) threads opened -- the one operation
-#: the default guard refuses that a teardown needs, since an unclosed connection
-#: is a reference cycle on CPython 3.11+ and holds its descriptors until the
-#: cyclic collector runs. Nothing in production may set it.
+#: ``ProgrammingError`` instead of racing the owner. ``test/conftest.py`` flips
+#: this to ``True`` once per session so ``_close_all_for_tests()`` can close the
+#: handles other (usually exited) threads opened -- the one operation the
+#: default guard refuses that a teardown needs, since an unclosed connection is
+#: a reference cycle on CPython 3.11+ and holds its descriptors until the
+#: cyclic collector runs. Only the ``test/`` testpath loads that conftest; the
+#: app test trees under ``src/kiro_crew/apps/builtins`` do not, so they never
+#: activate the flip themselves (a ``test/`` case run earlier in the same worker
+#: leaves it on). Nothing in production may set it.
 _ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS = False
 
 
@@ -2848,7 +2851,9 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             raise RuntimeError(
                 "KnowledgeStore._close_all_for_tests is a test seam: set "
                 "kiro_crew.knowledge.store._ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS before any "
-                "store is built (the rootdir test conftest does); production closes by exiting"
+                "store is built (test/conftest.py does, for the test/ testpath only; the app "
+                "test trees under src/kiro_crew/apps/builtins do not activate the flip "
+                "themselves); production closes by exiting"
             )
         with self._connections_lock:
             conns, self._connections = self._connections, []

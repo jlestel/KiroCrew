@@ -92,7 +92,7 @@ class _Oracle:
 def wired(tmp_path, monkeypatch, opened):
     """A consented keystone, a live config, a seeded store, and a surfaced session.
 
-    The store goes through the rootdir conftest's ``opened`` register-and-close
+    The store goes through ``test/conftest.py``'s ``opened`` register-and-close
     fixture: a dropped ``VectorMemoryStore`` keeps its ``db``/``-wal``/``-shm``
     descriptors until the cyclic collector runs.
     """
