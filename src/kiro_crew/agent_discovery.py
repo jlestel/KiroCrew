@@ -28,6 +28,7 @@ from kiro_crew.agent_files import (
     GUEST_AGENT_FILENAME,
     LITE_AGENT_FILENAME,
     OWNED_KIRO_AGENT_FILES,
+    SLACK_GUEST_AGENT_FILENAME,
 )
 from kiro_crew.agent_spec_format import (
     is_agent_spec_name,
@@ -1769,7 +1770,12 @@ def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
             pkg_stem = pkg_stem[len("local-") :]
         package = pkg_stem[: -(len(agent_name) + 1)]
 
-    if f.name in (AGENT_FILENAME, LITE_AGENT_FILENAME, GUEST_AGENT_FILENAME):
+    if f.name in (
+        AGENT_FILENAME,
+        LITE_AGENT_FILENAME,
+        GUEST_AGENT_FILENAME,
+        SLACK_GUEST_AGENT_FILENAME,
+    ):
         source = "kirocrew"
     elif is_package_filename:
         source = "package"

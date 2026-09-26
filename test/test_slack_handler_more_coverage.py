@@ -142,7 +142,7 @@ class FakeSessions:
     def get_slack_link(self, key):
         return None, None
 
-    def get_session_for_thread(self, thread_ts):
+    def get_session_for_thread(self, thread_ts, *, guest_user=""):
         return None
 
     def set_approval_policy(self, key, policy):
@@ -776,7 +776,7 @@ class TestHandleInteractionAuthReChecks:
         import kiro_crew.session as session_mod
 
         class _Map:
-            def get_session_for_thread(self, thread_ts):
+            def get_session_for_thread(self, thread_ts, *, guest_user=""):
                 return "dash:slot-1"
 
         monkeypatch.setattr(session_mod, "SessionMap", _Map)

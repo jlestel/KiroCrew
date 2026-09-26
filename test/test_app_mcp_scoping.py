@@ -389,9 +389,7 @@ class TestRebuildSurvival:
 
         assert agent._collect_app_mcp_servers() == {"good:srv": {"command": "ok"}}
 
-    def test_self_managed_http_url_is_preserved(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_self_managed_http_url_is_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A self-managed HTTP server (no backend.entryPoint) has an authoritative
         fixed URL and never gets a live registration — its manifest URL must
         survive the rebuild rather than being dropped as an illustrative port."""
@@ -1005,7 +1003,9 @@ class TestAnUngovernedHostDoesNotKeepAutoApprove:
         from kiro_crew.platform import governance as gov
 
         monkeypatch.setattr(gov, "may_skip_gate_now", lambda ref: True)
-        monkeypatch.setattr(gov, "_declared_auto_approve", lambda emitted: {"mail": ("email_read",)})
+        monkeypatch.setattr(
+            gov, "_declared_auto_approve", lambda emitted: {"mail": ("email_read",)}
+        )
         _pin_honour_auto_approve(monkeypatch, False)
         out = gov.strip_ungoverned_auto_approve(
             {"mail": {"command": "m", "autoApprove": ["email_read", "email_send"]}},
@@ -1258,9 +1258,38 @@ class TestTemplateGrantsAreCeilingFilteredAtBuild:
         key at all. ``_install_research_agent`` failed this before the fix:
         it derived from a then-unfiltered constructor.
         """
+        import ast
         import inspect
+        import textwrap
 
         from kiro_crew import agent
+
+        def _code_only(fn) -> str:
+            """The writer's executable CODE, with comments and docstrings dropped.
+
+            The rule is about what a writer WRITES, so it must be read off the
+            code. ``inspect.getsource`` also returns comments, and a writer that
+            deliberately does NOT emit ``allowedTools`` -- and says so in a comment
+            explaining why, which is the clearest thing to write there -- then
+            failed a guard about the key it was careful to omit. Documenting an
+            omission must not read as making it.
+
+            ``ast.unparse`` is what strips them: it re-emits the parsed body, so
+            comments are gone (they are not in the AST) and a docstring is dropped
+            explicitly below. Call syntax survives, which a token-join would not --
+            ``build_agent_config(`` would come back as ``build_agent_config (`` and
+            every needle here would stop matching.
+            """
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+            body = getattr(tree, "body", [])
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]
+            return "\n".join(ast.unparse(node) for node in body)
 
         writers = [
             fn
@@ -1272,7 +1301,7 @@ class TestTemplateGrantsAreCeilingFilteredAtBuild:
         writers.append(agent.rebuild_agent_config)
         assert len(writers) >= 5, "installer inventory shrank; update this parity test"
         for fn in writers:
-            src = inspect.getsource(fn)
+            src = _code_only(fn)
             covered = (
                 "build_agent_config(" in src
                 or "_may_auto_approve(" in src
@@ -1282,6 +1311,46 @@ class TestTemplateGrantsAreCeilingFilteredAtBuild:
                 f"{fn.__name__} writes an agent spec without inheriting or applying "
                 "the governance ceiling over allowedTools (see #7401)"
             )
+
+    def test_the_writer_guard_reads_code_and_not_comments(self) -> None:
+        """The guard above must still catch a writer that really writes the key.
+
+        Dropping comments is only safe if it narrows the guard to code and nothing
+        else. Both directions are checked on synthetic writers, because the real
+        inventory currently has no offender to observe:
+
+        * a writer that WRITES an unfiltered ``allowedTools`` is still caught;
+        * a writer that only MENTIONS it in a comment is not.
+        """
+        import ast
+        import textwrap
+
+        def _code_only_src(text: str) -> str:
+            tree = ast.parse(textwrap.dedent(text)).body[0]
+            body = getattr(tree, "body", [])
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]
+            return "\n".join(ast.unparse(node) for node in body)
+
+        offender = _code_only_src(
+            'def _install_bad_agent():\n    spec = {"allowedTools": ["*"]}\n    write(spec)\n'
+        )
+        assert "allowedTools" in offender, "a real offender must still be visible to the guard"
+        assert "build_agent_config(" not in offender and "_may_auto_approve(" not in offender
+
+        innocent = _code_only_src(
+            "def _install_good_agent():\n"
+            "    # deliberately writes no allowedTools key, so nothing is pre-approved\n"
+            '    spec = {"tools": ["web_search"]}\n'
+            "    write(spec)\n"
+        )
+        assert "allowedTools" not in innocent, "a comment must not read as writing the key"
+        assert "web_search" in innocent, "CONTROL: real code must survive the strip"
 
 
 class TestTheCodeToolIsGovernedForWrites:

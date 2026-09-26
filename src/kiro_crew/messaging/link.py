@@ -86,6 +86,40 @@ def is_channel_session_key(key: str) -> bool:
     return key.startswith(_CHANNEL_SESSION_PREFIXES)
 
 
+#: Marker that separates a guest's session key from an owner's inside the Slack
+#: namespace. A bare Slack timestamp is digits and a dot, so it can never contain
+#: this, which is what makes the two key shapes impossible to confuse.
+_GUEST_KEY_MARKER = "guest-"
+
+
+def guest_session_key(user_id: str, reply_ts: str) -> str:
+    """Return the session key a Slack guest turn runs under.
+
+    Keyed by guest AND thread so a guest never resumes the session behind an
+    owner's thread, and two guests in one channel never share one.
+
+    This lives here rather than in the Slack handler because the session index
+    itself must be able to tell a guest's thread claim from an owner's -- see
+    :meth:`kiro_crew.session_map.SessionMap.get_session_for_thread`, which is the
+    one place that hides such a claim. A predicate defined in the handler would
+    put the rule above the index it has to protect, and every path that reaches
+    the index without going through the handler would then miss it.
+    """
+    return f"{SLACK_NAMESPACE}:{_GUEST_KEY_MARKER}{user_id}-{reply_ts}"
+
+
+def is_guest_session_key(key: str) -> bool:
+    """True when *key* was minted by :func:`guest_session_key`.
+
+    The thread index holds ONE owner per thread and both key shapes are
+    self-derived from the thread's timestamp, so ``set_slack_link`` takes its
+    ``setdefault`` branch and a guest's claim is never displaced by an owner's
+    later self-link -- it simply stays. Reading the index back therefore needs a
+    way to tell whose claim it is, and this marker is it.
+    """
+    return key.startswith(f"{SLACK_NAMESPACE}:{_GUEST_KEY_MARKER}")
+
+
 def channel_namespace_of(key: str) -> str:
     """Return the channel namespace of *key*, or ``""`` if it is not a channel key."""
     for ns in CHANNEL_SESSION_NAMESPACES:

@@ -240,6 +240,7 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     rearm_reinjection,
     stop_reason_landed,
+    warn_if_toolless_turns_unservable,
 )
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
@@ -347,6 +348,7 @@ from kiro_crew.slack.handler import (
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.retry import open_dm_with_retry
 from kiro_crew.slack.scope_probe import warn_unreadable_tracked_channels
+from kiro_crew.slack.tool_gate import normalize_tool_title
 from kiro_crew.slack.transport import SlackTransport
 from kiro_crew.subagent import (
     _TRANSIENT_CONTINUE_MSG,
@@ -806,9 +808,6 @@ HEARTBEAT_SAFE_TOOLS = frozenset(
 )
 
 
-_HEARTBEAT_STATUS_PREFIXES = ("Running: ",)
-
-
 def _is_heartbeat_safe_tool(event_title: str) -> bool:
     """Return True if *event_title* is safe to auto-approve in a heartbeat task.
 
@@ -819,46 +818,16 @@ def _is_heartbeat_safe_tool(event_title: str) -> bool:
     ``list_env_secrets``, etc.).  Per security-controls deny-by-default:
     reject unless positively confirmed.
 
-    Title normalization (applied before the set lookup):
-
-    1. Strip leading status prefix (e.g. ``Running: ``).
-    2. Strip ACP ``mcp__<server>__<Tool>`` prefix.
-    3. Strip runtime ``@<server>/<Tool>`` prefix — kiro-cli titles arrive as
-       ``Running: @example-mcp/SomeTool`` at the gateway.
-
-    Only the **bare tool name** is tested against the frozenset.
+    Title normalization is shared with the guest gate
+    (``slack.tool_gate.normalize_tool_title``): strip the status prefix, strip an
+    ACP ``mcp__<server>__<Tool>`` or runtime ``@<server>/<Tool>`` prefix, and test
+    only the **bare tool name** against the frozenset.
 
     Returns False on empty / whitespace-only / unrecognised names.
     """
-    if not event_title:
-        return False
-    name = event_title.strip()
+    name, qualified = normalize_tool_title(event_title)
     if not name:
         return False
-    # Strip leading status prefix: "Running: @example-mcp/Tool" → "@example-mcp/Tool"
-    for prefix in _HEARTBEAT_STATUS_PREFIXES:
-        if name.startswith(prefix):
-            name = name[len(prefix) :]
-            break
-    # Preserve the server-QUALIFIED form (before the prefix is stripped) so the
-    # edition allowlist can match on the full identity and avoid bare-name
-    # collisions — normalized to the "@server/Tool" spelling regardless of which
-    # wire form arrived ("mcp__server__Tool" or "@server/Tool").
-    qualified = ""
-    if name.startswith("mcp__"):
-        parts = name.split("__", 2)
-        if len(parts) == 3:
-            qualified = f"@{parts[1]}/{parts[2]}"
-    elif name.startswith("@") and "/" in name:
-        qualified = name
-    # Strip MCP server prefix: "mcp__example-mcp__ToolName" → "ToolName"
-    if name.startswith("mcp__"):
-        parts = name.split("__", 2)
-        if len(parts) == 3:
-            name = parts[2]
-    # Strip @server/Tool prefix: "@example-mcp/SomeTool" → "SomeTool"
-    if name.startswith("@") and "/" in name:
-        name = name.rsplit("/", 1)[-1]
     if name in HEARTBEAT_SAFE_TOOLS:
         return True
     # Edition-contributed additions. Deferred context read via the sel.py pattern
@@ -938,22 +907,11 @@ _NO_RESPONSE = "_No response._"
 def _bare_tool_name(title: str) -> str:
     """``Running: @server/Tool`` / ``mcp__server__Tool`` / ``Tool`` -> ``Tool``.
 
-    Same wire forms ``_is_heartbeat_safe_tool`` unwraps; kept separate
-    because that helper answers an allowlist question and this one only
-    needs the name.
+    The same unwrapping the allowlist gates do, via the shared normalizer, for a
+    caller that needs only the name and asks no allowlist question.
     """
-    name = (title or "").strip()
-    for prefix in _HEARTBEAT_STATUS_PREFIXES:
-        if name.startswith(prefix):
-            name = name[len(prefix) :]
-            break
-    if name.startswith("mcp__"):
-        parts = name.split("__", 2)
-        if len(parts) == 3:
-            name = parts[2]
-    if name.startswith("@") and "/" in name:
-        name = name.rsplit("/", 1)[-1]
-    return name.strip()
+    bare, _ = normalize_tool_title(title)
+    return bare
 
 
 class _GateTally:
@@ -1937,6 +1895,31 @@ def _push_observe_limits(history: ChannelHistory, max_entries: int, ttl_secs: in
     history._observe_ttl_secs = ttl_secs
 
 
+def _warn_if_guest_turns_unservable(cfg) -> None:
+    """Name, at startup, a guest allowlist the configured backend cannot serve.
+
+    Slack's half of the shared :func:`warn_if_toolless_turns_unservable`, the same
+    way WhatsApp supplies its own admission facts. A guest's tool posture assumes
+    the harness mounts what the agent spec names, which only a backend whose
+    routing is ``Routing.AGENT_SPEC`` does; on any other backend guest admission
+    refuses every guest turn with a note. An owner who allow-listed guests and
+    tracked a channel would otherwise learn that only from the first guest's
+    refusal, or from the SEL.
+    """
+    slack = cfg.slack
+    allowlisted = [u for u in (getattr(slack, "allowed_users", None) or []) if str(u).strip()]
+    # A tracked channel is what a guest must post in, so an allowlist with no
+    # tracked channel admits nobody and warrants no warning.
+    tracked = [c for c in (getattr(slack, "tracking_channels", None) or []) if str(c).strip()]
+    backend = getattr(cfg.agent, "acp_backend", "")
+    warn_if_toolless_turns_unservable(
+        "slack",
+        admits_non_operators=bool(allowlisted and tracked),
+        backend=backend if isinstance(backend, str) else "",
+        admission=f"allowed_users={len(allowlisted)}, tracking_channels={len(tracked)}",
+    )
+
+
 class GatewayOrchestrator:
     """Manages the lifecycle of all gateway services.
 
@@ -1988,18 +1971,14 @@ class GatewayOrchestrator:
         self._app_token = creds.get(CRED_SLACK_APP_TOKEN, "")
         self._bot_token = creds.get(CRED_SLACK_BOT_TOKEN, "")
         self._owner_id = creds.get(CRED_OWNER_ID, "")
-        # Multi-user access is disabled — only owner is authorized.
-        # Prune stale allowed_users entries from config and warn.
-        stale = {u["slack_id"] for u in cfg.slack.allowed_users} - (
-            {self._owner_id} if self._owner_id else set()
-        )
-        if stale:
-            logger.warning(
-                "Pruning %d stale allowlist entries (multi-user disabled): %s",
-                len(stale),
-                stale,
-            )
+        # The live set is the owner plus every allow-listed guest, so a guest the
+        # owner approved survives a restart. Membership here grants inbound
+        # message admission only: ``is_allowed_user`` answers for the owner alone,
+        # and every owner control keys off that one.
         self._allowed_users: set[str] = {self._owner_id} if self._owner_id else set()
+        self._allowed_users.update(
+            str(u["slack_id"]) for u in cfg.slack.allowed_users if u.get("slack_id")
+        )
         self._tracking_channels: set[str] = {
             c["channel_id"] for c in cfg.slack.tracking_channels if c.get("channel_id")
         }
@@ -13824,6 +13803,13 @@ class GatewayOrchestrator:
             datetime.now(timezone.utc).isoformat(),
         )
 
+        # Name a guest allowlist this backend cannot serve, before any guest is
+        # refused by it.
+        try:
+            _warn_if_guest_turns_unservable(self._cfg)
+        except Exception:
+            logger.debug("guest-servability warning failed", exc_info=True)
+
         # Raise FD limit — each kiro-cli session uses ~6 FDs (3 pipes)
         # plus MCP server subprocesses. Default macOS limit (256) is too low.
         # No-op on Windows (no per-process descriptor rlimit).
@@ -14976,6 +14962,11 @@ class GatewayOrchestrator:
           orchestrator sets AND the ``handler`` module globals, mutated in place
           so the Slack-native modal (which edits the same set objects) and a CLI
           write converge on one set.
+        * ``slack.allowed_users`` -> the guest admission set, recomputed from the
+          document (owner plus every ``slack_id``) into the same one-object shape.
+          Recomputed, not added to, so a REVOCATION takes effect without a
+          restart; ``is_guest_user`` reads the handler global this writes, so
+          admission follows the config with no second cache to reconcile.
         * ``slack.channels`` / ``slack.dm_activation`` / ``messaging.*`` /
           ``trusted_bot_*`` / ``home_tab_sessions_per_kind`` /
           ``forward_to_agent_callback`` -> the shared config object every Slack
@@ -15015,14 +15006,43 @@ class GatewayOrchestrator:
             self._open_channels.clear()
             self._open_channels.update(new.slack.open_channels)
             slack_handler.set_open_channels(self._open_channels)
+        if "slack.allowed_users" in slack_paths:
+            # Recomputed from the document, exactly as ``__init__`` builds it:
+            # the owner plus every allow-listed ``slack_id``. Recompute rather
+            # than add, because REVOCATION is the direction that matters -- a
+            # guest the operator deleted has to stop being admitted without a
+            # restart, and an additive update could only ever grow the set.
+            #
+            # Mutated in place and handed to the handler, so the orchestrator
+            # set, the handler global and the set the Slack-native modal edits
+            # remain ONE object. ``is_guest_user`` reads that global, so this is
+            # the whole reconciliation: there is no second admission read to
+            # keep in step, and adding one is how a cache diverges.
+            allowed = {self._owner_id} if self._owner_id else set()
+            allowed.update(
+                str(u["slack_id"])
+                for u in new.slack.allowed_users
+                if isinstance(u, dict) and u.get("slack_id")
+            )
+            self._allowed_users.clear()
+            self._allowed_users.update(allowed)
+            slack_handler.set_allowed_users(self._allowed_users)
         authz_paths = sorted(
             p
             for p in slack_paths
-            if p in ("slack.trusted_bot_ids", "slack.open_channels", "slack.tracking_channels")
+            if p
+            in (
+                "slack.trusted_bot_ids",
+                "slack.open_channels",
+                "slack.tracking_channels",
+                "slack.allowed_users",
+            )
         )
         if authz_paths:
-            # Widening sets: the change itself is the auditable event, and the
-            # per-message admission decision is audited where it is made.
+            # The change itself is the auditable event, and the per-message
+            # admission decision is audited where it is made. Narrowing counts:
+            # ``slack.allowed_users`` is audited in both directions, because a
+            # revocation is the security-relevant half.
             sel().log_api_access(
                 caller="config",
                 operation="slack.authorization_config_change",

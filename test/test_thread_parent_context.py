@@ -104,7 +104,7 @@ class FakeSessionManager:
     def set_slack_link(self, key, thread_ts, channel_id):
         pass
 
-    def get_session_for_thread(self, thread_ts):
+    def get_session_for_thread(self, thread_ts, *, guest_user=""):
         return None
 
     def enqueue(self, key, msg_ts, text, **kwargs):

@@ -35,6 +35,33 @@ from kiro_crew.slack.gateway import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _restore_slack_identity_globals():
+    """Restore the process-global owner id and allow-list after EVERY test here.
+
+    ``set_owner_id`` and ``set_allowed_users`` write module state in
+    ``kiro_crew.slack.handler``, which outlives the test that set it. A test in
+    this file fabricated ``U_OWNER`` and an allow-list to exercise the membership
+    predicates, and left both in place: every later test on the same xdist worker
+    then ran with a fabricated owner, so a gate that should have refused an
+    unknown user silently passed.
+
+    The scope is the FILE, not the two lines that set it. The leak crosses tests,
+    so a ``finally`` at the call site would only fix the one test anybody had
+    already noticed -- the next test to call a setter reopens it. Autouse means a
+    test added later inherits the teardown without knowing it needs one.
+    """
+    from kiro_crew.slack import handler as _handler
+
+    _saved_owner = _handler._owner_id
+    _saved_allowed = set(_handler._allowed_users)
+    try:
+        yield
+    finally:
+        _handler.set_owner_id(_saved_owner)
+        _handler.set_allowed_users(_saved_allowed)
+
+
 def _make_orchestrator(
     *,
     slack_enabled: bool = False,
@@ -272,9 +299,16 @@ class TestGatewayOrchestratorInit:
             orch = GatewayOrchestrator(cfg)
         assert "C_OPEN" in orch._open_channels
 
-    def test_stale_allowed_users_pruned(self):
+    def test_config_allowed_users_loaded_as_guests(self):
+        """A config allowlist entry reaches the live set, so a guest survives restart.
+
+        Membership in the live set is what the inbound message gate consults, and
+        the config file is the only thing that outlives the process, so a guest
+        the owner approved is reachable again after a restart only if the load
+        happens here.
+        """
         cfg = KiroCrewConfig()
-        cfg.slack.allowed_users = [{"slack_id": "U_STALE"}]
+        cfg.slack.allowed_users = [{"slack_id": "U_GUEST"}]
         with patch.object(
             cfg,
             "load_credentials",
@@ -285,8 +319,22 @@ class TestGatewayOrchestratorInit:
             },
         ):
             orch = GatewayOrchestrator(cfg)
-        assert "U_STALE" not in orch._allowed_users
+        assert "U_GUEST" in orch._allowed_users
         assert "U_OWNER" in orch._allowed_users
+        # Membership grants inbound admission, never owner standing.
+        from kiro_crew.slack.handler import (
+            is_allowed_user,
+            is_guest_user,
+            set_allowed_users,
+            set_owner_id,
+        )
+
+        set_owner_id("U_OWNER")
+        set_allowed_users(orch._allowed_users)
+        assert is_guest_user("U_GUEST") is True
+        assert is_allowed_user("U_GUEST") is False
+        assert is_allowed_user("U_OWNER") is True
+        assert is_guest_user("U_OWNER") is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════

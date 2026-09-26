@@ -49,6 +49,7 @@ from kiro_crew.agent_discovery import (
     project_agent_name,
     read_agent_spec_strict,
 )
+from kiro_crew.agent_files import SLACK_GUEST_AGENT_NAME
 from kiro_crew.agent_spec_format import is_markdown_spec, iter_agent_spec_files
 from kiro_crew.config.loader import (
     ACTIVATION_REVIEW,
@@ -82,6 +83,11 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.state import append_and_surface
 from kiro_crew.deny_notice import steer_refusal_notice
+from kiro_crew.execution_context import (
+    ExecutionContext,
+    bind_session_execution,
+    resolve_member_execution,
+)
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import (
@@ -96,7 +102,7 @@ from kiro_crew.llm_helpers import (
     record_interaction_event,
     save_conversation_turn_off_loop,
 )
-from kiro_crew.memory_stores import UnknownMemoryStore
+from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE, UnknownMemoryStore
 from kiro_crew.messaging import auto_title, privacy_mode, turn_ceiling
 from kiro_crew.messaging.commands import (
     compact_unsupported_backend,
@@ -117,13 +123,24 @@ from kiro_crew.messaging.dispatch import (
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute
-from kiro_crew.messaging.link import canonical_key
+
+# ``guest_session_key`` / ``is_guest_session_key`` are DEFINED in
+# ``messaging.link``, not here, so the session index can tell a guest's thread
+# claim from an owner's without importing the Slack layer. Imported under their
+# own names because this module and its tests spell them here; a second
+# definition would let the index's filter and this module's key minting drift.
+from kiro_crew.messaging.link import (  # noqa: F401 -- re-export; imported from this module by name
+    canonical_key,
+    guest_session_key,
+    is_guest_session_key,
+)
 from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.platform import current_context
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -173,6 +190,7 @@ from kiro_crew.slack.sessions_view import (
     _collect_recent_sessions_off_loop,
     sessions_include_ended,
 )
+from kiro_crew.slack.tool_gate import build_guest_hooks, is_guest_safe_tool
 from kiro_crew.stats import Stats
 from kiro_crew.subagent import SubagentManager
 from kiro_crew.task import Task
@@ -756,6 +774,15 @@ _COMPACTION_FAILED_RETRIES = 2
 # persists nothing and mirrors nothing, so the conversation log records the
 # message once, with the reply the replay produces.
 _COMPACTION_RETRY_NOTICE = "⟳ Compaction failed — retrying…"
+#: Posted when an admitted guest's member cannot be resolved to an execution.
+#: Admission already checked membership, a non-default store and the guest spec, so
+#: this is a config that moved under the turn or a store with no usable identity.
+#: The turn is refused rather than run, because an unresolved member is what makes a
+#: guest turn read the owner's own memory.
+_GUEST_UNRESOLVED_NOTICE = (
+    "⛔ I cannot answer right now: the guest agent for this channel did not resolve. "
+    "Ask the owner to check it."
+)
 
 
 @dataclass(frozen=True)
@@ -943,6 +970,8 @@ async def maybe_apply_privacy_modifiers(
     sessions: SessionManager,
     reply_ts: str,
     link_thread: bool = True,
+    *,
+    guest_user: str,
 ) -> tuple[str, str, bool]:
     """Strip and apply the ``!temporary`` / ``!incognito`` privacy modifiers.
 
@@ -958,12 +987,40 @@ async def maybe_apply_privacy_modifiers(
     - *only_modifier* — True when the message was nothing but the modifier(s);
       the caller MUST then return without starting an LLM turn.
 
+    *guest_user* is REQUIRED and keyword-only, with no default. These are owner
+    controls -- ``!incognito`` writes a durable ``SessionMap`` flag that
+    ``hydrate()`` rebuilds, so it outlives a restart and suppresses the owner's
+    record of the turns it covers -- and this function is dispatched ABOVE the
+    callers' guest refusal ladders, so their later ``!``-command checks never see
+    a message that was only a modifier. Every other owner control on that ladder
+    refuses a guest; without this one a guest switched off the owner's record of
+    its own untrusted turns.
+
+    There is deliberately no default. For the session index the safe default is
+    "hide", so ``get_session_for_thread`` defaults; here the caller is the only
+    party that knows whether the sender is a guest, and defaulting to "not a
+    guest" would mean a caller added later admits guests by forgetting a keyword.
+    Required makes that a ``TypeError`` at the call site instead.
+
     Slack's TWO texts are why this drives ``privacy_mode``'s primitives rather
     than its single-text ``strip_and_apply``: only *cmd_text* decides whether the
     message was nothing BUT a modifier, while *text* is what reaches the model.
     Ordering (temporary, then incognito) and the early return as soon as nothing
     remains match the shipped behaviour.
     """
+    if guest_user:
+        # Mirrors ``maybe_handle_keyword_command``'s ``if guest_user: return
+        # False``: the modifier is neither stripped nor applied, so the token
+        # stays in *text* and is answered as ordinary content by the guest's own
+        # turn. Returning the inputs unchanged with ``only_modifier=False`` is
+        # what keeps this a refusal rather than a silent no-op that still lets a
+        # modifier-only message end the turn.
+        logger.info(
+            "Refusing privacy modifiers for guest %s — !temporary/!incognito are owner controls",
+            redact_log_via_context(guest_user),
+        )
+        return text, cmd_text, False
+
     for mode, pattern in (
         (privacy_mode.MODE_TEMPORARY, _TEMPORARY_TOKEN_RE),
         (privacy_mode.MODE_INCOGNITO, _INCOGNITO_TOKEN_RE),
@@ -1675,12 +1732,147 @@ def add_trusted_session(
 def is_allowed_user(user_id: str) -> bool:
     """Check if user_id is the owner.
 
-    Multi-user access is disabled for security — only the owner
-    (KIROCREW_OWNER_ID) is authorized to interact via Slack.
+    Owner-only by definition, and every owner control keys off it. Inbound
+    message admission for an allow-listed non-owner is a separate question,
+    answered by :func:`is_guest_user` — widening this predicate would hand a
+    guest the stop buttons, the Home tab, the ``!`` commands and the presigned
+    dashboard links along with it.
     """
     if not user_id:
         return False
     return is_owner(user_id)
+
+
+def is_guest_user(user_id: str) -> bool:
+    """Check if user_id is an allow-listed guest, i.e. a non-owner with inbound access.
+
+    Guests and the owner are disjoint sets: the owner is never a guest, so a
+    call site that must stay owner-only keeps asking
+    :func:`is_allowed_user` and keeps refusing everyone this answers True for.
+
+    A True answer grants ONE thing: candidacy at the inbound message gate. The
+    gate applies the channel, activation and thread conditions on top, and the
+    turn still has to resolve a configured guest member or it is refused.
+    """
+    if not user_id or is_owner(user_id):
+        return False
+    return user_id in _allowed_users
+
+
+def resolve_guest_agent(cfg: Any, channel_id: str) -> str:
+    """Return the guest member configured for *channel_id*, or ``""`` when none is.
+
+    Per-channel ``guest_agent`` wins over the global ``slack.guest_agent``, matching
+    how the per-channel ``agent`` override relates to the default agent. An empty
+    result is the refusal signal: no guest turn runs without a named member, because
+    an unnamed member resolves to the owner's own default memory store.
+    """
+    try:
+        channel = cfg.channel_config(channel_id)
+        return (channel.guest_agent or cfg.slack.guest_agent or "").strip()
+    except Exception:
+        logger.debug("Guest agent lookup failed for channel %s", channel_id, exc_info=True)
+        return ""
+
+
+def guest_member_configured(cfg: Any, agent_name: str) -> bool:
+    """Check *agent_name* names a member that is BOTH isolated and restricted.
+
+    Three positive requirements, because membership alone proves neither half of
+    the guest posture:
+
+    1. The name is in ``config.agents``. ``resolve_agent_bindings`` treats a name
+       absent from it as a kiro-cli template and binds it to the DEFAULT memory
+       store, which is the owner's.
+    2. The member's ``memory_store`` is set and is not
+       :data:`~kiro_crew.memory_stores.DEFAULT_MEMORY_STORE`. The field DEFAULTS
+       to ``"default"``, so a member entry that simply omits it parses to the
+       owner's own store and would pass a membership check while reading the
+       owner's memory.
+    3. The member's ``kiro_agent`` is the generated guest spec. That spec is what
+       mounts no MCP servers, so a member pointed at any other spec is a guest
+       running on an unrestricted toolset. A permission-time gate cannot see a
+       spec's ``allowedTools`` pre-approval -- the harness never raises a
+       permission request for a pre-approved tool -- so this predicate is the
+       only place a wrongly-bound spec can be stopped.
+
+    A negative answer denies admission outright. An owner misconfiguration must
+    refuse the turn rather than downgrade it to something that looks like it
+    worked, because every silent downgrade here lands on the owner's own store.
+    """
+    if not agent_name:
+        return False
+    try:
+        member = cfg.agents.get(agent_name)
+        if member is None:
+            return False
+        store = (getattr(member, "memory_store", "") or "").strip()
+        if not store or store == DEFAULT_MEMORY_STORE:
+            return False
+        return (getattr(member, "kiro_agent", "") or "").strip() == SLACK_GUEST_AGENT_NAME
+    except Exception:
+        logger.debug("Guest member lookup failed for %r", agent_name, exc_info=True)
+        return False
+
+
+class _GuestExecutionRefused(Exception):
+    """A guest turn's member could not be resolved SAFELY, so it must not run.
+
+    Distinct from the errors ``resolve_member_execution`` raises on its own: this
+    one is raised by the guest caller for the two conditions that are legal for an
+    ordinary member and disqualifying for a guest -- a member the executing config
+    does not admit, and a member resolving to the owner's default memory store.
+    Both fail closed at the single ``except`` around the resolution, which refuses
+    the turn rather than downgrading it.
+    """
+
+
+def visible_thread_owner(sessions: Any, reply_ts: str, guest_user: str) -> str | None:
+    """The owner of *reply_ts* as a turn by *guest_user* is allowed to see it.
+
+    The rule itself lives on :meth:`kiro_crew.session_map.SessionMap.get_session_for_thread`
+    and is NOT reimplemented here. It was moved there because this module is not
+    the only reader: the Slack transport path holds ten reads of its own, the
+    dashboard mirror and the interaction handler hold more, and ``use_transport``
+    defaults to True -- so on a default install the OWNER's turn takes the
+    transport path, and a filter that lived only here protected the owner on the
+    path the owner does not normally take. At the index, every reader inherits it,
+    including one added later.
+
+    What remains here is the argument order the call sites in this module already
+    use, and one fact they depend on: the route loop's two consistency re-checks
+    compare a fresh read against the value held from the previous read, so both
+    sides must be filtered identically or the loop would never agree and would
+    spin. Calling one function at all four reads is what guarantees that.
+    """
+    return sessions.get_session_for_thread(reply_ts, guest_user=guest_user)
+
+
+def format_allowlist(cfg: Any) -> str:
+    """Render who currently has Slack access, for a read-only listing.
+
+    Reports the live in-memory set, which is what the message gate actually
+    consults, and takes display names from config where it has one. Mutation is
+    not offered here: adding a guest goes through the owner's Allow button, which
+    audits the approval and persists it, and removal goes through the same button
+    path. A command that could mutate would be a second, unaudited way in.
+    """
+    names: dict[str, str] = {}
+    try:
+        for entry in cfg.slack.allowed_users:
+            if isinstance(entry, dict) and entry.get("slack_id"):
+                names[str(entry["slack_id"])] = str(entry.get("name") or "")
+    except Exception:
+        logger.debug("Allowlist config read failed while rendering", exc_info=True)
+
+    guests = sorted(u for u in _allowed_users if u and u != _owner_id)
+    lines = ["*Slack access*", f"• <@{_owner_id}> — owner" if _owner_id else "• owner not set"]
+    for uid in guests:
+        label = names.get(uid, "")
+        lines.append(f"• <@{uid}>{f' — {label}' if label else ''} — guest")
+    if not guests:
+        lines.append("_No guests on the allowlist._")
+    return "\n".join(lines)
 
 
 def set_tracking_channels(channel_ids: set[str]) -> None:
@@ -2373,11 +2565,29 @@ async def _handle_slash_command(
         )
         return ""
 
-    # ── !allowlist — multi-user access disabled ──
+    # ── !allowlist — read-only listing (owner-only) ──
+    # Reads, never writes. Adding or removing a guest stays on the Allow / Remove
+    # button path, which records the approver in the audit trail; a command that
+    # mutated the list would be a second way in with no such record.
     if cmd == "!allowlist":
+        if not is_owner(user_id):
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.allowlist.list",
+                outcome="denied",
+                source="slack",
+                resources=channel,
+                error="not owner",
+            )
+            await slack.post_message(
+                channel, "⛔ Only the bot owner can use `!allowlist`.", reply_ts
+            )
+            return ""
+        _cfg_now = KiroCrewConfig.load()
         await slack.post_message(
             channel,
-            "⛔ Multi-user access is disabled for security. Only the owner can use Kiro Crew via Slack.",
+            f"{format_allowlist(_cfg_now)}\n\n"
+            f"_Use `/{_cfg_now.slack.command} @user` to nominate someone._",
             reply_ts,
         )
         return ""
@@ -2890,6 +3100,7 @@ async def maybe_handle_keyword_command(
     cron_service: CronService | None = None,
     handle_sessions: bool = True,
     channel_agent: str | None = None,
+    guest_user: str = "",
 ) -> bool:
     """Intercept the path-independent keyword commands.
 
@@ -2913,7 +3124,18 @@ async def maybe_handle_keyword_command(
     ``!temporary``/``!incognito`` modifier rewrites cannot turn a modified
     message into a bare ``sessions`` match). The transport path has no such
     modifier machinery, so it uses the default and handles all four commands.
+
+    *guest_user* is the Slack id of an admitted guest, and a non-empty value
+    refuses every branch. Only the ``sessions`` branch checks its caller; the
+    other three — ``spawn``, ``run`` and the cron wakeups — act on the owner's
+    subagent manager, task runner and cron service with no caller check at all.
+    They are also reached BEFORE any LLM turn opens, so the guest tool gate does
+    not exist yet and a guest-triggered ``cron remove all`` would leave no denial
+    record. Returning ``False`` sends the text on as ordinary chat, which is what
+    a guest writing the word ``spawn`` should get.
     """
+    if guest_user:
+        return False
     # Resolve the agent so the command-intercept persists record the real agent
     # name in session metadata (thread override, then channel override, then
     # global default), matching handle_message's main path.
@@ -3166,6 +3388,13 @@ async def handle_message(
     from_trusted_bot: bool = False,
     channel_activation: str | None = None,
     had_voice_input: bool = False,
+    guest_user: str = "",
+    # The config object a guest turn's ADMISSION passed on, handed down so
+    # admission and execution cannot reach opposite verdicts. ``None`` means the
+    # caller has none to offer (a queued message rebuilt from its queue entry);
+    # the resolution below then loads one and re-applies the admission predicate
+    # to it rather than trusting the earlier verdict.
+    guest_cfg: Any = None,
     _compaction_replay: _CompactionReplay | None = None,
 ) -> None:
     """Route a Slack message through ACP with streaming and tool approval.
@@ -3181,6 +3410,11 @@ async def handle_message(
 
     *channel_agent* overrides the default agent for this channel (set via
     per-channel config in ``slack.channels``).
+
+    *guest_user* is the Slack id of an admitted allow-listed guest, and empty for
+    an owner turn. Non-empty keys the turn to a guest-only session so it cannot
+    resume the session behind an owner's thread, pins the agent to the guest
+    member the caller resolved, and routes tool approval through the guest gate.
 
     *_compaction_replay* is set only by this function itself, when it re-runs a
     message whose previous attempt was abandoned after a transient compaction
@@ -3203,6 +3437,12 @@ async def handle_message(
     # conversation log, and the per-thread override maps across two keys.
     reply_ts = thread_ts or msg_ts
     session_key = canonical_key(reply_ts)
+    if guest_user:
+        # reply_ts still addresses the visible Slack thread, so the answer lands
+        # where the guest asked. Only the session-scoped half moves: a guest gets
+        # its own registry entry, conversation log and override maps, which is what
+        # keeps an owner's thread history out of a guest turn's context.
+        session_key = guest_session_key(guest_user, reply_ts)
 
     # Inbound channels-governance gate (off-loop). Slack is a governed transport
     # like the others: a ``channels`` policy that denies ``slack`` stops inbound
@@ -3233,7 +3473,115 @@ async def handle_message(
 
     # Resolve agent early so ALL persist paths (hook auto-reply, command
     # intercepts, review-mode drafts, main LLM path) can forward it.
-    _agent = _thread_agents.get(session_key) or channel_agent or _get_default_agent() or None
+    #
+    # A guest turn runs the member's RESOLVED TEMPLATE, not the member's own name.
+    # ``channel_agent`` here is the caller's ``_guest_agent``, which is a
+    # ``config.agents`` KEY -- ``guest_member_configured`` requires membership. But
+    # ``agent=`` on this path is a kiro TEMPLATE name: it reaches
+    # ``AcpProvider`` verbatim and is spawned as ``--agent <name>``. Handing the
+    # member key over means the spawn dies on a missing spec, or -- worse -- finds a
+    # same-named spec and runs the guest on THAT, bypassing the one spec whose empty
+    # ``mcpServers`` the admission predicate calls the only place a wrongly-bound
+    # spec can be stopped. The cron path already maps alias to template through
+    # ``resolve_agent_bindings`` (``slack/gateway.py``) for the same reason.
+    #
+    # One resolution serves both halves: ``ExecutionContext`` carries the template
+    # AND the member's memory store, and the store is bound to this turn's session
+    # key below -- a fresh guest key has no execution record, and an unbound key
+    # resolves to a BLANK store, which is the owner's own memory.
+    #
+    # The thread and channel overrides stay excluded: both are owner controls.
+    _guest_execution: ExecutionContext | None = None
+    _agent: str | None
+    if guest_user:
+
+        def _resolve_guest_execution() -> ExecutionContext:
+            """Resolve the guest member on ONE config object, and admit on THAT.
+
+            Admission ran ``guest_member_configured`` in ``_route_message``. It
+            ran on a different object: ``orch._cfg`` is a boot snapshot for every
+            section outside ``_SLACK_OWNED_FIELDS``, and ``agents`` is not in that
+            tuple, so an operator who repoints the member's ``kiro_agent`` or
+            resets its ``memory_store`` leaves the snapshot's verdict standing
+            while the turn resolves the new value. That gap is how a guest reaches
+            a spec carrying its own ``allowedTools`` pre-approvals -- which raise
+            no permission request, and the permission request is the only place
+            the guest tool gate runs -- or binds the owner's Global memory.
+
+            So the object admission passed is handed down as *guest_cfg* and used
+            here. A turn that arrives WITHOUT one (a queued message rebuilt by
+            ``_dispatch_queued``, which reconstructs from the queue entry alone)
+            is not trusted on admission's earlier verdict: the predicate is
+            re-applied to the object this resolution uses, so no object executes a
+            guest turn without having passed the check itself.
+            """
+            cfg = guest_cfg if guest_cfg is not None else KiroCrewConfig.load()
+            if not guest_member_configured(cfg, channel_agent or ""):
+                raise _GuestExecutionRefused(
+                    "the guest member is not configured on the config this turn resolves"
+                )
+            execution = resolve_member_execution(cfg, channel_agent or "")
+            # ``require_member_memory_store`` returns DEFAULT_MEMORY_STORE early
+            # rather than raising -- correct for its own contract, since the
+            # default IS a real store for an ordinary member. For a guest it is
+            # the owner's Global memory, so the refusal belongs to this caller.
+            #
+            # Read off ``store_id``: ``ExecutionContext.store`` is a
+            # ``MemoryStoreRef``, not a string, so treating it as one raises
+            # ``AttributeError`` and refuses EVERY guest turn through the
+            # ``except`` below -- a refusal that looks exactly like the intended
+            # one from the outside.
+            #
+            # DEFENCE IN DEPTH, and currently unreachable: ``MemoryStoreRef``
+            # itself refuses a member bound to the Global store ("a member cannot
+            # use the Global store"), so ``resolve_member_execution`` raises before
+            # this line is read and no mutation of this branch can be caught by a
+            # test. It is kept because the guarantee it states -- a GUEST never
+            # runs on the owner's default store -- belongs to this caller rather
+            # than to a validator one layer down that is free to relax.
+            store = (getattr(execution.store, "store_id", "") or "").strip()
+            if not store or store == DEFAULT_MEMORY_STORE:
+                raise _GuestExecutionRefused(
+                    f"the guest member resolves to the owner's default store ({store or 'blank'})"
+                )
+            return execution
+
+        try:
+            _guest_execution = await asyncio.to_thread(_resolve_guest_execution)
+        except Exception:
+            # Fail closed. Running anyway is what resolves the owner's memory, so
+            # the turn does not run at all.
+            logger.warning(
+                "Refusing guest turn: guest member could not be resolved to an execution",
+                exc_info=True,
+            )
+            try:
+                await slack.post_message(channel, _GUEST_UNRESOLVED_NOTICE, reply_ts)
+            except Exception:
+                logger.debug("Failed to post the guest refusal notice", exc_info=True)
+            return
+        _agent = _guest_execution.template_id
+    else:
+        _agent = _thread_agents.get(session_key) or channel_agent or _get_default_agent() or None
+
+    # Hooks this turn consults. A guest turn gets the guest-scoped manager, whose
+    # empty ``auto_approve_tools`` means the hook gate cannot GRANT a tool, only
+    # deny one, and whose dropped auto-replies and transforms keep the owner's
+    # canned responses and text rewrites off a guest's message. Independent of
+    # the guest tool gate below: either alone refuses a tool the owner's config
+    # would have auto-approved.
+    # Resolved ONCE and read as a plain name at every consultation below. The
+    # structural gate scan in test_hooks.py recognises a consultation by the
+    # shape ``<name>.on_tool_call(``, so a parenthesised receiver spelled at the
+    # call site hides that site from the guard that proves it threads every
+    # enforcement field.
+    _turn_hooks = None
+    if context_builder is not None:
+        _turn_hooks = (
+            build_guest_hooks(context_builder.hooks)
+            if guest_user and context_builder.hooks
+            else context_builder.hooks
+        )
 
     # ── Linked thread intercept: route to dashboard slot if linked ──
     # Resolved from the NAME captured when the answer was accepted, not from the
@@ -3245,7 +3593,13 @@ async def handle_message(
     if route_pinned and target_slot_name and _dashboard_state:
         _target_slot = getattr(_dashboard_state, "_slots", {}).get(target_slot_name)
 
-    if await maybe_route_linked_thread(
+    # A guest turn never takes this intercept. It delivers the message into the
+    # dashboard slot behind a linked thread -- the owner's own conversation, with
+    # the owner's agent, store and auto-approved tools -- and it RETURNS, so it
+    # lands upstream of the guest tool gate, which therefore never sees the turn
+    # at all. There is no destination to redirect to either: the guest's answer
+    # belongs in the Slack thread it was asked in.
+    if not guest_user and await maybe_route_linked_thread(
         text,
         session_key,
         user_id,
@@ -3266,8 +3620,8 @@ async def handle_message(
     )
 
     # ── Hook: check for auto-reply before touching ACP ──
-    if context_builder:
-        hook_result = context_builder.hooks.on_message(text)
+    if _turn_hooks:
+        hook_result = _turn_hooks.on_message(text)
         if hook_result.action == HOOK_REPLY:
             await slack.post_message(channel, hook_result.text, reply_ts)
             if conversation_log and not _is_slack_restricted(session_key):
@@ -3289,6 +3643,24 @@ async def handle_message(
 
     # ── Status keyword: reply with stats summary ──
     if text.strip().lower() == "status":
+        # Owner-only, and audited when refused, exactly as the ``sessions`` branch
+        # below is. ``Stats().summary()`` is gateway-WIDE telemetry -- uptime,
+        # message counts, tool approvals and denials, session and subagent counts --
+        # so it is owner state even though it names no file. This branch sits ABOVE
+        # ``maybe_handle_keyword_command``, whose own guest refusal therefore never
+        # runs for it, and it answers with no LLM turn, so the guest tool gate does
+        # not exist yet either.
+        if guest_user:
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.status_command",
+                outcome="denied",
+                source="slack",
+                resources=channel,
+                error="guest_denied_owner_telemetry",
+            )
+            await slack.post_message(channel, "_Permission denied._", reply_ts)
+            return
         # Identity status via the active PlatformContext (Default == OSS no-op
         # stub returning ""; an enterprise companion returns the real SSO line).
         sso_line = await current_context().identity.status_line(prefix=" · sso")
@@ -3336,7 +3708,15 @@ async def handle_message(
 
     # ── !temporary / !incognito privacy modifiers (shared with transport) ──
     text, _cmd_text, _only_modifier = await maybe_apply_privacy_modifiers(
-        text, _cmd_text, session_key, user_id, channel, slack, sessions, reply_ts
+        text,
+        _cmd_text,
+        session_key,
+        user_id,
+        channel,
+        slack,
+        sessions,
+        reply_ts,
+        guest_user=guest_user,
     )
     if _only_modifier:
         return
@@ -3445,6 +3825,7 @@ async def handle_message(
         cron_service=cron_service,
         handle_sessions=False,
         channel_agent=channel_agent,
+        guest_user=guest_user,
     ):
         return
 
@@ -3470,7 +3851,7 @@ async def handle_message(
     # key silently no-ops and leaves the control clickable.
     await expire_slack_options(
         cast("DashboardState | None", get_dashboard_state()),
-        sessions.get_session_for_thread(reply_ts) or session_key,
+        visible_thread_owner(sessions, reply_ts, guest_user) or session_key,
     )
 
     status_ctrl = StatusReactionController(
@@ -3840,12 +4221,19 @@ async def handle_message(
     # thread, and whether to mirror into a dashboard slot -- and a pinned answer
     # needs a different answer for each. Falsifying this single value to steer all
     # three is what made the pin land wrong three times running.
-    thread_owner_key = sessions.get_session_for_thread(reply_ts)
+    thread_owner_key = visible_thread_owner(sessions, reply_ts, guest_user)
     # Mirror/footer value: a pinned answer belongs to the conversation that ASKED,
     # not to whoever owns the thread now, so it mirrors nowhere. (A pinned asker
     # that *does* hold a slot never reaches here -- maybe_route_linked_thread
     # already delivered the turn into that slot and returned.)
     linked_session_key = None if route_pinned else thread_owner_key
+    if guest_user:
+        # A guest turn mirrors nowhere. Its own self-link makes this value the
+        # guest's key on a follow-up, and the mirror below feeds whatever slot the
+        # name resolves to plus a "Link to Dashboard" footer control -- both owner
+        # surfaces. The dashboard is where the owner reads their own sessions, so a
+        # guest turn has no destination there.
+        linked_session_key = None
     if route_pinned:
         # A pinned answer names its own conversation, so the thread's CURRENT
         # owner has no say -- rewriting the key here is what let a pinned answer
@@ -3876,23 +4264,48 @@ async def handle_message(
         task.start()
         while True:
             candidate_key = session_key
-            if not route_pinned:
-                thread_owner_key = sessions.get_session_for_thread(reply_ts)
+            if not route_pinned and not guest_user:
+                # A guest turn keeps the key minted for it above. This block exists
+                # to hand a thread's turn to whoever owns the thread, which for a
+                # guest is by definition somebody else: ``candidate_key`` would
+                # become the canonical or owner key, ``session_store_for_turn``
+                # would then resolve the OWNER's memory store, and the guest's own
+                # key -- with its own conversation log and override maps -- would
+                # be discarded before it was ever used.
+                thread_owner_key = visible_thread_owner(sessions, reply_ts, guest_user)
                 candidate_key = thread_owner_key or canonical_key(reply_ts)
                 if candidate_key != session_key:
                     await _hydrate_thread_overrides(candidate_key, conversation_log)
-                    if sessions.get_session_for_thread(reply_ts) != thread_owner_key:
+                    if visible_thread_owner(sessions, reply_ts, guest_user) != thread_owner_key:
                         continue
             # Both private identity hydration and store resolution can yield to
             # a link/unlink. Commit the route only after those reads agree with
             # the current owner; a pinned answer always keeps its asker instead.
             memory_error = None
+            if _guest_execution is not None:
+                # Publish the guest member's identity on the guest key BEFORE the
+                # store is resolved from it. ``store_of_session`` reads the session's
+                # execution record first and its conversation-log metadata second; a
+                # freshly minted guest key has neither, so it returns a BLANK store,
+                # and blank resolves to the owner's global memory and the operator's
+                # global lessons. Nothing else on the Slack inbound path binds one --
+                # the only other caller is the cron path in ``slack/gateway.py`` --
+                # so without this the refusal that ``guest_member_configured``
+                # enforces at admission is undone one layer down.
+                try:
+                    await asyncio.to_thread(bind_session_execution, candidate_key, _guest_execution)
+                except Exception as exc:
+                    # Fail closed, exactly as an unresolvable store does: an unbound
+                    # guest key is the leak, so no turn runs on one.
+                    raise UnknownMemoryStore(
+                        "The guest member's identity could not be bound to this session"
+                    ) from exc
             try:
                 _memory_store = await session_store_for_turn(context_builder, candidate_key)
             except UnknownMemoryStore as exc:
                 memory_error = exc
-            if not route_pinned:
-                if sessions.get_session_for_thread(reply_ts) != thread_owner_key:
+            if not route_pinned and not guest_user:
+                if visible_thread_owner(sessions, reply_ts, guest_user) != thread_owner_key:
                     continue
                 if candidate_key != session_key:
                     logger.info(
@@ -3908,7 +4321,18 @@ async def handle_message(
             break
         # Re-resolve _agent against (possibly linked) session_key for the main
         # LLM path — linked dashboard sessions may carry a different thread agent.
-        _agent = _thread_agents.get(session_key) or channel_agent or _get_default_agent() or None
+        #
+        # A guest turn keeps the member the caller resolved, exactly as the first
+        # resolution above pins it. The two must agree: this one reads the thread
+        # override map and then the owner's DEFAULT agent, so a guest reaching it
+        # would run on an agent bound to the owner's memory store. Today
+        # ``channel_agent`` carries the guest member and wins before the default is
+        # consulted, so the bug is latent rather than live -- one write into
+        # ``_thread_agents`` under a guest key is all that separates them.
+        if not guest_user:
+            _agent = (
+                _thread_agents.get(session_key) or channel_agent or _get_default_agent() or None
+            )
         client, is_new, resumed = await sessions.get_or_create(
             session_key, agent=_agent, channel_id=channel
         )
@@ -3932,7 +4356,7 @@ async def handle_message(
         # posts on its way out, leaving live buttons for a superseded question.
         await expire_slack_options(
             cast("DashboardState | None", get_dashboard_state()),
-            sessions.get_session_for_thread(reply_ts) or session_key,
+            visible_thread_owner(sessions, reply_ts, guest_user) or session_key,
         )
         if is_new:
             await sessions.set_channel(session_key, channel)
@@ -4272,8 +4696,8 @@ async def handle_message(
                 # informational exception. A genuine deny-list / sensitive-path
                 # match still surfaces a (best-effort, non-enforcing) warning +
                 # audit.
-                if context_builder:
-                    tool_result = context_builder.hooks.on_tool_call(
+                if _turn_hooks:
+                    tool_result = _turn_hooks.on_tool_call(
                         event.title,
                         session_key=session_key,
                         agent=_agent or "",
@@ -4418,9 +4842,112 @@ async def handle_message(
                     accumulated = ""
 
             elif event.kind == EVENT_PERMISSION_REQUEST:
+                # ── Guest tool gate: terminal, and ahead of every rung below ──
+                # A guest turn is decided here and never falls through to the
+                # hook auto-approve, the spawn grant, approval_mode, YOLO, trust,
+                # or the interactive buttons. Deny-by-default: a tool not
+                # positively on the guest list is rejected. The safe ones are
+                # approved outright rather than parked, so no approval prompt for
+                # a guest turn ever exists to be answered or seen.
+                #
+                # Keyed on the harness-authored identity (``tool_name`` plus
+                # ``mcp_server_name``), never on ``event.title``: the title is
+                # LLM-authored prose, so a gate reading it lets the model name
+                # the tool it is authorized for. An absent identity denies.
+                if guest_user:
+                    # The deny rungs run HERE, above the approval, because this
+                    # branch is terminal: it approves and ``continue``s, so
+                    # anything consulted further down never sees a guest turn.
+                    # ``build_guest_hooks`` keeps the owner's ``auto_deny_tools``
+                    # and sensitive-path deny precisely because "a deny can only
+                    # narrow what a guest reaches" -- and while the approval came
+                    # first, that retained deny was never consulted on the turn it
+                    # was kept for. An operator's ``network.egress`` denial, or an
+                    # ``auto_deny_tools`` entry naming ``web_search``, did not hold
+                    # for a guest.
+                    #
+                    # Only the DENY direction is honoured. A hook AUTO-APPROVE is
+                    # deliberately ignored: it would let the owner's
+                    # ``auto_approve_tools`` globs widen the guest list, and this
+                    # gate's whole contract is that nothing widens it. So the two
+                    # layers compose one way only -- either alone refuses.
+                    _guest_hook_denied = False
+                    if _turn_hooks:
+                        _guest_hook_result = _turn_hooks.on_tool_call(
+                            event.title,
+                            session_key=session_key,
+                            agent=_agent or "",
+                            **hook_gate_kwargs(event),
+                        )
+                        _guest_hook_denied = _guest_hook_result.action == TOOL_DENY
+                    _guest_ok = (
+                        is_guest_safe_tool(event.tool_name, event.mcp_server_name)
+                        and not _guest_hook_denied
+                    )
+                    if _guest_ok:
+                        # Fail-closed on audit failure: an unattended non-owner
+                        # turn must not run a tool with no permission record, so
+                        # a failed write denies instead of approving silently.
+                        try:
+                            await asyncio.to_thread(
+                                lambda: sel().log_tool_invocation(
+                                    session_key=session_key,
+                                    source="slack",
+                                    agent=_agent or "",
+                                    tool_name=event.tool_name,
+                                    tool_kind=event.tool_kind,
+                                    outcome="auto_approved",
+                                    request_id=event.request_id,
+                                    metadata={"reason": "in_guest_safe_tools"},
+                                    critical=True,
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "SEL audit failed on guest approve path — denying "
+                                "tool to preserve the audit-or-deny invariant",
+                                exc_info=True,
+                            )
+                            await client.reject_tool(event.request_id)
+                            Stats().inc_tool_denial()
+                            continue
+                        await client.approve_tool(event.request_id)
+                        Stats().inc_tool_auto_approved()
+                        continue
+                    try:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="slack",
+                            agent=_agent or "",
+                            tool_name=event.tool_name,
+                            tool_kind=event.tool_kind,
+                            outcome="denied",
+                            request_id=event.request_id,
+                            error=(
+                                "unverified_tool_identity"
+                                if not event.tool_name
+                                else (
+                                    "denied_by_hooks"
+                                    if _guest_hook_denied
+                                    else "not_in_guest_safe_tools"
+                                )
+                            ),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "SEL audit failed on guest deny path — tool was still rejected",
+                            exc_info=True,
+                        )
+                    await client.reject_tool(event.request_id)
+                    Stats().inc_tool_denial()
+                    _denied_title, _ = redact_exfiltration_urls(event.title)
+                    _denied_title, _ = redact_credentials(_denied_title)
+                    accumulated += f"\n🚫 _Tool `{_denied_title}` is not available to guests._"
+                    continue
+
                 # Check tool hooks for auto-approve
-                if context_builder:
-                    tool_result = context_builder.hooks.on_tool_call(
+                if _turn_hooks:
+                    tool_result = _turn_hooks.on_tool_call(
                         event.title,
                         session_key=session_key,
                         agent=_agent or "",
@@ -4746,6 +5273,11 @@ async def handle_message(
                         from_trusted_bot=from_trusted_bot,
                         channel_activation=channel_activation,
                         had_voice_input=had_voice_input,
+                        guest_user=guest_user,
+                        # Same object the original turn was admitted on. Omitting
+                        # it would make the replay load its own and re-derive the
+                        # verdict, which is the window this round closed.
+                        guest_cfg=guest_cfg,
                         _compaction_replay=_CompactionReplay(
                             attempt=_attempt + 1, stop_gen_at_entry=_stop_gen_at_entry
                         ),
@@ -5569,7 +6101,7 @@ async def handle_message(
             # the key this turn started with files the control where the next turn's
             # expiry will not look. Reading it twice would reopen the same split if a
             # link landed in between.
-            _options_owner = sessions.get_session_for_thread(reply_ts) or session_key
+            _options_owner = visible_thread_owner(sessions, reply_ts, guest_user) or session_key
             try:
 
                 remember_slack_options(

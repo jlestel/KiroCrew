@@ -1558,7 +1558,17 @@ class TestControlPostedAfterTheWindowIsSpent:
         footer = inspect.getsource(handler.handle_message)
         owner = footer.find("_options_owner =")
         assert owner != -1, "the footer path must resolve the owner once, into a variable"
-        assert "get_session_for_thread(reply_ts) or session_key" in footer[owner : owner + 200]
+        # The native path resolves through ``visible_thread_owner``, which hides a
+        # GUEST's thread claim: recording the owner's control under a guest's key
+        # would let the guest's next message expire the owner's pending question.
+        # The transport half above legitimately keeps the raw read -- it refuses a
+        # guest turn outright, so it carries no ``guest_user`` to filter on, and
+        # the index applies the same rule to an unfiltered read anyway. The two
+        # spellings differ for that stated reason, not by drift.
+        assert (
+            "visible_thread_owner(sessions, reply_ts, guest_user) or session_key"
+            in footer[owner : owner + 200]
+        )
         # Both the record and the cleanup must consume that one resolution.
         assert footer.count("_options_owner") >= 3, (
             "the footer's record AND its superseded-cleanup must both use the "

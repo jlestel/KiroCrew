@@ -39,6 +39,21 @@ WORKER_AGENT_FILENAME = "kirocrew-worker.json"
 KNOWLEDGE_AGENT_FILENAME = "kirocrew-knowledge.json"
 RESEARCH_AGENT_FILENAME = "kirocrew-research.json"
 HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
+#: The member an allow-listed SLACK guest runs as, and a spec of its own rather
+#: than a reuse of ``GUEST_AGENT_FILENAME`` above. That one is the channel-wide
+#: tool-less boundary a non-operator sender talks to (``messaging.dispatch``'s
+#: ``TOOLLESS_TURN_AGENT``), with ``tools: []`` pinned by its own test. This one
+#: mounts ``web_search`` for a guest the owner allow-listed by name in a tracked
+#: channel. Two trust boundaries, so two files, for the reason line 26 already
+#: gives: sharing one would mean a later change to either silently moves the
+#: other, and the wider of the two decides.
+SLACK_GUEST_AGENT_FILENAME = "kirocrew-slack-guest.json"
+#: The ``kiro_agent`` value a Slack guest member must carry, i.e. the modeId
+#: kiro-cli resolves the spec above by. DERIVED from the filename rather than
+#: spelled a second time: ``slack/handler.guest_member_configured`` refuses a
+#: guest member bound to any other spec, so a drift between the two names would
+#: refuse every guest turn while both strings still looked right.
+SLACK_GUEST_AGENT_NAME = SLACK_GUEST_AGENT_FILENAME.removesuffix(".json")
 
 # Collective allowlists — the EXACT filenames KiroCrew owns in each dir. Used by
 # the Playwright convergence sweep (browser/setup.py) so it rewrites only files
@@ -56,6 +71,7 @@ OWNED_KIRO_AGENT_FILES = (
     KNOWLEDGE_AGENT_FILENAME,
     RESEARCH_AGENT_FILENAME,
     HEARTBEAT_AGENT_FILENAME,
+    SLACK_GUEST_AGENT_FILENAME,
 )
 
 # The specs that MUST exist for the product to work at all. kiro-cli resolves an

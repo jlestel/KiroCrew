@@ -2130,9 +2130,16 @@ async def _handle_allowlist(
         if not _orch:
             logger.error("Allowlist approve: orchestrator not initialized")
             return
+        # Persist BEFORE publishing. ``run_config_write`` raises out of
+        # ``update_config_locked`` on an IO failure. Publishing first would admit a
+        # guest with no durable record: the live set is already mutated, the raise
+        # skips the SEL approve row below so nothing records the grant, and the
+        # owner's own ``format_allowlist`` reads config, so the owner cannot see the
+        # guest they are now answering. Publishing last means a raise leaves the
+        # grant absent everywhere rather than present in memory only.
+        await run_config_write(persist_allowed_user, new_user_id, name=display_name)
         _orch._allowed_users.add(new_user_id)
         set_allowed_users(_orch._allowed_users)
-        await run_config_write(persist_allowed_user, new_user_id, name=display_name)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.allowlist.approve",
@@ -2156,10 +2163,20 @@ async def _handle_allowlist(
         if not _orch:
             logger.error("Allowlist deny: orchestrator not initialized")
             return
-        # Remove from in-memory set and persisted config
+        # Persist BEFORE publishing, the same order as the approve branch above
+        # and for the sharper reason: the durable record is the AUTHORITY for
+        # guest standing. Discarding first makes a failed write look like a
+        # completed revocation -- the live set rejects them, the raise
+        # out of ``update_config_locked`` skips the SEL deny row below so nothing
+        # records the removal, and config still carries the grant. The gateway
+        # then restores it, and not only at the next restart: the
+        # ``slack.allowed_users`` applier rebuilds the live set FROM CONFIG on any
+        # change to that key, so admitting some other guest silently un-revokes
+        # this one. Publishing last means a raise leaves the grant present
+        # everywhere rather than absent in memory only.
+        await run_config_write(persist_allowed_user, new_user_id, remove=True)
         _orch._allowed_users.discard(new_user_id)
         set_allowed_users(_orch._allowed_users)
-        await run_config_write(persist_allowed_user, new_user_id, remove=True)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.allowlist.deny",
@@ -2588,9 +2605,15 @@ async def _handle_allowlist_remove(
     if not target_id:
         return
 
+    # Persist BEFORE publishing, for the reason spelled out in the deny branch:
+    # the durable record is the authority, and the ``slack.allowed_users`` applier
+    # rebuilds the live set from config on any change to that key, so a discard
+    # that was never persisted is undone by the next grant rather than surviving
+    # until a restart. This is the path an EXISTING guest reaches -- re-nominating
+    # one renders Keep/Remove -- so it is the revocation that matters most.
+    await run_config_write(persist_allowed_user, target_id, remove=True)
     _orch._allowed_users.discard(target_id)
     set_allowed_users(_orch._allowed_users)
-    await run_config_write(persist_allowed_user, target_id, remove=True)
 
     from kiro_crew.slack.blocks import allowlist_list_block
 

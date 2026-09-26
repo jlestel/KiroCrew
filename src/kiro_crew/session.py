@@ -3209,9 +3209,25 @@ class SessionManager:
         """True iff this session's Slack thread is disconnected but still bound."""
         return self._session_map.is_slack_paused(key)
 
-    def get_session_for_thread(self, thread_ts: str) -> str | None:
-        """Return the session key linked to a Slack thread, or None."""
-        return self._session_map.get_session_for_thread(thread_ts)
+    def get_session_for_thread(self, thread_ts: str, *, guest_user: str = "") -> str | None:
+        """Return the session key linked to a Slack thread, or None.
+
+        A guest's thread claim is hidden unless *guest_user* owns it; the rule and
+        the reasoning live on :meth:`SessionMap.get_session_for_thread`. Omitting
+        the argument is the safe direction, so a caller that does not know whose
+        turn it is never adopts a guest's session.
+        """
+        return self._session_map.get_session_for_thread(thread_ts, guest_user=guest_user)
+
+    def guest_claim_for_thread(self, thread_ts: str) -> str | None:
+        """The GUEST session key claiming a Slack thread, for CANCELLATION only.
+
+        Never route a turn onto this key. The rule and the reasoning live on
+        :meth:`SessionMap.guest_claim_for_thread`; it exists so the owner's
+        ``!stop`` can reach a turn the hiding rule correctly keeps out of every
+        routing read.
+        """
+        return self._session_map.guest_claim_for_thread(thread_ts)
 
     def channel_key_for_stem(self, stem: str) -> str:
         """The real channel session key behind a transcript filename *stem*.

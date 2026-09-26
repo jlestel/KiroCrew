@@ -278,7 +278,6 @@ src/kiro_crew/skills_dedupe.py
 src/kiro_crew/skills_script_validator.py
 src/kiro_crew/slack/blocks.py
 src/kiro_crew/slack/enterprise.py
-src/kiro_crew/slack/events.py
 src/kiro_crew/slack/sessions_view.py
 src/kiro_crew/subagent_scale.py
 src/kiro_crew/testing/channel_fixtures.py
@@ -329,7 +328,6 @@ test/test_app_e2e.py
 test/test_app_execution.py
 test/test_app_manager.py
 test/test_app_manifest.py
-test/test_app_mcp_scoping.py
 test/test_app_permissions.py
 test/test_app_proxy_auth.py
 test/test_app_routes.py

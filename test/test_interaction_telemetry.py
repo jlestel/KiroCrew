@@ -272,7 +272,7 @@ class _FakeSessionManager:
     def get_slack_link(self, key):
         return None, None
 
-    def get_session_for_thread(self, thread_ts):
+    def get_session_for_thread(self, thread_ts, *, guest_user=""):
         return None
 
     async def close_all(self):

@@ -160,7 +160,7 @@ class FakeSessions:
         self._sessions: dict = {}
         self.links: dict = {}
 
-    def get_session_for_thread(self, thread_ts: str):
+    def get_session_for_thread(self, thread_ts: str, *, guest_user: str = ""):
         return None
 
     async def get_or_create(self, session_key, agent=None, channel_id=None):

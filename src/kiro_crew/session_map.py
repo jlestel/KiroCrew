@@ -29,7 +29,9 @@ from kiro_crew.messaging.link import (
     UNBIND_REASONS,
     ChannelLink,
     canonical_key,
+    guest_session_key,
     is_channel_session_key,
+    is_guest_session_key,
     legacy_dashboard_mirror_key,
     split_dm_session_key,
 )
@@ -1481,9 +1483,69 @@ class SessionMap:
             return False
         return entry.get("slack_paused") is True
 
-    def get_session_for_thread(self, thread_ts: str) -> str | None:
-        """Return the session key linked to a Slack thread_ts, or None."""
-        return self._thread_to_session.get(thread_ts)
+    def get_session_for_thread(self, thread_ts: str, *, guest_user: str = "") -> str | None:
+        """Return the session key linked to a Slack thread_ts, or None.
+
+        A guest's thread claim is HIDDEN unless *guest_user* is the guest that
+        made it. This is the one place that rule lives, and it is here rather
+        than in the Slack handler for two reasons.
+
+        First, both key shapes are self-derived from the thread's timestamp, so
+        :meth:`set_slack_link` takes its ``setdefault`` branch: a guest's claim
+        outlives an owner's later reply in that thread. Any reader that then
+        adopts the claim runs its turn on the guest's session, agent, memory
+        store and tool gate -- for an OWNER turn that is the leak the guest
+        feature exists to prevent, arriving from the other direction.
+
+        Second, there is more than one reader, and there will be more later. The
+        Slack native path, the Slack transport path, the dashboard mirror and the
+        interaction handler all reach this method, and ``use_transport`` defaults
+        to True, so on a default install the OWNER's turn is the one that takes
+        the transport path. Hiding the claim at each call site protects whichever
+        path was edited; hiding it here protects all of them, and a path added
+        later inherits the protection by calling this at all.
+
+        The default is the SAFE direction: a caller that says nothing about whose
+        turn it is sees no guest claim. Only a guest turn passes *guest_user*, and
+        it sees its OWN claim and no other guest's -- admission refuses a guest in
+        another guest's thread, and this keeps that true at the index as well.
+        """
+        key = self._thread_to_session.get(thread_ts)
+        if key is None or not is_guest_session_key(key):
+            return key
+        if guest_user and key == guest_session_key(guest_user, thread_ts):
+            return key
+        logger.info(
+            "Slack thread %s is claimed by a guest session — hiding it from this reader",
+            thread_ts,
+        )
+        return None
+
+    def guest_claim_for_thread(self, thread_ts: str) -> str | None:
+        """Return the GUEST session key claiming *thread_ts*, or None.
+
+        The one deliberate bypass of :meth:`get_session_for_thread`'s hiding
+        rule, and named so it cannot be mistaken for a routing read: there is no
+        turn you should run on the key this returns. It exists for CANCELLATION.
+
+        Hiding a guest's claim protects a reader that would otherwise ADOPT the
+        guest's session for its own turn. The owner's in-thread ``!stop`` is not
+        adopting anything -- it is trying to cancel a turn that is already
+        running -- so the hiding rule turns the owner's emergency brake into
+        "Nothing running." while the untrusted turn continues. Losing the ability
+        to stop a guest's turn is the worst failure this design can have, which
+        is why the bypass is explicit rather than a boolean on the routing read
+        that a later caller could copy without noticing.
+
+        Returns None when no session claims the thread, and when the claim is an
+        ordinary (non-guest) session -- that case is already visible through
+        :meth:`get_session_for_thread`, so a caller stops it by the normal path
+        and this returns nothing extra to stop.
+        """
+        key = self._thread_to_session.get(thread_ts)
+        if key is None or not is_guest_session_key(key):
+            return None
+        return key
 
     # ── Channel-neutral outbound mirror binding (generalizes Slack linking) ──
     # ``set/get/clear_slack_link`` above are the Slack-specific backend of this

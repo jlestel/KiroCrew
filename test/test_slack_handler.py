@@ -138,7 +138,7 @@ class FakeSessionManager:
     def get_slack_link(self, key):
         return None, None
 
-    def get_session_for_thread(self, thread_ts):
+    def get_session_for_thread(self, thread_ts, *, guest_user=""):
         return None
 
     async def close_all(self):
@@ -1888,7 +1888,7 @@ class TestPerThreadAgent:
         class LinkedSessions(FakeSessionManager):
             """The thread index resolves this thread to a dashboard session."""
 
-            def get_session_for_thread(self, thread_ts):
+            def get_session_for_thread(self, thread_ts, *, guest_user=""):
                 return owner_key
 
         log = MagicMock()
@@ -1940,7 +1940,7 @@ class TestPerThreadAgent:
         class RelinkedSessions(FakeSessionManager):
             owner_key = old_owner
 
-            def get_session_for_thread(self, thread_ts):
+            def get_session_for_thread(self, thread_ts, *, guest_user=""):
                 return self.owner_key
 
             def set_slack_link(self, key, thread_ts, channel_id):
@@ -3531,7 +3531,7 @@ class TestTransientCompactionRetry:
                 self.noted.append(key)
                 return True
 
-            def get_session_for_thread(self, thread_ts):
+            def get_session_for_thread(self, thread_ts, *, guest_user=""):
                 return self.owner
 
         set_owner_id("U_OWNER")

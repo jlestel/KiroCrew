@@ -550,9 +550,16 @@ class TestMiscSlashCommands:
         assert "Imported 3 messages" in body and "slot-3" in body
 
     @pytest.mark.asyncio
-    async def test_allowlist_is_disabled(self, slack, sessions, owner):
+    async def test_allowlist_lists_read_only(self, slack, sessions, owner):
+        """``!allowlist`` reports access and mutates nothing.
+
+        Mutation lives on the Allow / Remove button path, which records the
+        approver in the audit trail.
+        """
         assert await _slash("!allowlist", slack, sessions) == ""
-        assert "Multi-user access is disabled" in _texts(slack)
+        body = _texts(slack)
+        assert "Slack access" in body
+        assert "nominate" in body
 
     @pytest.mark.asyncio
     async def test_title_sets_thread_title(self, slack, sessions, owner):
@@ -1309,7 +1316,7 @@ class TestPrivacyModifiers:
     @pytest.mark.asyncio
     async def test_temporary_only_returns_early(self, slack, sessions, owner):
         text, cmd, only = await h.maybe_apply_privacy_modifiers(
-            "!temporary", "!temporary", "t1", "U1", "C1", slack, sessions, "t1"
+            "!temporary", "!temporary", "t1", "U1", "C1", slack, sessions, "t1", guest_user=""
         )
         assert only is True and cmd == ""
         assert h.is_thread_temporary("t1") is True
@@ -1319,7 +1326,7 @@ class TestPrivacyModifiers:
     @pytest.mark.asyncio
     async def test_incognito_only_returns_early(self, slack, sessions, owner):
         _, cmd, only = await h.maybe_apply_privacy_modifiers(
-            "!incognito", "!incognito", "t1", "U1", "C1", slack, sessions, "t1"
+            "!incognito", "!incognito", "t1", "U1", "C1", slack, sessions, "t1", guest_user=""
         )
         assert only is True and cmd == ""
         assert h.is_thread_incognito("t1") is True
@@ -1336,6 +1343,7 @@ class TestPrivacyModifiers:
             slack,
             sessions,
             "t1",
+            guest_user="",
         )
         assert only is False
         assert cmd == "summarize" and text == "summarize"
@@ -1344,7 +1352,7 @@ class TestPrivacyModifiers:
     @pytest.mark.asyncio
     async def test_no_modifier_is_passthrough(self, slack, sessions, owner):
         out = await h.maybe_apply_privacy_modifiers(
-            "hello", "hello", "t1", "U1", "C1", slack, sessions, "t1"
+            "hello", "hello", "t1", "U1", "C1", slack, sessions, "t1", guest_user=""
         )
         assert out == ("hello", "hello", False)
         assert not slack.actions

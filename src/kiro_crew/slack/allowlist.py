@@ -31,7 +31,7 @@ from kiro_crew.dashboard.origin import (
 )
 from kiro_crew.dashboard.token_auth import LINK_WINDOW_SECS, MAX_SESSION_TTL_SECS, generate_token
 from kiro_crew.sel import sel
-from kiro_crew.slack.handler import is_allowed_user, is_tracked_channel
+from kiro_crew.slack.handler import is_guest_user, is_tracked_channel
 from kiro_crew.tunnel import get_tunnel_url, publish_disabled
 
 if TYPE_CHECKING:
@@ -107,7 +107,16 @@ async def prompt_allowlist(
     if not user_id:
         return
 
-    already = is_allowed_user(user_id)
+    # Whether this user ALREADY has a grant, which is what decides Keep/Remove
+    # versus Allow/Deny. It must be the membership predicate, not the owner-standing
+    # one: ``is_allowed_user`` was narrowed to owner-only when guests were split
+    # out, so an existing guest read as "not yet allowed" and the prompt offered
+    # Allow/Deny. Deny on that prompt UN-PERSISTS the grant, so re-nominating a
+    # guest -- the ``/kirocrew @user`` recall this function's docstring describes --
+    # handed the owner a button that deleted the access they were checking on. It
+    # also decides the automatic channel-join skip two lines below, which had the
+    # same inversion: a re-join re-prompted for a guest already granted.
+    already = is_guest_user(user_id)
 
     # Automatic channel-join → skip if already allowed
     if channel_id and already:

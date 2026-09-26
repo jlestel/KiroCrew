@@ -64,7 +64,7 @@ class _RoutingSessions(FakeSessions):
         self._thread_index = dict(thread_index or {})
         self.acquired_keys: list[str] = []
 
-    def get_session_for_thread(self, thread_ts):
+    def get_session_for_thread(self, thread_ts, *, guest_user=""):
         return self._thread_index.get(thread_ts)
 
     async def get_or_create(self, session_key, agent=None, channel_id=None):

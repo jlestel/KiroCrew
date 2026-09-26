@@ -1761,7 +1761,7 @@ class _LinkCapturingSessions(FakeSessions):
         # Who the thread index says owns this thread; None = unclaimed.
         self.thread_owner: str | None = None
 
-    def get_session_for_thread(self, thread_ts):
+    def get_session_for_thread(self, thread_ts, *, guest_user=""):
         return self.thread_owner
 
     async def get_or_create(self, session_key, agent=None, channel_id=None):
