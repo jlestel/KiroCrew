@@ -80,6 +80,7 @@ from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.mcp_discovery import sync_discovered_servers
 from kiro_crew.messaging.link import _in_namespace, canonical_key
 from kiro_crew.platform import redact_log_via_context
+from kiro_crew.runtime_ownership import release_session_lease
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     configured_sandbox_mode,
@@ -4403,6 +4404,12 @@ async def _reset_all_sessions(request: web.Request) -> int:
                         "Session shutdown hung past %.1fs; forcing kill",
                         _timeout,
                     )
+                    # The timeout cancelled ``shutdown`` mid-flight, so it may not
+                    # have reached its own release. Release here before the kill --
+                    # idempotent, so a shutdown that did get that far costs
+                    # nothing, and without it the gate refuses the very kill this
+                    # arm exists to perform and the hung tree leaks.
+                    await release_session_lease(p)
                     try:
                         # The kill signals the provider's whole process group and
                         # then waits out a bounded SIGTERM grace, so it blocks for

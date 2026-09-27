@@ -31,7 +31,7 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_VALUE,
 )
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
-from kiro_crew.runtime_ownership import PidRefcount, note_runtime_kill
+from kiro_crew.runtime_ownership import PidRefcount, authorize_runtime_kill
 
 logger = logging.getLogger(__name__)
 
@@ -1994,15 +1994,28 @@ def _sync_kill_provider(provider: object) -> None:
     if not isinstance(pid, int) or pid <= 1:
         logger.debug("_sync_kill_provider: refusing to signal invalid pid %r", pid)
         return
-    # Attributed ONCE, here, before any signal. Everything below is one careful
+    # Asked ONCE, here, before any signal. Everything below is one careful
     # escalation -- a group resolved while the leader was alive, a SIGTERM grace,
-    # a recorded descendant sweep -- and noting it per signal would write the
-    # same shot three times.
-    note_runtime_kill(
+    # a recorded descendant sweep -- and asking per signal would both write the
+    # same shot three times and leave a window where the answer changed
+    # mid-escalation.
+    #
+    # This is the ONE gate every hard kill of a provider passes: all three
+    # ``_dispatch_hard_kill`` implementations (the facade's static seam, the
+    # allocator's, and the warm pool's) resolve their killer through
+    # ``get_sync_kill_provider()``, and the dashboard's reset-all fallback calls
+    # this function directly. A refusal means the caller is holding a pid it does
+    # not own -- a co-tenant's runtime -- and the correct action is to leave it
+    # alone. A caller legitimately ending this runtime has released its own lease
+    # first (providers release in ``shutdown()``'s ``finally``, so even a failed
+    # or cancelled shutdown releases), which drops the count to zero and
+    # authorizes the kill.
+    if not authorize_runtime_kill(
         pid,
         reason="leaked provider teardown",
         caller="session_pid._sync_kill_provider",
-    )
+    ):
+        return
     # Deny-by-default on the ROOT's own identity -- but only where the pid can go
     # stale. ``_client._pid`` is a RECORDED number that outlives a failed start, so
     # it can name a process the OS has since handed to someone else; and for a group

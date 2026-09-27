@@ -3,9 +3,9 @@
 Every path that signals a process reaches one of a handful of primitives in
 :mod:`kiro_crew.platform_compat`, and a caller that reaches them directly does so
 unattributed: the log that follows says a process died, never who decided it
-should. Routing those callers through one attributed place
-(:func:`kiro_crew.runtime_ownership.note_runtime_kill`) is the work of several
-changes, so this module measures the remainder and ratchets it:
+should. Routing those callers through one gated place
+(:func:`kiro_crew.runtime_ownership.authorize_runtime_kill`, which both refuses a
+leased runtime and writes the attribution) is the work of several changes, so this module measures the remainder and ratchets it:
 :data:`BYPASS_BASELINE` may go DOWN in any change and may never go up. A new kill
 site must either attribute itself or lower something else to pay for itself.
 
@@ -17,7 +17,7 @@ Three things are pinned, and the third is what makes the first two mean anything
   primitive call is found where one is known to be
   (:func:`test_the_needles_match_a_known_call_site`);
 * that the two paths every other kill funnels into DO attribute themselves
-  (:func:`test_attributed_kill_paths_note_the_kill`). Without this the count
+  (:func:`test_attributed_kill_paths_consult_the_gate`). Without this the count
   could fall to zero while nothing was ever logged.
 
 Complements ``test_process_identity_structural.py`` rather than repeating it.
@@ -67,7 +67,7 @@ PID_KILL_PRIMITIVES = frozenset(
 #: teardown's own escalation (``session_pid``), app-backend and dev-preview
 #: process management, the test harness, the cron script runner, and a spread of
 #: single-site tools. The two biggest runtime kill paths already attribute
-#: themselves -- see :func:`test_attributed_kill_paths_note_the_kill` -- and their
+#: themselves -- see :func:`test_attributed_kill_paths_consult_the_gate` -- and their
 #: primitive calls remain counted here, because attribution brackets their
 #: escalation rather than replacing it.
 BYPASS_BASELINE = 66
@@ -81,7 +81,7 @@ ATTRIBUTED_KILL_PATHS = (
     ("acp/runtime.py", "kill"),
 )
 
-ATTRIBUTION = "note_runtime_kill"
+GATE = "authorize_runtime_kill"
 
 #: A call site the needles MUST find, so an empty scan cannot read as success.
 #: ``kill_process_tree`` is what a POSIX group teardown ends in.
@@ -146,7 +146,7 @@ def test_kill_primitive_bypass_count_does_not_grow() -> None:
     assert total <= BYPASS_BASELINE, (
         f"{total} direct kill-primitive call(s) now bypass the attribution point, above "
         f"the baseline of {BYPASS_BASELINE}. Route the new site through a path that calls "
-        f"kiro_crew.runtime_ownership.{ATTRIBUTION} instead of raising this number.\n"
+        f"kiro_crew.runtime_ownership.{GATE} instead of raising this number.\n"
         f"Per module:\n{breakdown}"
     )
 
@@ -182,7 +182,7 @@ def test_the_needles_match_a_known_call_site() -> None:
 
 
 @pytest.mark.parametrize(("module", "function"), ATTRIBUTED_KILL_PATHS)
-def test_attributed_kill_paths_note_the_kill(module: str, function: str) -> None:
+def test_attributed_kill_paths_consult_the_gate(module: str, function: str) -> None:
     """The two paths every other kill funnels into must say who fired.
 
     This is what a falling count has to mean. A count that reached zero because
@@ -196,27 +196,149 @@ def test_attributed_kill_paths_note_the_kill(module: str, function: str) -> None
     notes = [
         node
         for node in ast.walk(target)
-        if isinstance(node, ast.Call) and _callee_name(node) == ATTRIBUTION
+        if isinstance(node, ast.Call) and _callee_name(node) == GATE
     ]
     assert notes, (
-        f"{module}:{function} signals a process without calling {ATTRIBUTION}, so a "
+        f"{module}:{function} signals a process without calling {GATE}, so a "
         f"runtime it ends leaves nothing in the log naming the caller or the reason"
     )
 
 
 @pytest.mark.parametrize(("module", "function"), ATTRIBUTED_KILL_PATHS)
-def test_the_attribution_names_a_caller_and_a_reason(module: str, function: str) -> None:
+def test_the_gate_call_names_a_caller_and_a_reason(module: str, function: str) -> None:
     """A bare call that passes neither would log an empty attribution."""
     tree = _parse(SRC / module)
     assert tree is not None
     target = _function_named(tree, function)
     assert target is not None
     for node in ast.walk(target):
-        if isinstance(node, ast.Call) and _callee_name(node) == ATTRIBUTION:
+        if isinstance(node, ast.Call) and _callee_name(node) == GATE:
             passed = {kw.arg for kw in node.keywords}
             assert {"reason", "caller"} <= passed, (
-                f"{module}:{function} calls {ATTRIBUTION} without both reason and "
+                f"{module}:{function} calls {GATE} without both reason and "
                 f"caller (passed: {sorted(p for p in passed if p)})"
             )
             return
-    pytest.fail(f"{module}:{function} does not call {ATTRIBUTION}")
+    pytest.fail(f"{module}:{function} does not call {GATE}")
+
+
+@pytest.mark.parametrize(("module", "function"), ATTRIBUTED_KILL_PATHS)
+def test_the_gate_verdict_is_acted_on(module: str, function: str) -> None:
+    """Calling the gate is not gating on it -- the refusal must stop the kill.
+
+    The weaker sibling above is satisfied by a site that calls the gate and drops
+    the answer on the floor, which logs the refusal and then signals the process
+    anyway. That failure is invisible in a log review: the REFUSED line is
+    written, so the gate looks like it held while every kill still went through.
+
+    So require the call to sit under ``if not <gate>(...)`` whose body leaves the
+    function. Structural rather than behavioural because the alternative is
+    booting a runtime per path; the mutation that deletes a release site covers
+    the behaviour, and this covers the shape that mutation assumes.
+    """
+    tree = _parse(SRC / module)
+    assert tree is not None
+    target = _function_named(tree, function)
+    assert target is not None
+
+    def _guards(node: ast.AST) -> bool:
+        """An ``if not GATE(...)`` whose body returns or raises."""
+        if not isinstance(node, ast.If):
+            return False
+        test = node.test
+        if not (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)):
+            return False
+        if not (isinstance(test.operand, ast.Call) and _callee_name(test.operand) == GATE):
+            return False
+        return any(isinstance(leaf, (ast.Return, ast.Raise)) for leaf in ast.walk(node))
+
+    assert any(_guards(node) for node in ast.walk(target)), (
+        f"{module}:{function} calls {GATE} without acting on the verdict: a refusal "
+        f"must leave the function before anything is signalled, or the gate only "
+        f"logs while every kill still proceeds"
+    )
+
+
+# -- release-before-kill at the post-registration kill sites --
+
+#: Each entry is a file plus the release call that must precede a kill in the
+#: SAME block. Only the post-registration sites appear: every other hard-kill
+#: site in the tree runs before a session is registered, holds no lease, and is
+#: authorized without releasing anything. Adding a release there would be a call
+#: with no effect, which is why this list is short rather than exhaustive.
+_RELEASE_BEFORE_KILL = (
+    (
+        "src/kiro_crew/session_allocation.py",
+        "release_session_lease",
+        "_dispatch_hard_kill",
+    ),
+    (
+        "src/kiro_crew/dashboard/handlers/sessions.py",
+        "release_session_lease",
+        "_sync_kill_provider",
+    ),
+    (
+        "src/kiro_crew/acp/session_provider.py",
+        "release_runtime_lease",
+        "kill",
+    ),
+)
+
+
+def _call_names(node: ast.AST) -> set[str]:
+    """Every name referenced anywhere inside *node*, called or merely handed over.
+
+    References, not just calls: the dashboard's force-kill passes the killer to
+    ``run_in_executor`` and to a thread's ``target``, so a call-only scan sees no
+    kill on the one path where the release matters most.
+    """
+    found: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute):
+            found.add(sub.attr)
+        elif isinstance(sub, ast.Name):
+            found.add(sub.id)
+    return found
+
+
+def _blocks(tree: ast.AST) -> list[list[ast.stmt]]:
+    """Every statement list in *tree* -- a function body, an except handler, a
+    with/if/try body. A release and the kill it guards must share one."""
+    out: list[list[ast.stmt]] = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
+                out.append(block)
+    return out
+
+
+@pytest.mark.parametrize(("rel_path", "release", "kill"), _RELEASE_BEFORE_KILL)
+def test_a_post_registration_kill_releases_its_lease_first(
+    rel_path: str, release: str, kill: str
+) -> None:
+    """Commenting out a release site must fail HERE, not in production.
+
+    Without the release the gate sees a lease still outstanding and refuses the
+    very kill this path exists to perform, so the process leaks -- and the only
+    evidence is a REFUSED line in a log nobody reads. The ordering is the whole
+    invariant: a release AFTER the kill is as broken as none at all.
+    """
+    tree = ast.parse((SRC.parents[1] / rel_path).read_text(encoding="utf-8"))
+    for block in _blocks(tree):
+        released_at: int | None = None
+        for stmt in block:
+            # A def or class is scanned as its own block. Counting one here would
+            # let a release in one function pair with a kill in an unrelated later
+            # one and pass on nothing.
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            names = _call_names(stmt)
+            if kill in names and released_at is not None and released_at < stmt.lineno:
+                return
+            if release in names:
+                released_at = stmt.lineno
+    raise AssertionError(
+        f"{rel_path}: no block calls {release}() before {kill}() -- a kill that "
+        "does not release first is refused by the ownership gate and leaks the tree"
+    )

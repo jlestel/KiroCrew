@@ -28,7 +28,11 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_session_started,
 )
-from kiro_crew.runtime_ownership import PidRefcount
+from kiro_crew.runtime_ownership import (
+    PidRefcount,
+    acquire_session_lease,
+    release_session_lease,
+)
 from kiro_crew.validation import bounded_session_id
 
 if TYPE_CHECKING:
@@ -2452,12 +2456,24 @@ class SessionAllocationService:
                     self._install_work_dir_claim_probe(key, provider)
                     self._sessions[key] = session
                     self.advance_ownership_generation(key)
+                    # Registered: from here a live session is using this runtime,
+                    # so record the claim the kill gate reads. Paired with the
+                    # release inside the provider's own shutdown, and with the
+                    # release on the failure arm below that deregisters without
+                    # one. Before this line no tenant exists, which is why every
+                    # earlier cleanup path may kill unconditionally.
+                    await acquire_session_lease(provider)
                     try:
                         await record_session_started(key)
                     except BaseException:
                         # See open_task_session: a cancellation here would leave a
                         # registered session whose provider the caller is about to
                         # kill, plus a crumb the next boot reads as a crash.
+                        #
+                        # No release here: this re-raises into the handler at the
+                        # end of this method, which releases before it kills. A
+                        # second release would be a call whose effect is already
+                        # guaranteed, and one the ordering test cannot protect.
                         if self._sessions.get(key) is session:
                             del self._sessions[key]
                             self.advance_ownership_generation(key)
@@ -2510,6 +2526,13 @@ class SessionAllocationService:
         except BaseException:
             if preparation.revision:
                 self._remember_capability_failure(key, preparation)
+            # The ONE of these cleanup paths that can be past registration: this
+            # handler spans the lock section that registers the session, so a
+            # failure after it leaves a tenant holding a lease. Release before the
+            # kill or the gate refuses it and the process leaks -- the cleanup
+            # would be refusing its own teardown. Every earlier hard-kill site in
+            # this file is pre-registration and holds no lease.
+            await release_session_lease(provider)
             owner._dispatch_hard_kill(provider)
             raise
         finally:

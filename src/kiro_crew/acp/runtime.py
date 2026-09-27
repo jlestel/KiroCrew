@@ -148,7 +148,7 @@ from kiro_crew.metrics.events import (
 )
 from kiro_crew.providers.mirrors.registry import has_mirror, mirror_for
 from kiro_crew.resource_status import inject_xdist_auto_cap
-from kiro_crew.runtime_ownership import note_runtime_kill
+from kiro_crew.runtime_ownership import authorize_runtime_kill
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
     BoundWorkspaceMismatch,
@@ -3373,8 +3373,17 @@ class AcpRuntime:
         The attribution line is written HERE, before any signal, rather than
         where the process is reaped -- a line saying a process died cannot say
         who decided it should.
+
+        A REFUSED kill returns without signalling and without discarding
+        anything. The sandbox and the bound workspace below belong to the
+        *process*, not to this handle: releasing them under a runtime another
+        lease is still using would strand a live agent on a deleted workspace,
+        which is worse than the leak the kill was meant to prevent.
         """
-        note_runtime_kill(self, reason=reason or "runtime kill", caller="AcpRuntime.kill")
+        if not authorize_runtime_kill(
+            self, reason=reason or "runtime kill", caller="AcpRuntime.kill"
+        ):
+            return
         self._process_tree_confirmed_dead = False
         try:
             await self._kill_inner(expected=expected, reason=reason)

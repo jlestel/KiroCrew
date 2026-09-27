@@ -54,6 +54,7 @@ from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.providers.base import CancelOutcome, LLMEvent, LLMProvider
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.runtime_ownership import CHAT_RUNTIME_CAP, RUNTIME_OWNERSHIP
 from kiro_crew.session_token_sig import schedule_session_token_publish
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,21 @@ class AcpSessionProvider(LLMProvider):
         # When True, shutdown() kills the runtime (parent session owns it).
         # When False, shutdown() only destroys the session handle (subagent).
         self._owns_runtime = owns_runtime
+        # This provider's LEASE on the runtime, or None when it holds none.
+        #
+        # The durable form of ``_owns_runtime``: that flag says "I may kill this
+        # process" but lives only inside this object, so nothing else asking "is
+        # anyone still using pid N?" can see it. The lease records the same claim
+        # in the one registry the kill gate consults, which is what lets a
+        # non-owning killer -- the dashboard's reset-all fallback, a pid sweep --
+        # be refused instead of taking a co-tenant's runtime with it.
+        #
+        # Only an OWNING provider takes one. A session-sharing subagent is handed
+        # a runtime it did not spawn and must not kill, and at ``cap=1`` no entry
+        # holding a lease has room for a second, so having subagents acquire
+        # would either refuse them or change which process they land on. Their
+        # co-tenancy becomes a lease in the change that raises the cap.
+        self._runtime_lease: str | None = None
         self._resumed_flag: bool = False
         self._resume_session_id: str = ""
         # The session this provider serves. ``rekey()`` sets it on a warm-pool
@@ -104,7 +120,48 @@ class AcpSessionProvider(LLMProvider):
     # ── LLMProvider interface ──
 
     async def start(self) -> None:
-        """No-op — the session handle is already initialized."""
+        """No-op — the session handle is already initialized.
+
+        Deliberately NOT where the runtime lease is taken. The kiro startup path
+        constructs this provider and assigns it to the outer provider's
+        ``_client`` without ever awaiting this method, so a lease taken here would
+        never exist in a running gateway. ``acquire_runtime_lease`` is called from
+        the registration point instead.
+        """
+
+    async def acquire_runtime_lease(self) -> None:
+        """Record this session's claim on the runtime in the kill gate's registry.
+
+        Bookkeeping only, and no I/O: the runtime is running and the handle
+        initialized before this provider was constructed. Idempotent, and a no-op
+        for a subagent, which is handed a runtime it must not kill.
+
+        Called when the session becomes a REGISTERED tenant, so the lease means
+        the same thing as membership of the session registry: a live session is
+        using this process. That is what makes every pre-registration cleanup path
+        -- a failed ``start``, a failed identity stamp, a discarded pool provider
+        -- authorized without exception, because none of them has a tenant yet.
+
+        The runtime is passed in already spawned, so the ``spawn`` callback hands
+        the existing one back rather than making a second. At ``cap=1`` no entry
+        that holds a lease has room, so this always founds its own entry with
+        exactly one lease -- one process per owning session, which is what the
+        unpooled path already did.
+        """
+        if not self._owns_runtime or self._runtime_lease is not None:
+            return
+        runtime = self._runtime
+
+        async def _already_spawned() -> AcpRuntime:
+            return runtime
+
+        acquisition = await RUNTIME_OWNERSHIP.acquire(
+            runtime,
+            self._session_key,
+            _already_spawned,
+            cap=CHAT_RUNTIME_CAP,
+        )
+        self._runtime_lease = acquisition.lease
 
     async def new_conversation(self) -> None:
         """Reset to a fresh conversation on the SAME warm runtime (kiro path).
@@ -247,6 +304,27 @@ class AcpSessionProvider(LLMProvider):
         if hasattr(self._handle, "child_fidelity_aware"):
             self._handle.child_fidelity_aware = value
 
+    async def release_runtime_lease(self) -> None:
+        """Give up this provider's lease on the runtime, if it holds one.
+
+        Idempotent, and a no-op for a subagent, which never took one. The lease
+        handle is cleared first so a second call -- a teardown that races the
+        dashboard's reset, or a shutdown retried after a cancellation -- cannot
+        release a lease a later acquisition now owns.
+
+        Separate from ``shutdown`` because the callers differ. ``shutdown`` is the
+        owner ending its own runtime. The other caller is a path that kills a
+        process it did not lease: it must release the sessions it IS ending, so
+        their runtimes die, and must NOT release the ones it is not, so the gate
+        refuses and a co-tenant survives. Folding this into ``shutdown`` would
+        force such a path to choose between a full teardown and no release.
+        """
+        lease = self._runtime_lease
+        if lease is None:
+            return
+        self._runtime_lease = None
+        await RUNTIME_OWNERSHIP.release(lease)
+
     async def shutdown(self) -> None:
         """Destroy the session and optionally kill the runtime.
 
@@ -260,6 +338,18 @@ class AcpSessionProvider(LLMProvider):
             cancel_hooks = getattr(self._handle, "_cancel_hook_tasks", None)
             if callable(cancel_hooks):
                 cancel_hooks()
+            # Release BEFORE the kill, and before the destroy that precedes it.
+            # From this line on this provider is committed to ending the runtime,
+            # so holding the lease any longer would only make the gate refuse
+            # this teardown -- the process's owner refusing its own kill.
+            #
+            # Releasing first also covers the paths that never reach the kill
+            # below. A cancellation delivered into this coroutine leaves the
+            # process alive exactly as it does today, and the hard-kill fallback
+            # that cleans up after it then finds no lease and is authorized. Were
+            # the release after the kill, that fallback would be refused and the
+            # leak it exists to prevent would become permanent.
+            await self.release_runtime_lease()
             try:
                 if self.memory_mode != "persistent":
                     try:
