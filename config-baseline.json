@@ -4339,7 +4339,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Timeout (ms)",
-      "help": "Total budget for one decision, in milliseconds. Exceeding it logs error='timeout' and returns None, so this is the ceiling the seam adds to the path it sits in — not a target. Values at or below zero are floored to 1ms rather than disabling the timeout.",
+      "help": "Total budget for one decision, in milliseconds. Exceeding it logs error='timeout' and returns None, so this is the ceiling the seam adds to the path it sits in — not a target. Values at or below zero are floored to 1ms rather than disabling the timeout. Set it from the Decisions card (100 to 10000); a local JuL server needs about 5000.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 1000

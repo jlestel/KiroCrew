@@ -84,9 +84,9 @@ export const DECISIONS_MEMORY_POINT = 'memory.recall'
 export const DECISIONS_NUDGE_WAKE_POINT = 'nudge.wake'
 
 /**
- * Config path of the sampling share. One of the six `decisions.*` values the config
- * PATCH accepts, beside the three `model_route` tiers and the two `nudge_wake` keys;
- * the address and the credential are deliberately not among them.
+ * Config path of the sampling share. One of the seven `decisions.*` values the config
+ * PATCH accepts, beside the three `model_route` tiers, the two `nudge_wake` keys and
+ * `provider.timeout_ms`; the address and the credential are deliberately not among them.
  */
 export const DECISIONS_BUCKET_PATH = 'decisions.bucket'
 
@@ -105,12 +105,36 @@ export const DECISIONS_HISTORY_BUDGET_PATH = 'decisions.history_budget_chars'
  * Config path of the address decisions are sent to.
  *
  * READ-ONLY from the dashboard, deliberately: `PATCH /api/config/kirocrew` excludes
- * `decisions.provider.*` so a dashboard caller cannot choose where the state a
+ * `decisions.provider.*` (all but `timeout_ms`) so a dashboard caller cannot choose where the state a
  * decision point collects is sent, and `api_key` beside it is schema-sensitive, so
  * the masked read hands back a sentinel a write would clobber. The card shows the
  * address and names this path; an operator moves it in the file.
  */
 export const DECISIONS_ENDPOINT_PATH = 'decisions.provider.endpoint'
+
+/**
+ * Config path of how long one decision may wait for its answer, in milliseconds.
+ * The one `provider.*` key the config PATCH accepts: it chooses neither where state
+ * goes nor with which key, only how long a turn waits before falling back. Bounds
+ * mirror `DECISION_TIMEOUT_MS_MIN` / `_MAX` in the backend's config sections.
+ */
+export const DECISIONS_TIMEOUT_PATH = 'decisions.provider.timeout_ms'
+export const DECISIONS_TIMEOUT_MIN = 100
+export const DECISIONS_TIMEOUT_MAX = 10000
+/** The shipped default, sized for the hosted API (~100 ms per answer). */
+export const DECISIONS_TIMEOUT_DEFAULT = 1000
+
+/**
+ * `decisions.provider.timeout_ms` out of a `GET /api/config/kirocrew` body, or the
+ * shipped default when the config does not name a whole number.
+ */
+export function readTimeout(config: unknown): number {
+  const root = asRecord(config)
+  const decisions = root ? asRecord(root.decisions) : null
+  const provider = decisions ? asRecord(decisions.provider) : null
+  const raw = provider?.timeout_ms
+  return typeof raw === 'number' && Number.isInteger(raw) && raw > 0 ? raw : DECISIONS_TIMEOUT_DEFAULT
+}
 
 /** Config path prefix of the tier-to-model map `model.route` reads. */
 export const DECISIONS_MODEL_ROUTE_PATH = 'decisions.model_route'

@@ -824,6 +824,51 @@ describe('Decisions (Jev) preview card', () => {
     expect(patch).not.toHaveBeenCalled()
   })
 
+  it('shows the saved wait, and the shipped 1000 ms when the config names none', async () => {
+    stubGateway({ enabled: true }, { decisions: { bucket: 100 } })
+    renderSection()
+    const box = await screen.findByLabelText(/How long one decision may wait/i)
+    expect((box as HTMLInputElement).value).toBe('1000')
+  })
+
+  it('writes a new wait to decisions.provider.timeout_ms on blur', async () => {
+    const patch = vi.spyOn(api, 'patchConfig').mockResolvedValue({} as never)
+    stubGateway({ enabled: true }, { decisions: { bucket: 100, provider: { timeout_ms: 1000 } } })
+    renderSection()
+    const box = await screen.findByLabelText(/How long one decision may wait/i)
+    fireEvent.change(box, { target: { value: '5000' } })
+    fireEvent.blur(box)
+    await waitFor(() => {
+      expect(patch).toHaveBeenCalledWith('decisions.provider.timeout_ms', 5000)
+    })
+  })
+
+  it('writes no wait outside 100..10000 ms or one it cannot read', async () => {
+    const patch = vi.spyOn(api, 'patchConfig').mockResolvedValue({} as never)
+    stubGateway({ enabled: true }, { decisions: { bucket: 100, provider: { timeout_ms: 1000 } } })
+    renderSection()
+    const box = await screen.findByLabelText(/How long one decision may wait/i)
+    for (const value of ['50', '20000', '5s', '']) {
+      fireEvent.change(box, { target: { value } })
+      fireEvent.blur(box)
+    }
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(patch).not.toHaveBeenCalled()
+    expect((box as HTMLInputElement).value).toBe('1000')
+  })
+
+  it('offers the JuL install guide with copyable commands that were run', async () => {
+    stubGateway({ enabled: false })
+    renderSection()
+    await screen.findByText(/keep decisions on this machine with JuL/i)
+    for (const command of ['uv tool install "jul[mlx]"', 'jul setup', 'jul serve']) {
+      expect(screen.getByText(command)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: `Copy ${command}` })).toBeInTheDocument()
+    }
+    // `jul download` is not a JuL command; the first draft of this guide named it.
+    expect(screen.queryByText(/jul download/)).toBeNull()
+  })
+
   it('does not accept a ceiling while consent is off, because the write throws it away', async () => {
     // The keystone writer stores this ceiling as 0 whenever the switch is off, so the
     // PUT would answer 200 and the typed number would be gone on the next read -- a
