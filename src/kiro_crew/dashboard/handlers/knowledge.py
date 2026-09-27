@@ -187,12 +187,16 @@ async def _require_knowledge_owner(request: web.Request, operation: str) -> web.
     """Owner gate for the mutating knowledge routes, or ``None`` to proceed.
 
     Owner identity is a property of a dashboard-user request: ``app == ""`` is
-    the class ``is_owner_dashboard_request`` can rule on at all. The other two
-    caller classes keep the control that already governs them -- an
-    ``X-Internal-Secret`` loopback process (the ``knowledge_add_document`` MCP
-    tool) reaches here with ``app`` ABSENT, and an app token (the Notes app
-    declares ``/api/knowledge``) is confined to its manifest's declared paths
-    by ``_enforce_app_scope``.
+    the class ``is_owner_dashboard_request`` can rule on at all, so only that
+    class is gated here. Every caller whose ``app`` is not ``""`` passes this
+    gate and stays under the control that already governs it:
+
+    - an app token (the Notes app declares ``/api/knowledge``) is confined to
+      its manifest's declared paths by ``_enforce_app_scope``;
+    - an ``X-Internal-Secret`` loopback caller is admitted on the secret
+      itself. ``token_auth`` leaves ``app`` absent for a caller acting as the
+      person, and sets ``app`` to the owning app's id for a caller it resolves
+      to an app; neither arm runs ``_enforce_app_scope``.
     """
     if request.get("app") != "":
         return None
