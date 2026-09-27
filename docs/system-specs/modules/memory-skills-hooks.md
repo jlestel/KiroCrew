@@ -2977,11 +2977,11 @@ ancestor and unlink identity checks degrade to by-name checks. Setup and gateway
 startup both invoke it; startup runs it on every boot so a package upgrade needs
 no separate setup command.
 
-Agent skill-path discovery also scans nested AIM package snapshots under
-`~/.aim/packages/`. A valid object `.aim/.version-manifest.json` with
-`currentEventId` selects that snapshot. Malformed JSON or a non-object manifest
-has no selected event and follows the existing fallback of scanning nested
-snapshots; it does not abort agent configuration.
+Agent skill-path discovery also scans nested AIM package snapshots under the
+per-package snapshot tree. A valid object version manifest with `currentEventId`
+selects that snapshot. Malformed JSON or a non-object manifest has no selected
+event and follows the existing fallback of scanning nested snapshots; it does not
+abort agent configuration.
 
 **Project skills (`<project>/.kiro/skills`) — a different source from the one above.**
 `$KIROCREW_PROJECT_DIR/skills/` is a *sync* source: its contents are copied into
