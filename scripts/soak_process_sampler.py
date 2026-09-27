@@ -215,6 +215,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # Everything this samples is Linux-only: cgroup v2 for slice membership,
+    # /proc for liveness and RSS, and a page size from sysconf. Refuse by name
+    # rather than crashing part-way through the first sample on a host that has
+    # none of them.
+    if sys.platform != "linux":
+        print(
+            f"process sampling needs cgroup v2 and /proc; this host is {sys.platform}",
+            file=sys.stderr,
+        )
+        return 2
     home = args.home
     if home is None:
         env_home = os.environ.get("KIROCREW_HOME")

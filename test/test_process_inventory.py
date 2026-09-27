@@ -452,14 +452,43 @@ def test_the_sampler_default_home_is_not_the_legacy_path() -> None:
 def test_the_sampler_refuses_a_home_that_does_not_exist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Refusing beats sampling: an absent home would report all-zero populations."""
+    """Refusing beats sampling: an absent home would report all-zero populations.
+
+    The platform refusal sits AHEAD of this guard and returns the same code, so a
+    Windows shard would satisfy the exit assertion while never reaching the home
+    check. Claim the platform so the guard under test is the one that answers,
+    and the assertion means the same thing on every shard.
+    """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import soak_process_sampler
 
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("KIROCREW_HOME", raising=False)
     missing = tmp_path / "not-there"
     assert soak_process_sampler.main(["--home", str(missing), "--once"]) == 2
-    assert "does not exist" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "does not exist" in err
+    assert "needs cgroup v2" not in err
+
+
+def test_the_sampler_refuses_by_name_off_linux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other direction of the same guard, run on every platform.
+
+    Everything sampled is Linux-only, so the refusal must name the host rather
+    than crash part-way through a first sample. The home here EXISTS, so only the
+    platform guard can produce the refusal.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import soak_process_sampler
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    assert soak_process_sampler.main(["--home", str(tmp_path), "--once"]) == 2
+    err = capsys.readouterr().err
+    assert "needs cgroup v2 and /proc" in err
+    assert "win32" in err
 
 
 def test_the_classifier_reads_an_explicit_cgroup_base_on_any_platform(machine) -> None:

@@ -227,24 +227,33 @@ def _await_descendants_gone(kin: set[int]) -> set[int]:
     return left
 
 
-def _log_offsets(home: Path, captured: str) -> tuple[int, int]:
-    """Current sizes of the two log sources, as a point to read forward from.
+def _log_baseline(home: Path, captured: str) -> tuple[int, frozenset[str]]:
+    """What the two log sources held BEFORE the kill, as a point to read past.
 
-    Taken BEFORE the kill. The victim's pid is already all over the startup log
-    -- it was spawned, tracked and reported -- so searching the whole log for the
-    number proves only that the process once existed, and the death assertion
-    would pass on a gateway that never recorded the death at all. Reading only
-    what was appended after this point is what makes it evidence.
+    The victim's pid is already all over the startup log -- it was spawned,
+    tracked and reported -- so searching the whole log for the number proves only
+    that the process once existed, and the death assertion would pass on a
+    gateway that never recorded the death at all.
+
+    The two sources need different baselines because they behave differently.
+    ``gateway.log`` is append-only, so a byte offset is exact. The captured
+    output is NOT a growing buffer: it is rebuilt on each call from bounded tails
+    of stderr and stdout, so a character index taken from an earlier call indexes
+    a different string, and once those tails saturate it points at content that
+    predates the kill. Its baseline is therefore the SET of lines already seen,
+    which no truncation can invalidate.
     """
     try:
         size = (home / "gateway.log").stat().st_size
     except OSError:
         size = 0
-    return size, len(captured)
+    return size, frozenset(captured.splitlines())
 
 
-def _logs_naming(home: Path, pid: int, captured: str, offsets: tuple[int, int]) -> list[str]:
-    """Lines appended after *offsets* that mention *pid* as a whole number.
+def _logs_naming(
+    home: Path, pid: int, captured: str, baseline: tuple[int, frozenset[str]]
+) -> list[str]:
+    """Lines new since *baseline* that mention *pid* as a whole number.
 
     Both sources are read because they are populated differently: the file is
     the gateway's own rotating log, and the captured output is what a harness
@@ -255,7 +264,7 @@ def _logs_naming(home: Path, pid: int, captured: str, offsets: tuple[int, int]) 
     test would accept an unrelated line as proof that the death was recorded.
     """
     pattern = re.compile(rf"(?<!\d){pid}(?!\d)")
-    file_offset, captured_offset = offsets
+    file_offset, seen_lines = baseline
     hits: list[str] = []
     try:
         with open(home / "gateway.log", "r", encoding="utf-8", errors="replace") as handle:
@@ -271,8 +280,8 @@ def _logs_naming(home: Path, pid: int, captured: str, offsets: tuple[int, int]) 
     for line in appended.splitlines():
         if pattern.search(line):
             hits.append(f"gateway.log: {line.strip()[:240]}")
-    for line in captured[captured_offset:].splitlines():
-        if pattern.search(line):
+    for line in captured.splitlines():
+        if line not in seen_lines and pattern.search(line):
             hits.append(f"captured output: {line.strip()[:240]}")
     return hits
 
@@ -353,7 +362,7 @@ def test_killing_a_runtime_root_recovers(real_user_session: Any) -> None:
         kin = descendants_of(victim.pid, set(before.live_pids)) - {victim.pid}
         victim_argv = read_argv(victim.pid)
         # Read forward from HERE: the victim's pid is already in the startup log.
-        offsets = _log_offsets(env.home, env.handle.diagnostics())
+        baseline = _log_baseline(env.home, env.handle.diagnostics())
 
         _kill_verified(victim, "agent runtime root")
 
@@ -382,7 +391,7 @@ def test_killing_a_runtime_root_recovers(real_user_session: Any) -> None:
             f"recycled number.\n{inventory(env.home, ignore_pids=ignore).render()}"
         )
 
-        recorded = _logs_naming(env.home, victim.pid, env.handle.diagnostics(), offsets)
+        recorded = _logs_naming(env.home, victim.pid, env.handle.diagnostics(), baseline)
         assert recorded, (
             f"no log line appended after the kill names the runtime root {victim.pid}, so "
             "the death was absorbed silently. Checked the gateway log file and the "

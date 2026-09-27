@@ -655,7 +655,15 @@ def stop_instance_slice(home: Path) -> str:
         _, status = os.waitpid(pid, 0)
     except (OSError, ValueError) as exc:
         raise SliceCleanupError(f"could not stop {slice_name}: {exc}") from exc
-    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+    # WIFEXITED/WEXITSTATUS are POSIX-only. Where they are absent a raw 0 is the
+    # only success value there is, which is also what the decoded form means.
+    wifexited = getattr(os, "WIFEXITED", None)
+    wexitstatus = getattr(os, "WEXITSTATUS", None)
+    if wifexited is not None and wexitstatus is not None:
+        succeeded = bool(wifexited(status)) and wexitstatus(status) == 0
+    else:
+        succeeded = status == 0
+    if not succeeded:
         raise SliceCleanupError(
             f"systemctl --user stop {slice_name} did not succeed (wait status "
             f"{status}); the slice is still loaded in the user manager"

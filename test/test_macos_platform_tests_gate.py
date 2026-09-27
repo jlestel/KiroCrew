@@ -268,6 +268,7 @@ class TestARedMacSuiteHoldsPublicationAndNeverABuild:
                 "build-windows",
                 "dependency-vulnerability-gate",
                 "pod-scenarios",
+                "process-leak-invariant",
             ]
         )
 
