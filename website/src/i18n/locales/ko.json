@@ -455,6 +455,7 @@
         "min_20_characters": "최소 20자.",
         "model": "모델",
         "model_default_inherit": "기본값(상속)",
+        "model_line": "모델: {{model}}",
         "moderate": "보통",
         "new_campaign": "새 캠페인",
         "new_campaign_2": "+ 새 캠페인",

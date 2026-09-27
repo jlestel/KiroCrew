@@ -459,6 +459,7 @@
         "min_20_characters": "কমপক্ষে 20 অক্ষর।",
         "model": "মডেল",
         "model_default_inherit": "ডিফল্ট (উত্তরাধিকার)",
+        "model_line": "মডেল: {{model}}",
         "moderate": "মধ্যম",
         "new_campaign": "নতুন ক্যাম্পেইন",
         "new_campaign_2": "+ নতুন ক্যাম্পেইন",

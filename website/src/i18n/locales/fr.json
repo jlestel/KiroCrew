@@ -463,6 +463,7 @@
         "min_20_characters": "20 caractères minimum.",
         "model": "Modèle",
         "model_default_inherit": "Par défaut (hériter)",
+        "model_line": "Modèle : {{model}}",
         "moderate": "Modéré",
         "new_campaign": "Nouvelle campagne",
         "new_campaign_2": "+ Nouvelle campagne",

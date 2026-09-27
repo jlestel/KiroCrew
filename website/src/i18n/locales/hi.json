@@ -459,6 +459,7 @@
         "min_20_characters": "न्यूनतम 20 वर्ण।",
         "model": "मॉडल",
         "model_default_inherit": "डिफ़ॉल्ट (इनहेरिट)",
+        "model_line": "मॉडल: {{model}}",
         "moderate": "मध्यम",
         "new_campaign": "नया अभियान",
         "new_campaign_2": "+ नया अभियान",

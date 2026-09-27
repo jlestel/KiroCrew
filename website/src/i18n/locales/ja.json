@@ -455,6 +455,7 @@
         "min_20_characters": "最小 20 文字。",
         "model": "モデル",
         "model_default_inherit": "デフォルト（継承）",
+        "model_line": "モデル：{{model}}",
         "moderate": "標準",
         "new_campaign": "新しいキャンペーン",
         "new_campaign_2": "+ 新しいキャンペーン",

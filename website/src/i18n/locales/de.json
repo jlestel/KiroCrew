@@ -459,6 +459,7 @@
         "min_20_characters": "Min. 20 Zeichen.",
         "model": "Modell",
         "model_default_inherit": "Standard (übernehmen)",
+        "model_line": "Modell: {{model}}",
         "moderate": "Mittel",
         "new_campaign": "Neue Kampagne",
         "new_campaign_2": "+ Neue Kampagne",

@@ -327,6 +327,7 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
             <div>{i18nT('apps.autoResearch.researchLabPage.research_question', { question: `${question.slice(0, 50)}${question.length > 50 ? '...' : ''}` })}</div>
             <div className="text-muted">{i18nT('apps.autoResearch.researchLabPage.up_to')} {maxCycles} {i18nT('apps.autoResearch.researchLabPage.cycles')} {idleSecs}{i18nT('apps.autoResearch.researchLabPage.s_idle')}{validation.estimated_duration_min} {i18nT('apps.autoResearch.researchLabPage.min')}</div>
             {successCriteria && <div className="text-muted">{i18nT('apps.autoResearch.researchLabPage.done_when')} {successCriteria}</div>}
+            {executionMode === 'agent' && <div className="text-muted">{i18nT('apps.autoResearch.researchLabPage.model_line', { model: model || i18nT('apps.autoResearch.researchLabPage.model_default_inherit') })}</div>}
           </div>
         </> : <div className="text-sm text-muted">{i18nT('apps.autoResearch.researchLabPage.validating')}</div>}
         {/* No hand-off: the campaign wizard's question, success criteria and cycle

@@ -455,6 +455,7 @@
         "min_20_characters": "至少 20 个字符。",
         "model": "模型",
         "model_default_inherit": "默认（继承）",
+        "model_line": "模型：{{model}}",
         "moderate": "中等",
         "new_campaign": "新建战役",
         "new_campaign_2": "+ 新建战役",

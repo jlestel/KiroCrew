@@ -467,6 +467,7 @@
         "min_20_characters": "Минимум 20 символов.",
         "model": "Модель",
         "model_default_inherit": "По умолчанию (наследовать)",
+        "model_line": "Модель: {{model}}",
         "moderate": "Умеренная",
         "new_campaign": "Новая кампания",
         "new_campaign_2": "+ Новая кампания",
