@@ -17,6 +17,7 @@ import os
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlsplit
 
@@ -942,13 +943,30 @@ class TestUsableDirRejectsEveryDirLink:
 # ── API handlers (mode-independent: stub request + asyncio.run) ──────────────
 
 
-class _DownloadReq:
+_OWNER = "owner-subject"
+
+
+class _OwnerReq(dict):
+    """A stub request carrying the dashboard owner's claims.
+
+    Both diagnostics handlers are owner-gated, so the dashboard-user request these
+    tests model carries ``app == ""`` and the configured owner's subject.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(app="", user=_OWNER)
+        self.app = {"state": SimpleNamespace(owner_id=_OWNER)}
+
+
+class _DownloadReq(_OwnerReq):
     def __init__(self, filename: str) -> None:
+        super().__init__()
         self.match_info = {"filename": filename}
 
 
-class _CollectReq:
+class _CollectReq(_OwnerReq):
     def __init__(self, body: dict) -> None:
+        super().__init__()
         self._body = body
 
     async def json(self) -> dict:

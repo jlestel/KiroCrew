@@ -1296,7 +1296,13 @@ async def api_memory_embedding_model(request: web.Request) -> web.Response:
 
     The dimension is NOT taken from the caller: it is read off the loaded model
     (``n_embd``), so the user cannot get it wrong and the UI needs no dim field.
+
+    Owner-gated first: an apply rewrites the owner's config and re-embeds the
+    owner's whole vector store.
     """
+    owner_denied = await require_owner_dashboard_request(request, "memory.embedding_model")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if _is_restricted_session(state, request):
         sk = request.headers.get("X-Session-Key", "")

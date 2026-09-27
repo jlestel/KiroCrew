@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.security import redact
 
 from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
@@ -1335,8 +1336,49 @@ async def _handle_deps(_request: web.Request) -> web.StreamResponse:
     return web.json_response(await asyncio.to_thread(deps.check_deps))
 
 
-async def _handle_deps_install(_request: web.Request) -> web.StreamResponse:
-    """Install the optional dependencies that can be installed safely."""
+def _audit_deps_install_allowed_sync(caller: str) -> None:
+    """Best-effort SEL record of an allowed install; never raises.
+
+    Blocking body of :func:`_audit_deps_install_allowed`: the first ``sel()`` of
+    a process constructs the log, so handlers reach this through the async
+    wrapper, which runs it off the event loop.
+    """
+    try:
+        from kiro_crew.sel import sel  # circular import: sel->config->apps cycle
+
+        sel().log_api_access(
+            caller=caller,
+            operation="auto_improvement.deps_install",
+            outcome="allowed",
+            source="dashboard",
+            resources="install_deps",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for deps install failed", exc_info=True)
+
+
+async def _audit_deps_install_allowed(request: web.Request) -> None:
+    """Record the allowed install in SEL; the owner gate audits only its refusals."""
+    caller = str(request.get("app") or request.get("user") or "unknown")
+    try:
+        await asyncio.to_thread(_audit_deps_install_allowed_sync, caller)
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit dispatch for deps install failed", exc_info=True)
+
+
+async def _handle_deps_install(request: web.Request) -> web.StreamResponse:
+    """Install the optional dependencies that can be installed safely.
+
+    The install runs pip in the gateway interpreter, so a dashboard-user caller
+    (``app == ""``) must be the owner. An app token keeps its own app-scope check.
+    """
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(
+            request, "auto_improvement.deps_install"
+        )
+        if owner_denied is not None:
+            return owner_denied
+    await _audit_deps_install_allowed(request)
     result = await asyncio.to_thread(deps.install_deps)
     if result.get("ok"):
         return web.json_response(result, status=200)
