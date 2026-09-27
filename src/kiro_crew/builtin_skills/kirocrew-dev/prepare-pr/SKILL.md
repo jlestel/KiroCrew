@@ -681,10 +681,10 @@ Omit a section only when truly not applicable, and say so.
 `diff_signals.py --check-body` applies two rules to the finished body. Both
 stop the loop; they pull in opposite directions on purpose (why: `references/rationale.md`):
 
-| check | what it measures | on breach | why that strength |
-|---|---|---|---|
-| Accounting | every changed area (the `pr-scope.yml` unit: a module directory under `src/kiro_crew/` or `website/src/`, the top-level component elsewhere) is named in the body — by the area, a changed path or its `dir/file` tail, or a unique non-generic file name | **exit 20** — stop, fix the body or the diff | an unnamed change is how a stray edit rides along |
-| Length | words of prose in `What changed` (fenced blocks, table rows, image lines excluded) against the 500 of section 3's paragraph rule | **exit 21** — stop, compress the prose | with the ledger complete, a cap cuts only restated facts; the diff is the evidence |
+| check | what it measures | on breach |
+|---|---|---|
+| Accounting | every changed area (the `pr-scope.yml` unit: a module directory under `src/kiro_crew/` or `website/src/`, the top-level component elsewhere) is named in the body — by the area, a changed path or its `dir/file` tail, or a unique non-generic file name | **exit 20** — stop, fix the body or the diff |
+| Length | words of prose in `What changed` (fenced blocks, table rows, image lines excluded) against the 500 of section 3's paragraph rule | **exit 21** — stop, compress the prose |
 
 Paths, tables and pictures never count against the limit. When both breach,
 20 is reported and both findings print.
@@ -715,14 +715,14 @@ depth or the reader; the facts stay complete and technically exact.
   Name the thing and what it does, not the abstraction around it.
 - Add a picture only when it explains a changed shape faster than prose.
 
-Before publishing the body, read section 3 once. Rewrite any sentence that needs
-a second read, move each section's point first, and remove historical narration.
+Before publishing the body, reread section 3 and rewrite any sentence that needs
+a second read.
 
 #### Draw it — the Age 5 picture
 
-Draw ONE picture, at most, and none for a one-liner, a rename, a test-only change
-or a doc edit. When to draw, the form, the fixed palette, the caption and the
-placement are all in `references/body-picture.md` — read it before drawing.
+Draw ONE picture at most, and none for a one-liner, a rename, a test-only change
+or a doc edit. When to draw, the form, the palette, the caption and the placement
+are in `references/body-picture.md` — read it before drawing.
 
 ### Screenshots
 
@@ -787,9 +787,8 @@ If the PR deliberately closes nothing, say so at the start of a line —
 `no linked issue: <why>` — so a reader can tell an intentional omission from a
 forgotten trailer. **Advisory, not a gate:** readiness never blocks on it.
 
-`pr_status.py` handles the parsing edge cases itself (fenced blocks and indented
-examples are masked, closures are reconciled on repository *and* number); you do not
-need to reason about them — just read the `NOTICE:` lines it prints.
+`pr_status.py` masks fenced blocks and indented examples and reconciles closures
+on repository *and* number, so just read the `NOTICE:` lines it prints.
 
 ## Which mechanism drives the loop
 

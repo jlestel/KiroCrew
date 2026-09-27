@@ -86,6 +86,7 @@ from kiro_crew.dashboard.token_auth import (
 )
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
+from kiro_crew.external_text import redact_external_text as _redact_external
 from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
@@ -191,13 +192,8 @@ def _mask_agent_free_text(value: object) -> object:
     makes for schema-sensitive values.
 
     Keyed on ``_redact_external`` itself rather than a second detector so this
-    rule and the roster's cannot drift apart. The import is function-local to
-    match this module's handler-import style, not for boot-path weight —
-    ``handlers.agents`` already imports ``discover`` at module level, so it is
-    loaded at handler setup regardless.
+    rule and the roster's cannot drift apart.
     """
-    from kiro_crew.dashboard.handlers.discover import _redact_external
-
     if not isinstance(value, str):
         return _SENSITIVE_MASK
     # No falsy pre-check on purpose: ``_redact_external`` returns falsy input
@@ -633,6 +629,9 @@ async def api_theme_config(request: web.Request) -> web.Response:
         return web.json_response(_theme_payload(cfg))
 
     # PUT
+    denied = await require_owner_dashboard_request(request, "config.theme.write")
+    if denied is not None:
+        return denied
     body = await request.json()
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="request body must be an object")
@@ -2071,6 +2070,10 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
     from kiro_crew.config.loader import config_path  # noqa: F811
 
     if request.method == "PUT":
+        denied = await require_owner_dashboard_request(request, "config.update")
+        if denied is not None:
+            return denied
+
         caller = request.get("user", "dashboard")
 
         def _deny(error: str, status: int = 400, *, code: str | None = None) -> web.Response:
@@ -2791,13 +2794,20 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         _log_sel("denied", resources or msg)
         return web.json_response({"error": msg}, status=status)
 
+    denied = await require_owner_dashboard_request(request, "config.patch")
+    if denied is not None:
+        return denied
+
     try:
         body = await request.json()
     except Exception:
         return _deny("invalid JSON", "invalid JSON body")
+    if not isinstance(body, dict):
+        return _deny("invalid JSON", "invalid JSON body")
 
-    path_key = body.get("path", "")
-    value = body.get("value")
+    path_key: str = body.get("path", "")
+    value: Any = body.get("value")
+
     spec = _EDITABLE_CONFIG.get(path_key)
     if not spec:
         # `agent.apps_allow_third_party` was deliberately REMOVED from the editable
