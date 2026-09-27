@@ -12199,7 +12199,6 @@
       "level_change_failed": "更改日志级别失败"
     },
     "mcpGatewayCard": {
-      "active_sessions": "活动会话",
       "backends": "后端",
       "idle": "空闲",
       "no_backends_spawned_yet_start_a_session_that_cal": "尚未启动任何后端 — 启动一个调用 MCP 工具的会话来填充进程池。",
@@ -12210,7 +12209,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "服务器",
-      "sessions": "会话",
       "shared_mcp_gateway": "共享 MCP 网关",
       "with_shared_gateway_pooled": "使用共享网关（池化）",
       "without_gateway_per_session_copies": "不使用网关（每会话独立副本）"

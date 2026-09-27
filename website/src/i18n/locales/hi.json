@@ -12381,7 +12381,6 @@
       "level_change_failed": "लॉग स्तर बदला नहीं जा सका"
     },
     "mcpGatewayCard": {
-      "active_sessions": "सक्रिय सत्र",
       "backends": "बैकएंड",
       "idle": "निष्क्रिय",
       "no_backends_spawned_yet_start_a_session_that_cal": "अभी कोई बैकएंड शुरू नहीं हुआ — पूल भरने के लिए ऐसा सत्र शुरू करें जो कोई MCP टूल कॉल करे।",
@@ -12392,7 +12391,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "सर्वर",
-      "sessions": "सत्र",
       "shared_mcp_gateway": "साझा MCP गेटवे",
       "with_shared_gateway_pooled": "साझा गेटवे के साथ (पूल किया गया)",
       "without_gateway_per_session_copies": "गेटवे के बिना (हर सत्र की अलग कॉपी)"

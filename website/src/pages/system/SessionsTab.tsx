@@ -43,6 +43,8 @@ import {
   fmtUptime,
   heatLevel,
   rowName,
+  aggregateOncePerRuntime,
+  sumOncePerRuntime,
   type SessionRow,
 } from './sessionRows'
 
@@ -198,7 +200,8 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('procs', {
           header: i18nT('pages.sessionsTab.procs'),
           enableGrouping: false,
-          aggregationFn: 'sum',
+          // Runtime-level count: added once per runtime, not once per co-tenant.
+          aggregationFn: (_id, leafRows) => aggregateOncePerRuntime('procs', leafRows),
           size: 68,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -208,7 +211,8 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('mcp', {
           header: i18nT('pages.sessionsTab.mcp_stubs'),
           enableGrouping: false,
-          aggregationFn: 'sum',
+          // Runtime-level count: added once per runtime, not once per co-tenant.
+          aggregationFn: (_id, leafRows) => aggregateOncePerRuntime('mcp', leafRows),
           size: 92,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -249,6 +253,11 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('pid', {
           header: i18nT('pages.sessionsTab.pid'),
           enableGrouping: false,
+          // A pid is an identifier, not a quantity: the default numeric roll-up
+          // added four pids into one impossible number on every group row. A
+          // group spans several runtimes, so it HAS no single pid -- the honest
+          // aggregate is none, and the cell falls through to its em-dash.
+          aggregationFn: () => null,
           size: 74,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -297,7 +306,12 @@ export default function SessionsTab({ planeStateRef }: Props) {
     (m, s) => (s.rss_mb != null && (m == null || s.rss_mb > m) ? s.rss_mb : m),
     null,
   )
-  const procTotal = sessions.reduce((n, s) => n + (s.procs ?? 0), 0)
+  // Each runtime's process count ONCE. `procs` is the runtime's own total,
+  // reported whole on every co-tenant row, so a plain sum over rows multiplies a
+  // shared runtime by its tenant count -- three co-tenants of one 9-process
+  // runtime read as 27. Same rule as the `procs` column's group aggregate; this
+  // footer is a second reader of the same figure and needs the same key.
+  const procTotal = sumOncePerRuntime(sessions.map(s => [s.pid, s.procs] as const)) ?? 0
 
   // Finding 7a: surface the disabled reason via InfoTip, not just title
   const groupSegments: Array<Segment<GroupBy>> = [
@@ -656,7 +670,17 @@ export default function SessionsTab({ planeStateRef }: Props) {
                                   </span>
                                 )
                               })()}
-                              {r.shared && !grouped && (
+                              {/* On a LEAF row the badge qualifies that row's own
+                                  rss/cpu as an attributed share. On a GROUP row it
+                                  says the fold contains a multiplexed runtime --
+                                  the group's own total is de-duplicated per pid, but
+                                  the member figures it rolls up are still shares, and
+                                  a group row's `original` is a synthetic placeholder
+                                  whose `shared` says nothing, so the answer comes
+                                  from the leaves. */}
+                              {(grouped
+                                ? row.getLeafRows().some(leaf => leaf.original.shared)
+                                : r.shared) && (
                                 <span className="shrink-0 ml-1.5 text-[10px] px-1.5 rounded border border-warn/40 text-warn">
                                   {i18nT('pages.sessionsTab.shared')}
                                 </span>

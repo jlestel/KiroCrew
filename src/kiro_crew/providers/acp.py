@@ -2483,6 +2483,13 @@ class AcpProvider(LLMProvider):
         await self._client.new_conversation()  # type: ignore[attr-defined]
 
     def is_alive(self) -> bool:
+        """Whether the shared client is responsive.
+
+        PROCESS-level, like every liveness answer on this provider: the client is
+        one kiro-cli process that may host several ACP sessions, so co-tenants
+        cannot be told apart here. Read it as "the process serving me is up", not
+        as "my session is usable".
+        """
         return self._client.is_responsive()
 
     def is_process_alive(self) -> bool:
@@ -2554,6 +2561,11 @@ class AcpProvider(LLMProvider):
         return err if isinstance(err, InfraError) else None
 
     def touch_activity(self) -> None:
+        """Refresh the CLIENT's activity clock.
+
+        PROCESS-level: the stamp lives on the shared client, so this marks every
+        session on that process active, not just this one.
+        """
         self._client.touch_activity()
 
     def runtime_info(self) -> tuple[int | None, str | None]:

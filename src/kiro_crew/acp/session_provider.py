@@ -554,11 +554,24 @@ class AcpSessionProvider(LLMProvider):
         return self._handle.session_id
 
     def is_alive(self) -> bool:
-        """True if the underlying runtime is still alive."""
+        """True if the underlying runtime is still alive.
+
+        A PROCESS-level answer wearing a session-level name. Every session on a
+        shared runtime gets the same one, so it is right about death (the process
+        dying does end all of them) and wrong about eviction: a session removed
+        by ``terminate_session`` still reads alive while its co-tenants keep the
+        process up. A caller asking "may I still use MY session" needs a
+        per-session liveness bit, which this contract has no vocabulary for.
+        """
         return self._runtime.is_alive()
 
     def is_process_alive(self) -> bool:
-        """True if the runtime process exists and has not exited."""
+        """True if the runtime process exists and has not exited.
+
+        Process-level by name as well as by behaviour, and shared by every
+        session on the runtime. Do not read it as "my session is usable" -- see
+        :meth:`is_alive`.
+        """
         return self._runtime.is_alive()
 
     @property
@@ -599,7 +612,16 @@ class AcpSessionProvider(LLMProvider):
         return proc.returncode if proc else None
 
     def touch_activity(self) -> None:
-        """Refresh activity timestamp on the runtime."""
+        """Refresh activity timestamp on the runtime.
+
+        PROCESS-level: the clock belongs to the runtime, so one session's
+        activity refreshes it for every session on it. An idle co-tenant is
+        therefore never idle while a neighbour talks, which is the SAFE
+        direction for anything that reaps on idleness (it defers, never
+        signals early) and the wrong one for anything that reports idle time
+        as a fact about a session. A per-session activity stamp is the fix;
+        this method cannot be it, because it has only the runtime to write to.
+        """
         self._runtime._last_activity = time.monotonic()
 
     def rekey(

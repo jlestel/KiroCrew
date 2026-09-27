@@ -12745,7 +12745,6 @@
       "level_change_failed": "Не удалось изменить уровень журнала"
     },
     "mcpGatewayCard": {
-      "active_sessions": "Активные сессии",
       "backends": "Бэкенды",
       "idle": "Простой",
       "no_backends_spawned_yet_start_a_session_that_cal": "Бэкенды ещё не запущены — начните сессию с вызовом инструмента MCP, чтобы наполнить пул.",
@@ -12756,7 +12755,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "Сервер",
-      "sessions": "Сессии",
       "shared_mcp_gateway": "Общий шлюз MCP",
       "with_shared_gateway_pooled": "С общим шлюзом (пул)",
       "without_gateway_per_session_copies": "Без шлюза (копия на каждую сессию)"

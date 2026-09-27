@@ -312,11 +312,15 @@ class TestRssThresholdCheck:
     async def test_child_map_built_once_per_tick(self) -> None:
         # review-bot perf finding: _build_child_map scans all of /proc, so it must
         # run once per sweep, not once per candidate.
+        #
+        # Distinct pids: the measurement is cached per RUNTIME, so two candidates
+        # on one pid would legitimately be one walk and could not show that the
+        # per-candidate measurement still happens. Co-tenancy has its own test.
         manager = _make_manager(rss_max_mb=1000)
         manager._sessions["dashboard:a"] = _session_stub(busy=False)
         manager._sessions["dashboard:b"] = _session_stub(busy=False)
         manager.reset = AsyncMock(return_value=True)
-        manager.get_pid = MagicMock(return_value=4242)
+        manager.get_pid = MagicMock(side_effect={"dashboard:a": 11, "dashboard:b": 22}.get)
         with patch("kiro_crew.session._build_child_map", return_value={}) as bm, patch(
             "kiro_crew.session._rss_mb_from_tree", return_value=2048
         ) as rt:
@@ -337,7 +341,7 @@ class TestRssThresholdCheck:
         manager._sessions["dashboard:a"] = _session_stub(busy=False)
         manager._sessions["dashboard:b"] = _session_stub(busy=False)
         manager.reset = AsyncMock(return_value=True)
-        manager.get_pid = MagicMock(return_value=4242)
+        manager.get_pid = MagicMock(side_effect={"dashboard:a": 11, "dashboard:b": 22}.get)
         # Overrides the class fixture's /proc pin: this is the Windows branch.
         with patch.object(session.platform_compat, "IS_WINDOWS", True), patch(
             "kiro_crew.session._build_child_map",
@@ -370,6 +374,74 @@ class TestRssThresholdCheck:
             "kiro_crew.session._rss_mb_from_tree", return_value=2048
         ):
             await manager._rss_threshold_check()  # must not raise
+        assert reset_calls == ["dashboard:a", "dashboard:b"]
+
+    @pytest.mark.asyncio
+    async def test_co_tenants_are_measured_once_and_recycle_one_session(self) -> None:
+        """Two sessions on ONE runtime: the tree is measured once, and crossing
+        the ceiling recycles ONE of them, not both.
+
+        The RSS figure is the shared tree's, so N co-tenants read the SAME
+        number and all N cross together. Resetting all of them in one tick
+        discards N sessions' work to reclaim one process, and the process
+        survives anyway while any tenant remains -- so the sweep repeats. One
+        reset per runtime per tick is the action the measurement supports.
+        """
+        manager = _make_manager(rss_max_mb=1000)
+        manager._sessions["dashboard:a"] = _session_stub(busy=False)
+        manager._sessions["dashboard:b"] = _session_stub(busy=False)
+        manager.reset = AsyncMock(return_value=True)
+        manager.get_pid = MagicMock(return_value=4242)  # one runtime, two tenants
+        with patch("kiro_crew.session._build_child_map", return_value={}), patch(
+            "kiro_crew.session._rss_mb_from_tree", return_value=2048
+        ) as rt:
+            await manager._rss_threshold_check()
+        assert rt.call_count == 1  # one walk per DISTINCT pid
+        assert manager.reset.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_runtimes_over_threshold_are_each_recycled(self) -> None:
+        """The one-per-runtime rule is keyed on the pid, so two sessions on two
+        runtimes are both recycled -- the 1:1 case must be untouched."""
+        manager = _make_manager(rss_max_mb=1000)
+        manager._sessions["dashboard:a"] = _session_stub(busy=False)
+        manager._sessions["dashboard:b"] = _session_stub(busy=False)
+        manager.reset = AsyncMock(return_value=True)
+        manager.get_pid = MagicMock(side_effect={"dashboard:a": 11, "dashboard:b": 22}.get)
+        with patch("kiro_crew.session._build_child_map", return_value={}), patch(
+            "kiro_crew.session._rss_mb_from_tree", return_value=2048
+        ) as rt:
+            await manager._rss_threshold_check()
+        assert rt.call_count == 2
+        assert manager.reset.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_co_tenant_lets_the_next_one_be_recycled(self) -> None:
+        """The budget is one SUCCESSFUL reset per runtime, not one attempt.
+
+        A victim the guards decline (attached sub-agents, a mid-flight
+        injection, reset's own atomic re-check) has reclaimed nothing, so the
+        tick must still be able to recycle a co-tenant. Otherwise a single
+        permanently-guarded tenant makes the ceiling unreachable for its whole
+        runtime.
+        """
+        manager = _make_manager(rss_max_mb=1000)
+        manager._sessions["dashboard:a"] = _session_stub(busy=False)
+        manager._sessions["dashboard:b"] = _session_stub(busy=False)
+        manager.get_pid = MagicMock(return_value=4242)
+        reset_calls: list[str] = []
+
+        async def _reset(
+            key, *, expect_session=None, skip_if_busy=False, skip_if_injecting=False
+        ):
+            reset_calls.append(key)
+            return key == "dashboard:b"  # 'a' declines, 'b' recycles
+
+        manager.reset = _reset  # type: ignore[assignment]
+        with patch("kiro_crew.session._build_child_map", return_value={}), patch(
+            "kiro_crew.session._rss_mb_from_tree", return_value=2048
+        ):
+            await manager._rss_threshold_check()
         assert reset_calls == ["dashboard:a", "dashboard:b"]
 
     @pytest.mark.asyncio

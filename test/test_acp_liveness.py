@@ -21,6 +21,7 @@ from kiro_crew.acp._dispatch import _dumps_degraded, _redact
 from kiro_crew.acp.liveness import (
     CHILD_EXIT_GRACE_SECS,
     EVIDENCE_ESTABLISHED_FLAT,
+    EVIDENCE_SHARED_TREE,
     EVIDENCE_SHELL_CHILD_ABSENT,
     VERDICT_DEAD,
     VERDICT_STUCK_INPUT,
@@ -123,8 +124,15 @@ class FakeProc:
         (d / "tcp6").write_text(header)
 
 
-def _oracle(fake: FakeProc, clock: _Clock, sample_min: float = 3.0) -> LivenessOracle:
-    return LivenessOracle(str(fake.root), now=clock, sample_min_secs=sample_min)
+def _oracle(
+    fake: FakeProc,
+    clock: _Clock,
+    sample_min: float = 3.0,
+    tenancy=None,
+) -> LivenessOracle:
+    return LivenessOracle(
+        str(fake.root), now=clock, sample_min_secs=sample_min, tenancy=tenancy
+    )
 
 
 # ── Shell tool evidence ──────────────────────────────────────────────────────
@@ -879,6 +887,73 @@ def test_model_wait_flat_no_socket_is_dead(tmp_path):
     verdict, evidence = oracle.check_model_wait(100)
     assert verdict == VERDICT_DEAD
     assert "no established backend socket" in evidence
+
+
+def test_model_wait_flat_no_socket_on_a_shared_tree_is_unknown(tmp_path):
+    """Two sessions on one runtime: the wedge signature is tree-wide evidence,
+    so it cannot name WHICH tenant lost its frame → UNKNOWN, tagged
+    shared_tree, never DEAD."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    fake.set_net_tcp(100, [])  # no established sockets
+    oracle = _oracle(fake, clock, sample_min=1.0, tenancy=lambda: 2)
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    verdict, evidence = oracle.check_model_wait(100)
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(EVIDENCE_SHARED_TREE)
+    assert "2 sessions" in evidence
+
+
+def test_model_wait_flat_no_socket_with_one_declared_tenant_is_dead(tmp_path):
+    """A runtime that DECLARES a single tenant keeps the immediate verdict: its
+    whole tree is that one session's, so the wedge signature is attributable."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    fake.set_net_tcp(100, [])
+    oracle = _oracle(fake, clock, sample_min=1.0, tenancy=lambda: 1)
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    assert oracle.check_model_wait(100)[0] == VERDICT_DEAD
+
+
+def test_model_wait_tenancy_probe_failure_does_not_reach_dead(tmp_path):
+    """An unreadable tenancy probe is absent evidence, not a declaration of
+    exclusivity: it degrades the verdict instead of authorising the fast path.
+    A raising probe must also not escape as an oracle error."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    fake.set_net_tcp(100, [])
+
+    def boom() -> int:
+        raise RuntimeError("runtime went away mid-probe")
+
+    oracle = _oracle(fake, clock, sample_min=1.0, tenancy=boom)
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    verdict, evidence = oracle.check_model_wait(100)
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(EVIDENCE_SHARED_TREE)
+
+
+def test_fresh_carries_the_tenancy_probe(tmp_path):
+    """``fresh()`` is taken at every liveness-state boundary, so a probe it
+    dropped would silently restore the unattributable DEAD mid-turn."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    fake.set_net_tcp(100, [])
+    oracle = _oracle(fake, clock, sample_min=1.0, tenancy=lambda: 3).fresh()
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    assert oracle.check_model_wait(100)[0] == VERDICT_UNKNOWN
 
 
 @requires_symlinks

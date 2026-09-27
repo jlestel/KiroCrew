@@ -1554,6 +1554,13 @@ class SessionAllocationService:
         # timestamps describe.
 
     async def is_provider_alive(self, key: str) -> bool | None:
+        """Whether *key*'s provider process is up, or None when there is no session.
+
+        Forwards a PROCESS-level answer (``provider.is_process_alive``) under a
+        per-key question. On a shared runtime every co-tenant key returns the
+        same value, so a True here does not establish that *key* itself is still
+        served -- only that the process behind it has not exited.
+        """
         key = self._owner._fold_key(key)
         async with self._lock:
             session = self._sessions.get(key)

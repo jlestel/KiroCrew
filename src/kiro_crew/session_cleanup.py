@@ -432,7 +432,7 @@ class SessionCleanup:
                 if pid is not None:
                     candidates.append((key, pid, session))
 
-        victims: list[tuple[str, int, SessionEntry]] = []
+        victims: list[tuple[str, int, int, SessionEntry]] = []
         if candidates:
             loop = asyncio.get_running_loop()
             measure: Callable[[int], int]
@@ -452,16 +452,40 @@ class SessionCleanup:
                 def measure(pid: int) -> int:
                     return self._deps.rss_mb_from_tree(pid, child_map)
 
+            # The figure is a RUNTIME's tree, so it is measured per runtime, not
+            # per session: co-tenants would otherwise pay N identical tree walks
+            # to read one number. Cached within the tick only -- the next tick
+            # re-measures, because the tree grows.
+            rss_by_pid: dict[int, int] = {}
             for key, pid, session in candidates:
-                rss = await loop.run_in_executor(
-                    self._deps.get_maintenance_executor(),
-                    measure,
-                    pid,
-                )
+                rss = rss_by_pid.get(pid)
+                if rss is None:
+                    rss = await loop.run_in_executor(
+                        self._deps.get_maintenance_executor(),
+                        measure,
+                        pid,
+                    )
+                    rss_by_pid[pid] = rss
                 if rss > self.state.rss_max_mb:
-                    victims.append((key, rss, session))
+                    victims.append((key, pid, rss, session))
 
-        for key, rss, session in victims:
+        # One RECLAIM per runtime per tick. The threshold was crossed by a
+        # process, and every session on it reads the same figure, so recycling
+        # all of them would discard N sessions' work for one process -- which
+        # survives anyway while any tenant remains, so the next tick would find
+        # the same crossing with fewer sessions left to spend. Budgeted on a
+        # reset that actually happened, not on an attempt: a victim the guards
+        # below decline has reclaimed nothing, so a co-tenant is still eligible.
+        recycled_pids: set[int] = set()
+        for key, pid, rss, session in victims:
+            if pid in recycled_pids:
+                self._deps.logger.debug(
+                    "RSS recycle: runtime %d already recycled a session this tick; "
+                    "leaving co-tenant %s alone",
+                    pid,
+                    key,
+                )
+                continue
             try:
                 # A free semaphore only proves the parent's OWN turn is over.
                 # Sub-agents spawned by that turn keep running on this session's
@@ -506,6 +530,7 @@ class SessionCleanup:
                 )
                 if not recycled:
                     continue
+                recycled_pids.add(pid)
                 self._deps.logger.warning(
                     "RSS recycle: session %s tree rss=%dMB exceeds %dMB",
                     key,

@@ -500,6 +500,16 @@ class BackendPool:
         ``asyncio.to_thread``. Snapshotting first is load-bearing: iterating
         ``_backends`` in the worker thread can race a concurrent add/evict
         ("dict changed size during iteration").
+
+        ``stubs`` is ``refcount``, which is ``len(_stub_inboxes)`` — the number
+        of attached stub CONNECTIONS. It is named for what it counts because it
+        is not a session count and cannot be read as one: an agent runtime opens
+        ONE stub per MCP server however many sessions it hosts, so a runtime
+        serving several sessions contributes 1. As a session count it is a lower
+        bound, and every figure derived from it (the pool's own "what this would
+        cost unpooled" estimate) inherits that. The session count is not
+        derivable here: the pool knows stub uuids and caller identities pushed to
+        it, not the set of sessions riding each stub.
         """
         now = time.monotonic()
         async with self._lock:
@@ -509,7 +519,7 @@ class BackendPool:
                         "server": b.pool_key.server_name,
                         "agent": b.pool_key.agent_name,
                         "pid": b.pid,
-                        "sessions": b.refcount,
+                        "stubs": b.refcount,
                         "idle_s": round(max(0.0, now - b.last_used_at), 1),
                     },
                     b.pid,

@@ -12381,7 +12381,6 @@
       "level_change_failed": "Protokollebene konnte nicht geändert werden"
     },
     "mcpGatewayCard": {
-      "active_sessions": "Aktive Sitzungen",
       "backends": "Backends",
       "idle": "Inaktiv",
       "no_backends_spawned_yet_start_a_session_that_cal": "Noch keine Backends gestartet — starten Sie eine Sitzung, die ein MCP-Werkzeug aufruft, um den Pool zu füllen.",
@@ -12392,7 +12391,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "Server",
-      "sessions": "Sitzungen",
       "shared_mcp_gateway": "Gemeinsames MCP-Gateway",
       "with_shared_gateway_pooled": "Mit gemeinsamem Gateway (gepoolt)",
       "without_gateway_per_session_copies": "Ohne Gateway (Kopien pro Sitzung)"

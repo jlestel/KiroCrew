@@ -12199,7 +12199,6 @@
       "level_change_failed": "로그 레벨을 변경하지 못했습니다"
     },
     "mcpGatewayCard": {
-      "active_sessions": "활성 세션",
       "backends": "백엔드",
       "idle": "유휴",
       "no_backends_spawned_yet_start_a_session_that_cal": "아직 생성된 백엔드가 없습니다 — MCP 도구를 호출하는 세션을 시작하여 풀을 채우세요.",
@@ -12210,7 +12209,6 @@
       "rss": "RSS",
       "s": "초",
       "server": "서버",
-      "sessions": "세션",
       "shared_mcp_gateway": "공유 MCP 게이트웨이",
       "with_shared_gateway_pooled": "공유 게이트웨이 사용 (풀링)",
       "without_gateway_per_session_copies": "게이트웨이 없음 (세션별 사본)"

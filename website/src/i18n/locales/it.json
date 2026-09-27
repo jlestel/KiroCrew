@@ -12563,7 +12563,6 @@
       "level_change_failed": "Impossibile modificare il livello di log"
     },
     "mcpGatewayCard": {
-      "active_sessions": "Sessioni attive",
       "backends": "Backend",
       "idle": "Inattivo",
       "no_backends_spawned_yet_start_a_session_that_cal": "Nessun backend ancora avviato — avvia una sessione che chiami uno strumento MCP per popolare il pool.",
@@ -12574,7 +12573,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "Server",
-      "sessions": "Sessioni",
       "shared_mcp_gateway": "Gateway MCP condiviso",
       "with_shared_gateway_pooled": "Con gateway condiviso (in pool)",
       "without_gateway_per_session_copies": "Senza gateway (copie per sessione)"

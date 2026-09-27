@@ -44,7 +44,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import MutableMapping
+from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,6 +108,147 @@ _SLICE_TASKS_TIGHT_RATIO = 0.90
 #: cgroup v2 files holding a cgroup's live task count and its task ceiling.
 _PIDS_CURRENT = "pids.current"
 _PIDS_MAX = "pids.max"
+
+#: cgroup v2 file listing a cgroup's member PROCESS ids (one per line). Unlike
+#: ``pids.current`` (tasks, i.e. threads) these are the pids an ownership
+#: question can be asked about.
+_CGROUP_PROCS = "cgroup.procs"
+
+
+@dataclass(frozen=True)
+class SliceOwnership:
+    """Whether every agent process in the slice has a live owner, and vice versa.
+
+    Two independent failures, each an alarm at any value above zero:
+
+    - ``unowned_alive`` — a process is running in the agent slice and NOTHING
+      claims it. It is leaked: no teardown path will reach it, it holds its
+      memory against the slice's ceiling until the host is rebooted or a sweep
+      guesses right about it, and it is invisible to every per-session view.
+    - ``owned_dead`` — something claims a pid that is not running. The claim is
+      stale, so a reader asking "is my session's process up" gets yes from a
+      record rather than from the kernel, and a signal aimed at that pid lands on
+      whatever the OS has since given the number to.
+
+    ``owned_alive`` is the healthy population, published so the two faults can be
+    read as a rate rather than as bare counts.
+
+    ``readable`` is False where the slice's membership cannot be enumerated (not
+    Linux, no cgroup v2 delegation, the slice not materialized). Then every count
+    is ``-1``: a host whose slice cannot be read has NOT been shown to be clean,
+    and publishing 0 there would be an all-clear nothing measured.
+    """
+
+    unowned_alive: int
+    owned_dead: int
+    owned_alive: int
+    readable: bool
+
+    @property
+    def healthy(self) -> bool:
+        """True only when the slice was readable AND both faults are zero."""
+        return self.readable and self.unowned_alive == 0 and self.owned_dead == 0
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "unowned_alive": self.unowned_alive,
+            "owned_dead": self.owned_dead,
+            "owned_alive": self.owned_alive,
+            "readable": self.readable,
+            "healthy": self.healthy,
+        }
+
+
+UNREADABLE_SLICE_OWNERSHIP = SliceOwnership(
+    unowned_alive=-1, owned_dead=-1, owned_alive=-1, readable=False
+)
+
+
+def _read_agent_slice_pids() -> set[int] | None:
+    """Every pid in the agent slice, or None when membership is unreadable.
+
+    Reads ``cgroup.procs`` from the shared slice AND every descendant cgroup:
+    each agent runs in its own ``run-*.scope`` under the slice, and a parent
+    cgroup's own ``cgroup.procs`` lists only processes attached directly to it,
+    which for a slice with children is usually none. Walking the subtree is what
+    makes the count the slice's real population rather than zero.
+
+    Reading the SHARED parent is sound here for the reason the task probe gives:
+    a count attributes nothing to anyone, where a kill would need an owner.
+    """
+    try:
+        from kiro_crew import sandbox
+
+        slice_dir = sandbox._agents_slice_cgroup_dir()
+        if slice_dir is None:
+            return None
+        pids: set[int] = set()
+        seen_any = False
+        for procs_file in [slice_dir / _CGROUP_PROCS, *slice_dir.rglob(_CGROUP_PROCS)]:
+            try:
+                text = procs_file.read_text(encoding="utf-8")
+            except OSError:
+                # A scope released between the walk and the read is ordinary, not
+                # a failure: the pids it held are gone too.
+                continue
+            seen_any = True
+            for line in text.split():
+                try:
+                    pids.add(int(line))
+                except ValueError:
+                    continue
+        return pids if seen_any else None
+    except Exception:  # pragma: no cover - defensive; the probe must never raise
+        logger.debug("agent-slice pid enumeration failed", exc_info=True)
+        return None
+
+
+def slice_ownership(
+    claimed_pids: Iterable[int],
+    *,
+    slice_pids: Iterable[int] | None = None,
+    pid_alive: Callable[[int], bool] | None = None,
+) -> SliceOwnership:
+    """Ownership health of the agent slice. Never raises.
+
+    *claimed_pids* is the caller's union of every source that claims a runtime.
+    It is injected rather than read because the claim records live in the
+    gateway's session manager, not on disk — the same reason
+    :func:`kiro_crew.diag.procs.scan` takes its owner map.
+
+    *slice_pids* and *pid_alive* are seams: the defaults are the real probes, and
+    a test replaces them to run the whole computation against a fixture with no
+    cgroup and no processes.
+
+    The two faults are measured over different populations on purpose.
+    ``unowned_alive`` is asked of the SLICE, because a leak is a process nobody
+    recorded and only the kernel knows about it. ``owned_dead`` is asked of the
+    CLAIMS, because a stale claim can name a pid that was never in the slice, or
+    one whose scope is already gone — so intersecting it with the slice first
+    would hide exactly the claims that have outlived their process.
+
+    A pid that is claimed and alive but OUTSIDE the slice counts as
+    ``owned_alive``: it is owned and running, which is what the field says.
+    """
+    try:
+        claimed = {int(pid) for pid in claimed_pids}
+        members = _read_agent_slice_pids() if slice_pids is None else {int(p) for p in slice_pids}
+        if members is None:
+            return UNREADABLE_SLICE_OWNERSHIP
+        alive = pid_alive
+        if alive is None:
+            from kiro_crew import platform_compat
+
+            alive = platform_compat.pid_exists
+        return SliceOwnership(
+            unowned_alive=sum(1 for pid in members if pid not in claimed),
+            owned_dead=sum(1 for pid in claimed if not alive(pid)),
+            owned_alive=sum(1 for pid in claimed if alive(pid)),
+            readable=True,
+        )
+    except Exception:  # pragma: no cover - defensive; the probe must never raise
+        logger.debug("slice ownership probe failed", exc_info=True)
+        return UNREADABLE_SLICE_OWNERSHIP
 
 
 def _read_pids_max(path: Path) -> int:
@@ -728,6 +869,15 @@ def admission_check(cfg: object | None = None) -> AdmissionDecision:
 # the posture rather than on a second, disagreeing scale. ``unknown`` (an
 # unreadable probe) keeps the fixed cap: a host the probe cannot measure is
 # never made worse by it.
+#
+# SESSION = PROCESS is a premise here, not an accident of wording. It holds
+# today because every pre-warm spawns its own runtime. Where a session can join
+# an existing runtime instead, a pre-warm claim costs a lease rather than a
+# process, and this allowance then over-charges: it holds back pre-warms the
+# host could afford, so the host is UNDER-used, never over-committed. That is
+# the safe direction to be wrong in, which is why the number is left alone and
+# the premise is written down instead. The fix when sharing lands is to size on
+# the runtimes a pre-warm will actually SPAWN, not on the sessions it will serve.
 PREWARM_MAX_LIVE = 3
 _PREWARM_BY_POSTURE: dict[str, int] = {
     POSTURE_CRITICAL: 0,

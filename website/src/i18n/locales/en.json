@@ -7335,7 +7335,6 @@
       "real_time_application_output": "Real-time application output"
     },
     "mcpGatewayCard": {
-      "active_sessions": "Active sessions",
       "backends": "Backends",
       "idle": "Idle",
       "no_backends_spawned_yet_start_a_session_that_cal": "No backends spawned yet — start a session that calls an MCP tool to populate the pool.",
@@ -7346,7 +7345,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "Server",
-      "sessions": "Sessions",
       "shared_mcp_gateway": "Shared MCP gateway",
       "with_shared_gateway_pooled": "With shared gateway (pooled)",
       "without_gateway_per_session_copies": "Without gateway (per-session copies)"

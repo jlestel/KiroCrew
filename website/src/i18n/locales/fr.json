@@ -12563,7 +12563,6 @@
       "level_change_failed": "Échec de la modification du niveau de journalisation"
     },
     "mcpGatewayCard": {
-      "active_sessions": "Sessions actives",
       "backends": "Backends",
       "idle": "Inactif",
       "no_backends_spawned_yet_start_a_session_that_cal": "Aucun backend démarré pour l'instant — lancez une session qui appelle un outil MCP pour alimenter le pool.",
@@ -12574,7 +12573,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "Serveur",
-      "sessions": "Sessions",
       "shared_mcp_gateway": "Passerelle MCP partagée",
       "with_shared_gateway_pooled": "Avec passerelle partagée (mutualisée)",
       "without_gateway_per_session_copies": "Sans passerelle (copies par session)"

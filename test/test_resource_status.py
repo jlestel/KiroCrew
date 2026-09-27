@@ -574,3 +574,93 @@ def test_task_count_does_not_move_the_posture(monkeypatch) -> None:
     for current in (0, 16000, 32768):
         _tasks(monkeypatch, current, 32768, current)
         assert rs.probe(_cfg(4.0, 2.0)).posture == rs.POSTURE_AMPLE
+
+
+# ── slice ownership SLI (unowned-alive / owned-dead) ──
+
+
+class TestSliceOwnership:
+    """Both faults are alarms at any value above zero, and an unreadable slice
+    is not an all-clear."""
+
+    @staticmethod
+    def _alive(live: set[int]):
+        return lambda pid: pid in live
+
+    def test_a_process_nothing_claims_is_counted_as_leaked(self) -> None:
+        out = rs.slice_ownership(
+            [10, 11], slice_pids=[10, 11, 12], pid_alive=self._alive({10, 11, 12})
+        )
+        assert out.unowned_alive == 1
+        assert out.owned_dead == 0
+        assert out.healthy is False
+
+    def test_a_claim_on_a_pid_that_is_not_running_is_counted_as_stale(self) -> None:
+        out = rs.slice_ownership(
+            [10, 99], slice_pids=[10], pid_alive=self._alive({10})
+        )
+        assert out.owned_dead == 1
+        assert out.unowned_alive == 0
+        assert out.healthy is False
+
+    def test_a_stale_claim_outside_the_slice_is_still_counted(self) -> None:
+        """Intersecting the claims with the slice first would hide exactly the
+        claims that have outlived their process -- once the scope is released
+        such a pid is absent from the slice."""
+        out = rs.slice_ownership(
+            [4242], slice_pids=[], pid_alive=self._alive(set())
+        )
+        assert out.owned_dead == 1
+
+    def test_a_fully_accounted_slice_is_healthy(self) -> None:
+        out = rs.slice_ownership(
+            [10, 11], slice_pids=[10, 11], pid_alive=self._alive({10, 11})
+        )
+        assert (out.unowned_alive, out.owned_dead, out.owned_alive) == (0, 0, 2)
+        assert out.healthy is True
+
+    def test_an_empty_slice_with_no_claims_is_healthy(self) -> None:
+        out = rs.slice_ownership([], slice_pids=[], pid_alive=self._alive(set()))
+        assert out.healthy is True
+        assert out.owned_alive == 0
+
+    def test_an_unreadable_slice_reports_minus_one_and_is_not_healthy(self) -> None:
+        """A host whose slice cannot be enumerated has not been shown to be
+        clean, so it must not publish zeros."""
+        out = rs.slice_ownership(
+            [10], slice_pids=None, pid_alive=self._alive({10})
+        )
+        # slice_pids=None takes the real probe; on a host without the slice it is
+        # unreadable, and on one WITH it the counts are real but never negative.
+        if not out.readable:
+            assert (out.unowned_alive, out.owned_dead, out.owned_alive) == (-1, -1, -1)
+            assert out.healthy is False
+        else:
+            assert out.unowned_alive >= 0 and out.owned_dead >= 0
+
+    def test_a_claimed_pid_alive_outside_the_slice_counts_as_owned_alive(self) -> None:
+        out = rs.slice_ownership(
+            [77], slice_pids=[], pid_alive=self._alive({77})
+        )
+        assert (out.owned_alive, out.owned_dead, out.unowned_alive) == (1, 0, 0)
+        assert out.healthy is True
+
+    def test_a_raising_liveness_probe_degrades_instead_of_propagating(self) -> None:
+        def boom(_pid: int) -> bool:
+            raise OSError("proc went away")
+
+        out = rs.slice_ownership([10], slice_pids=[10], pid_alive=boom)
+        assert out.readable is False
+        assert out.healthy is False
+
+    def test_the_payload_carries_every_field_a_reader_needs(self) -> None:
+        out = rs.slice_ownership(
+            [10, 99], slice_pids=[10, 12], pid_alive=self._alive({10, 12})
+        )
+        assert out.as_dict() == {
+            "unowned_alive": 1,
+            "owned_dead": 1,
+            "owned_alive": 1,
+            "readable": True,
+            "healthy": False,
+        }

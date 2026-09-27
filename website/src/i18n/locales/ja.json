@@ -12199,7 +12199,6 @@
       "level_change_failed": "ログレベルの変更に失敗しました"
     },
     "mcpGatewayCard": {
-      "active_sessions": "アクティブセッション",
       "backends": "バックエンド",
       "idle": "アイドル",
       "no_backends_spawned_yet_start_a_session_that_cal": "バックエンドがまだ生成されていません — MCP ツールを呼び出すセッションを開始して、プールを設定してください。",
@@ -12210,7 +12209,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "サーバー",
-      "sessions": "セッション",
       "shared_mcp_gateway": "共有 MCP ゲートウェイ",
       "with_shared_gateway_pooled": "共有ゲートウェイあり (プール)",
       "without_gateway_per_session_copies": "ゲートウェイなし (セッションごとのコピー)"

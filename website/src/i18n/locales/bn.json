@@ -12381,7 +12381,6 @@
       "level_change_failed": "লগ লেভেল পরিবর্তন করা যায়নি"
     },
     "mcpGatewayCard": {
-      "active_sessions": "সক্রিয় সেশন",
       "backends": "Backends",
       "idle": "নিষ্ক্রিয়",
       "no_backends_spawned_yet_start_a_session_that_cal": "এখনও কোনো ব্যাকএন্ড চালু হয়নি — পুল পূরণ করতে এমন একটি সেশন শুরু করুন যা কোনো MCP টুল কল করে।",
@@ -12392,7 +12391,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "সার্ভার",
-      "sessions": "সেশন",
       "shared_mcp_gateway": "শেয়ার্ড MCP গেটওয়ে",
       "with_shared_gateway_pooled": "শেয়ার্ড গেটওয়ে সহ (পুলড)",
       "without_gateway_per_session_copies": "গেটওয়ে ছাড়া (প্রতি-সেশন কপি)"

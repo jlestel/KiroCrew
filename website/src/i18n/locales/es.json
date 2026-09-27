@@ -12563,7 +12563,6 @@
       "level_change_failed": "No se pudo cambiar el nivel de registro"
     },
     "mcpGatewayCard": {
-      "active_sessions": "Sesiones activas",
       "backends": "Backends",
       "idle": "Inactivo",
       "no_backends_spawned_yet_start_a_session_that_cal": "Aún no se ha generado ningún backend — inicia una sesión que llame a una herramienta MCP para llenar el pool.",
@@ -12574,7 +12573,6 @@
       "rss": "RSS",
       "s": "s",
       "server": "Servidor",
-      "sessions": "Sesiones",
       "shared_mcp_gateway": "Gateway MCP compartido",
       "with_shared_gateway_pooled": "Con gateway compartido (agrupado)",
       "without_gateway_per_session_copies": "Sin gateway (copias por sesión)"

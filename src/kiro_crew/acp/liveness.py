@@ -103,8 +103,23 @@ flat on macOS/Windows is classified as waiting for input at the (narrowed)
 budget rather than as an opaque stall.
 
 Attribution on a shared runtime: each handle probes only ITS OWN runtime pid,
-and the cmdline match keys shell evidence to THIS session's in-flight command.
-Where attribution is impossible the verdict degrades to UNKNOWN.
+but a runtime can host several sessions, and then that pid's process tree is not
+one session's. Which probes survive that is not uniform, so it is stated per
+probe rather than claimed for the module:
+
+- the cmdline match keys shell evidence to THIS session's in-flight command, so
+  the shell branch attributes;
+- the movement and socket probes read the WHOLE tree, so a co-tenant's build
+  reads as this session's progress and a co-tenant's backend connection
+  suppresses this session's wedge signature. Both of those err toward
+  forbearance, which costs detection latency and no work;
+- the one reading that is acted on at once, the model-wait DEAD, is therefore
+  gated on declared tenancy: with co-tenants it degrades to UNKNOWN tagged
+  :data:`EVIDENCE_SHARED_TREE` and the caller's stale window governs instead.
+  Pass ``tenancy`` to declare it; a caller that declares nothing gets the
+  historical single-tenant reading.
+
+Where attribution is impossible the verdict degrades to UNKNOWN, never to a kill.
 
 Unit-testable against a fake ``/proc`` tree via the ``proc_root`` ctor arg and
 an injectable ``now`` clock.
@@ -154,6 +169,32 @@ EVIDENCE_ESTABLISHED_FLAT = "established_flat"
 # still covered by the "young descendant exists" test below, so the narrowing
 # only shortens a non-lethal cancel, never skips straight to one.
 EVIDENCE_SHELL_CHILD_ABSENT = "shell_child_absent"
+
+# Evidence prefix for a verdict the oracle declined to sharpen into DEAD because
+# the runtime hosts MORE THAN ONE session, so the evidence for it is not
+# attributable to the session that asked.
+#
+# The model-wait wedge signature (flat counters, no established backend socket)
+# is read over the runtime's WHOLE process tree. On a runtime with one tenant
+# that tree IS that session, so the signature names it. With two tenants the
+# same reading names neither: it says "nothing on this process is talking to a
+# backend", and which tenant lost its frame — or whether any did — is a question
+# the counters cannot answer. DEAD is the one verdict the caller acts on
+# immediately (``session_handle`` cancels the turn on the spot instead of at the
+# stale window), so an unattributable DEAD spends another session's in-flight
+# turn to recover a guess.
+#
+# The same reasoning already sits at the CONSUMER in
+# ``subagent_manager.monitoring``, which drops a DEAD outright while
+# ``_session_sharing`` is set. Putting it in the oracle is what lets the other
+# consumers inherit it: the verdict is unsound at the point the evidence is
+# gathered, not at each place it is read.
+#
+# Degrades to UNKNOWN rather than WORKING: a shared tree is a reason not to
+# trust the fast path, never a reason to defer indefinitely. The caller's
+# ordinary stale window still bounds it, so a genuine wedge is still recovered —
+# at the window instead of at once.
+EVIDENCE_SHARED_TREE = "shared_tree"
 
 # Evidence for a movement probe that stored a BASELINE and has nothing to
 # compare it against yet. Structurally non-informative: it says "ask me again",
@@ -1081,6 +1122,7 @@ class LivenessOracle:
         darwin_backend: DarwinProcessBackend | None = None,
         wall_now=time.time,
         steady_now_fn=steady_now,
+        tenancy: Callable[[], int | None] | None = None,
     ) -> None:
         self._proc = str(proc_root)
         self._now = now
@@ -1098,6 +1140,17 @@ class LivenessOracle:
         )
         self._tracked_child: int | None = None
         self._child_gone_ts: float | None = None
+        # How many sessions the probed runtime hosts, asked at verdict time
+        # because a runtime gains and loses tenants while a turn runs. Only the
+        # DEAD branch of the model wait reads it — see
+        # :data:`EVIDENCE_SHARED_TREE` for why that branch and not the others.
+        #
+        # ``None`` means the caller declares NOTHING, and the module then reads
+        # the tree as one session's, which is the 1:1 premise this refactor is
+        # removing. It is the default so that a caller which has not been taught
+        # about tenancy keeps today's verdicts exactly; a caller whose runtime
+        # CAN host a second session is the one that must pass this.
+        self._tenancy = tenancy
         # sample key -> (ts, counter). Keys: "io", "cpu".
         self._samples: dict[str, tuple[float, int]] = {}
 
@@ -1135,6 +1188,7 @@ class LivenessOracle:
             darwin_backend=self._darwin,
             wall_now=self._wall_now,
             steady_now_fn=self._steady_now,
+            tenancy=self._tenancy,
         )
 
     # ── Public checks ──
@@ -1575,7 +1629,42 @@ class LivenessOracle:
         established = self._any_established(runtime_pid)
         if established:
             return VERDICT_UNKNOWN, f"{EVIDENCE_ESTABLISHED_FLAT}: {evidence}"
+        sharing = self._shared_tree_reason()
+        if sharing:
+            return VERDICT_UNKNOWN, f"{EVIDENCE_SHARED_TREE}: {sharing} ({evidence})"
         return VERDICT_DEAD, f"no established backend socket and flat counters ({evidence})"
+
+    def _shared_tree_reason(self) -> str:
+        """Why tree-wide evidence is not this session's, or "" when it is.
+
+        Asked immediately before the one verdict that is acted on at once. Three
+        answers, and only the first clears the fast path:
+
+        - a declared tenancy of 1 — the tree is this session's, evidence
+          attributable, "" ;
+        - a declared tenancy above 1 — co-tenants, so the reading names no
+          session in particular;
+        - a probe that cannot answer (it raised, or returned a non-count) —
+          ABSENT evidence, which is not a declaration of exclusivity. An
+          exception here means the runtime is being torn down or swapped under
+          the probe, which is the least safe moment to authorise an immediate
+          cancel, so it reads the same as sharing.
+
+        No probe at all is the caller declaring nothing, which keeps the module's
+        historical 1:1 reading — see the ``tenancy`` note in ``__init__``.
+        """
+        if self._tenancy is None:
+            return ""
+        try:
+            count = self._tenancy()
+        except Exception:
+            logger.debug("liveness: tenancy probe failed", exc_info=True)
+            return "tenancy unreadable"
+        if not isinstance(count, int) or count < 1:
+            return "tenancy unreadable"
+        if count == 1:
+            return ""
+        return f"{count} sessions on this runtime"
 
     def _portable_model_wait(self, runtime_pid: int) -> tuple[str, str]:
         """Model-wait verdict from platform-neutral evidence.
