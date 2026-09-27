@@ -1319,25 +1319,155 @@ def _pr_facts_digest(facts: Mapping[str, Any]) -> str:
     return hashlib.sha256(rendered.encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def _judge_pr_targets(judge: Mapping[str, Any] | None) -> list[str]:
+    """The pull-request targets a judge brief names. Never raises.
+
+    Imported lazily and wrapped, for the reason every other judge call in this
+    module is: the brief is an optional feature, and a loop must still arm on a
+    build where reading it fails.
+    """
+    if not isinstance(judge, Mapping) or not judge:
+        return []
+    try:
+        from kiro_crew import autonudge_judge as _judge
+
+        return _judge.pr_targets_of(judge)
+    except Exception:
+        logger.debug("AutoNudge: could not read the judge brief's targets", exc_info=True)
+        return []
+
+
+def infer_subject(message: str, judge: Mapping[str, Any] | None = None) -> "targets.Target | None":
+    """WHICH pull request a loop is about: its judge brief first, then its instruction.
+
+    One function, because the answer is needed in five places -- the arm, the
+    retarget, the tick's probe config, the rebinding check that runs after the poll,
+    and the terminal revalidation -- and a subject decided differently in any one of
+    them is a loop whose monitor and whose reader disagree about what is watched.
+
+    The brief's ``targets`` list is read FIRST because
+    :func:`~kiro_crew.autonudge_judge.parse_targets` already reads it first: a list
+    NARROWS the watch, and once it is present the collector asks about those strings
+    and nothing else. A monitor resolved from the instruction while the collector
+    asks about the list is two halves about two pull requests, and the reading is
+    dropped every tick as "a pull request this loop does not watch".
+
+    That is not hypothetical. A loop armed with the URL in ``judge.targets`` and the
+    number alone in its instruction got NO monitor: nothing was fetched, the tick
+    recorded no evidence, and every interval fired on the plain timer -- so the
+    comment bodies the judge exists to read never reached it.
+
+    The instruction decides when the brief names no pull request, which is the
+    ordinary case and the one this inference was built for. It also decides when the
+    brief names MORE than one: a loop holds a single monitor, so a list of two
+    subjects selects none, and falling back leaves such a loop exactly the reading it
+    gets today rather than taking its monitor away.
+
+    The brief reading FIRST is a precedence, never an override. It supplies the
+    subject only when the instruction names NO pull request -- the case this
+    inference exists for. Once the instruction names one, it must name the SAME one,
+    or this returns ``None``: the brief's job is to narrow what the judge reads, so
+    one entry there cannot overrule a pull request the owner spelled out in full, and
+    it cannot resolve an instruction that names two either. Preferring the brief
+    would watch the pull request the judge was only asked to read evidence from --
+    the ordinary "blocked on #7" brief -- and let #7 merging retire the loop that
+    owns #42; preferring the instruction would rebuild the very split described
+    above. Refusing costs one ungated turn per interval, the cost such a loop already
+    pays, and it is the answer :func:`targets.infer` gives to the same doubt inside a
+    single string.
+
+    The GRAMMAR is unchanged and stays in one place. Every candidate goes through
+    :func:`targets.infer`, whose refusal of a shorthand has nothing to do with where
+    the text came from -- ``#123`` is equally an issue reference, and a slug carries
+    no host -- so a brief naming ``owner/name#123`` selects nothing here, exactly as
+    the collector drops that entry.
+    """
+    listed: list["targets.Target"] = []
+    for entry in _judge_pr_targets(judge):
+        found = targets.infer(entry)
+        if found is None:
+            continue
+        identity = (found.kind, found.subject, found.host_key)
+        if all(identity != (other.kind, other.subject, other.host_key) for other in listed):
+            listed.append(found)
+    from_message = targets.infer(message)
+    if len(listed) == 1:
+        only = listed[0]
+        if not targets.names_pull_request(message):
+            return only
+        if from_message is not None and (
+            from_message.kind,
+            from_message.subject,
+            from_message.host_key,
+        ) == (only.kind, only.subject, only.host_key):
+            return only
+        # The brief NARROWS a watch; it does not declare one. So it supplies the
+        # subject only when the instruction names NO pull request -- the case this
+        # whole inference exists for. Once the instruction names one, it must name
+        # the SAME one, or this returns nothing.
+        #
+        # Both other answers cause the harm this refusal exists to prevent. Taking
+        # the brief's entry watches the pull request the judge was only asked to READ
+        # from -- the ordinary "blocked on #7" brief -- so #7 merging drives the
+        # terminal settlement and retires the loop that owns #42 with its own work
+        # never observed. Taking the instruction's instead rebuilds the split this
+        # function was written to close: a monitor on #42 while the collector asks
+        # only about #7, every reading dropped as a pull request this loop does not
+        # watch.
+        #
+        # ``names_pull_request`` rather than ``from_message is not None`` because
+        # those differ exactly where it matters: an instruction naming TWO pull
+        # requests infers ``None``, and treating that as "names none" would let the
+        # brief pick one of the two -- resolving an ambiguity ``targets.infer``
+        # deliberately refuses to resolve, by the side door. Refusing costs one
+        # ungated turn per interval, which is what such a loop already gets today.
+        logger.info(
+            "AutoNudge: a judge brief and an instruction disagree about the pull request "
+            "(brief names %s), so no monitor is built rather than watching either",
+            only.subject,
+        )
+        return None
+    if listed:
+        logger.info(
+            "AutoNudge: a judge brief names %d pull requests, so the instruction decides "
+            "the watched subject instead",
+            len(listed),
+        )
+    return from_message
+
+
+def loop_subject(loop: Any) -> "targets.Target | None":
+    """The subject one stored loop is about, from that loop's own two strings."""
+    from kiro_crew import autonudge_judge as _judge
+
+    return infer_subject(str(getattr(loop, "message", "") or ""), _judge.spec_of(loop))
+
+
 def infer_monitor(
     message: str,
     now: float,
     *,
     creation_surface: MonitorCreationSurface = MonitorCreationSurface.UNKNOWN,
+    judge: Mapping[str, Any] | None = None,
 ) -> MonitorState | None:
-    """Build a monitor for *message*'s subject, or ``None`` to stay ungated.
+    """Build a monitor for this loop's subject, or ``None`` to stay ungated.
 
     ``None`` is the common, safe answer: a loop watching something with no probe
     -- a deployment, a ticket, a file -- keeps exactly the behaviour it had
-    before this feature existed. Only a message that names ONE observable
+    before this feature existed. Only a loop that names ONE observable
     subject becomes a gated monitor.
 
     Public because the ARMING SURFACE has to report this same decision in its
     acknowledgement, and the reasons it can answer ``None`` are not all in
-    :func:`targets.infer` -- a subject that will not form a valid monitor is
+    :func:`infer_subject` -- a subject that will not form a valid monitor is
     another. An ack that re-derived the answer from the target alone could claim
     a gate the loop never got, which is the one thing a disclosure must not do.
     One function, one answer.
+
+    *judge* is the brief this loop will be STORED with, and it is passed rather
+    than re-read because on the arming path the loop does not exist yet. Which of
+    the two strings names the subject is :func:`infer_subject`'s decision, not
+    this function's.
 
     Budgets are left at their defaults and are NOT enforced on this path. The
     default cap is 8 agent turns, and real babysit loops run for dozens of
@@ -1346,7 +1476,7 @@ def infer_monitor(
     decision controller that owns the rest of the budget vocabulary, and is
     deliberately not smuggled in behind a token saving.
     """
-    target = targets.infer(message)
+    target = infer_subject(message, judge)
     if target is None:
         return None
     try:
@@ -2863,6 +2993,11 @@ class AutoNudgeService:
                 await self._revoke_provider_credentials_before_removal(existing.id)
                 self.remove_sync(existing.id, persist=False, emit=False)
             now = time.time()
+            # Scrubbed ONCE, then used for both the stored field and the subject the
+            # monitor is built from. Two calls would be two values: the scrub may
+            # rewrite a target, and a watch bound to a string the loop does not carry
+            # is a watch whose own reader drops its reading.
+            stored_judge = scrubbed_judge_spec(judge) if isinstance(judge, dict) else {}
             loop = NudgeLoop(
                 id=self._mint_loop_id(loop_id),
                 slot_key=slot_key,
@@ -2880,7 +3015,7 @@ class AutoNudgeService:
                 # decode path. Stored whatever the consent scope says, so a loop armed
                 # today is judged once the scope is granted -- the tick, not the arm, is
                 # where that is decided.
-                judge=scrubbed_judge_spec(judge) if isinstance(judge, dict) else {},
+                judge=stored_judge,
                 # Anchor the first deadline at arm time (set BEFORE the
                 # snapshot below so it persists): the countdown starts the
                 # moment the loop is armed, and user turns from here on only
@@ -2913,7 +3048,11 @@ class AutoNudgeService:
                 # subject; keying that only on the wording of the instruction made a
                 # cadence contract depend on prose.
                 monitor=(
-                    infer_monitor(message, now, creation_surface=creation_surface) if gate else None
+                    infer_monitor(
+                        message, now, creation_surface=creation_surface, judge=stored_judge
+                    )
+                    if gate
+                    else None
                 ),
                 gate=gate,
                 banner=banner,
@@ -3158,6 +3297,10 @@ class AutoNudgeService:
             # rollback below restores exactly what it removed and nothing else.
             claim_discarded_for_retarget = False
             floor_discarded_for_retarget = False
+            #: Whether this update changed something that can change the WATCHED
+            #: SUBJECT -- the instruction, or the brief whose target list names it.
+            #: Resolved once below, after both have landed.
+            rebind_monitor = False
             was_active = loop.active
             if message is not None:
                 retarget = message != loop.message
@@ -3207,64 +3350,13 @@ class AutoNudgeService:
                     # wording changed would revoke that through the documented way
                     # to revise a loop -- silently, since an ungated loop and a
                     # re-gated one look identical until the turns stop arriving.
-                    inferred = infer_monitor(message, time.time()) if loop.gate else None
-                    current = loop.monitor
-                    # The stored spelling is a canonical shorthand and cannot
-                    # express a HOST, so kind and target alone would call an edit
-                    # from an enterprise shorthand to the same public slug
-                    # "unchanged" and keep polling the wrong server. This is the
-                    # third of the three places that comparison had to reach; the
-                    # other two are the post-poll binding and the dedupe identity.
-                    old_probe = targets.infer(str(previous.get("message") or ""))
-                    new_probe = targets.infer(message)
-                    same_host = (old_probe.host_key if old_probe else None) == (
-                        new_probe.host_key if new_probe else None
-                    )
-                    same_subject = (
-                        inferred is not None
-                        and current is not None
-                        and current.kind == inferred.kind
-                        and current.target == inferred.target
-                        and same_host
-                    )
-                    if not same_subject:
-                        if current is not None and current.version != MONITOR_STATE_VERSION:
-                            # A FUTURE version cannot be interpreted here, so it must
-                            # not be REPLACED here either. The revival guard below
-                            # already refuses to touch such a record, on the grounds
-                            # that the stored intent belongs to the newer gateway that
-                            # wrote it -- but that guard runs after this assignment,
-                            # so a downgraded gateway destroyed the payload before the
-                            # rule protecting it ever applied. Same rule, second
-                            # surface: leave the record alone and let the message
-                            # change without rebinding the watch.
-                            logger.info(
-                                "AutoNudge: loop %s carries a monitor from version %d, so "
-                                "its retarget is refused rather than overwriting state "
-                                "this gateway cannot read",
-                                loop.id,
-                                current.version,
-                            )
-                        else:
-                            # A wake claimed for the OLD subject must not be spent on
-                            # the new one. The claim is keyed by loop id, so without
-                            # this the in-flight turn's delivery charges a wake to a
-                            # monitor that has observed nothing, and grants it a
-                            # follow-up allowance it never earned. Remembered so the
-                            # persistence rollback below can hand it back if this
-                            # retarget never lands.
-                            claim_discarded_for_retarget = loop.id in self._pending_monitor_wake
-                            self._pending_monitor_wake.discard(loop.id)
-                            # And the floor claim, for the identical reason. I added
-                            # that second claim one round ago and wrote on the pull
-                            # request that two hand-written claim sets with two release
-                            # points would go wrong at the third site; this IS that
-                            # site, missed by the same change that predicted it. Third
-                            # time a claim has been released in one set and forgotten
-                            # in another.
-                            floor_discarded_for_retarget = loop.id in self._pending_floor_tick
-                            self._pending_floor_tick.discard(loop.id)
-                            loop.monitor = inferred
+                    #
+                    # The rebinding itself happens AFTER the judge block below, not
+                    # here. The brief's target list also names the subject, an update
+                    # may carry a new message and a new brief in one call, and the
+                    # subject has to be resolved from the pair this loop ends up with
+                    # -- deciding it here would read the brief being replaced.
+                    rebind_monitor = True
             if banner is not None:
                 # Display-only, so no deadline or timer consequence — unlike
                 # ``idle_secs`` below, quieting a running loop must not restart
@@ -3296,6 +3388,79 @@ class AutoNudgeService:
                 # the criteria being replaced, so carrying it forward would show the
                 # judge a hit rate for a question nobody is asking any more.
                 loop.judge_recent_verdicts = []
+                # A REPLACED brief can name a different pull request, and the collector
+                # will ask about the new list from the next tick on. A monitor left on
+                # the old subject would publish a reading the collector drops, so the
+                # watch would go on spending a fetch and the judge would see nothing.
+                # Only for a gated loop: a structured monitor is refused far above, and
+                # an ungated loop has no judge to read.
+                rebind_monitor = rebind_monitor or loop.gate
+            # ONE place resolves the subject, from the two strings this loop now holds.
+            # Reached by a changed instruction and by a replaced brief alike, because
+            # either can name a different pull request and only the pair says which.
+            if rebind_monitor:
+                inferred = (
+                    infer_monitor(loop.message, time.time(), judge=loop.judge)
+                    if loop.gate
+                    else None
+                )
+                current = loop.monitor
+                # The stored spelling is a canonical shorthand and cannot
+                # express a HOST, so kind and target alone would call an edit
+                # from an enterprise shorthand to the same public slug
+                # "unchanged" and keep polling the wrong server. This is the
+                # third of the three places that comparison had to reach; the
+                # other two are the post-poll binding and the dedupe identity.
+                old_probe = infer_subject(str(previous.get("message") or ""), previous.get("judge"))
+                new_probe = infer_subject(loop.message, loop.judge)
+                same_host = (old_probe.host_key if old_probe else None) == (
+                    new_probe.host_key if new_probe else None
+                )
+                same_subject = (
+                    inferred is not None
+                    and current is not None
+                    and current.kind == inferred.kind
+                    and current.target == inferred.target
+                    and same_host
+                )
+                if not same_subject:
+                    if current is not None and current.version != MONITOR_STATE_VERSION:
+                        # A FUTURE version cannot be interpreted here, so it must
+                        # not be REPLACED here either. The revival guard below
+                        # already refuses to touch such a record, on the grounds
+                        # that the stored intent belongs to the newer gateway that
+                        # wrote it -- but that guard runs after this assignment,
+                        # so a downgraded gateway destroyed the payload before the
+                        # rule protecting it ever applied. Same rule, second
+                        # surface: leave the record alone and let the message
+                        # change without rebinding the watch.
+                        logger.info(
+                            "AutoNudge: loop %s carries a monitor from version %d, so "
+                            "its retarget is refused rather than overwriting state "
+                            "this gateway cannot read",
+                            loop.id,
+                            current.version,
+                        )
+                    else:
+                        # A wake claimed for the OLD subject must not be spent on
+                        # the new one. The claim is keyed by loop id, so without
+                        # this the in-flight turn's delivery charges a wake to a
+                        # monitor that has observed nothing, and grants it a
+                        # follow-up allowance it never earned. Remembered so the
+                        # persistence rollback below can hand it back if this
+                        # retarget never lands.
+                        claim_discarded_for_retarget = loop.id in self._pending_monitor_wake
+                        self._pending_monitor_wake.discard(loop.id)
+                        # And the floor claim, for the identical reason. I added
+                        # that second claim one round ago and wrote on the pull
+                        # request that two hand-written claim sets with two release
+                        # points would go wrong at the third site; this IS that
+                        # site, missed by the same change that predicted it. Third
+                        # time a claim has been released in one set and forgotten
+                        # in another.
+                        floor_discarded_for_retarget = loop.id in self._pending_floor_tick
+                        self._pending_floor_tick.discard(loop.id)
+                        loop.monitor = inferred
             interval_changed = False
             if idle_secs is not None:
                 new_idle = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
@@ -6287,8 +6452,9 @@ class AutoNudgeService:
         probe = probes.build(monitor.kind)
         if probe is None:
             return False
-        # Derive the probe's config from the LOOP'S OWN INSTRUCTION, then check
-        # the subject it yields against the stored monitor.
+        # Derive the probe's config from the LOOP'S OWN STRINGS -- its judge brief's
+        # target list, else its instruction -- then check the subject it yields
+        # against the stored monitor.
         #
         # Not from ``monitor.target``: that is the CANONICAL subject
         # ("owner/name#123"), a shorthand, and a shorthand deliberately carries no
@@ -6298,17 +6464,19 @@ class AutoNudgeService:
         # same-numbered enterprise pull request being merged would then falsely
         # terminate a live public watch.
         #
-        # The instruction is the only place the original spelling survives, and
+        # Those strings are the only place the original spelling survives, and
         # storing the host a second time would put one fact in two places that can
-        # disagree. So infer from the message and REQUIRE the result to name the
+        # disagree. So infer from them and REQUIRE the result to name the
         # subject the monitor is bound to; a mismatch means the two have drifted
         # apart, which is not something to resolve by guessing -- fire instead, the
-        # same direction every other uncertain path takes.
-        target = targets.infer(loop.message)
+        # same direction every other uncertain path takes. Resolving the subject
+        # HERE by a different rule than the arm used is exactly how that mismatch
+        # gets manufactured, which is why both go through ``infer_subject``.
+        target = loop_subject(loop)
         if target is None or (target.kind, target.subject) != (monitor.kind, monitor.target):
             if target is not None:
                 logger.info(
-                    "AutoNudge: loop %s instruction names %s but its monitor is bound to "
+                    "AutoNudge: loop %s names %s but its monitor is bound to "
                     "%s -- firing instead of observing",
                     loop.id,
                     target.subject,
@@ -6399,12 +6567,12 @@ class AutoNudgeService:
         # The poll above is a real await -- it runs ``gh`` in a thread for as long as
         # the reading's whole budget, ``gh_pr._TICK_BUDGET_SECS``, not the per-call cap
         # -- so the loop can be RETARGETED while it is in flight:
-        # ``update(message=...)`` rebinds the monitor to a different pull request,
-        # or clears it. Acting on this verdict now would apply an observation of
-        # the OLD subject to the new one, and the terminal branch would deactivate
-        # a watch that had just been pointed at a live pull request. Compare the
-        # binding, not the object: a retarget mutates the same MonitorState.
-        fresh = targets.infer(loop.message)
+        # ``update(message=...)`` or a replaced judge brief rebinds the monitor to a
+        # different pull request, or clears it. Acting on this verdict now would apply
+        # an observation of the OLD subject to the new one, and the terminal branch
+        # would deactivate a watch that had just been pointed at a live pull request.
+        # Compare the binding, not the object: a retarget mutates the same MonitorState.
+        fresh = loop_subject(loop)
         current_binding = (
             (monitor.kind, monitor.target, fresh.message) if fresh is not None else None
         )
@@ -6569,7 +6737,7 @@ class AutoNudgeService:
             try:
                 # Re-read under the lock. The checks before it were made while a
                 # retarget could still land.
-                fresh_under_lock = targets.infer(loop.message)
+                fresh_under_lock = loop_subject(loop)
                 if (
                     loop.monitor is not monitor
                     or loop.id not in self._loops
@@ -7138,7 +7306,7 @@ class AutoNudgeService:
         was already delivered. This review has paid for a defect at an existing site for
         each new piece of per-loop state, so re-asking is the cheaper way to answer.
         """
-        target = targets.infer(loop.message)
+        target = loop_subject(loop)
         probe = probes.build(monitor.kind)
         if target is None or probe is None:
             # Cannot re-check, so cannot confirm. Keep the loop alive.

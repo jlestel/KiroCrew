@@ -97,35 +97,28 @@ class Target:
     host_key: str = "default"
 
 
-def infer(text: str) -> Target | None:
-    """Return the single subject *text* is about, or ``None``.
+def _pull_requests_named(text: str) -> set[tuple[str, str, int]]:
+    """Every distinct pull request *text* names by full URL.
 
-    ``None`` on every doubtful case, and specifically when the text names more
-    than one distinct pull request. That case is common and it is exactly where
-    guessing does damage: a babysit instruction routinely names its own PR *and*
-    a PR it is blocked on ("gated on #7 merging first"), and a watch armed on
-    the blocker would report the blocker's progress while staying silent about
-    the PR the loop actually owns.
+    ONLY an explicit public pull-request URL gates a loop. A bare
+    ``owner/name#123`` proves neither of the two things this decision needs:
+
+    * not that the subject is a PULL REQUEST -- ``#123`` is equally an issue
+      reference, and a same-numbered pull request may exist and be merged, which
+      would retire a loop that was watching the issue;
+    * not WHICH SERVER it lives on -- a shorthand resolves through the operator's
+      ambient gh configuration, so on an enterprise host the same slug names a
+      different repository.
+
+    Requiring the full URL also narrows what an agent-written message can cause:
+    a credentialed (audited, read-only, fixed-argv) gh call now happens only for
+    a subject the instruction spelled out in full. A shorthand-only instruction
+    is simply not gated, which costs a turn per interval -- today's cost, and the
+    safe direction.
     """
-    if not isinstance(text, str) or not text:
-        return None
-
     found: set[tuple[str, str, int]] = set()
-    # ONLY an explicit public pull-request URL gates a loop. A bare
-    # ``owner/name#123`` proves neither of the two things this decision needs:
-    #
-    # * not that the subject is a PULL REQUEST -- ``#123`` is equally an issue
-    #   reference, and a same-numbered pull request may exist and be merged, which
-    #   would retire a loop that was watching the issue;
-    # * not WHICH SERVER it lives on -- a shorthand resolves through the operator's
-    #   ambient gh configuration, so on an enterprise host the same slug names a
-    #   different repository.
-    #
-    # Requiring the full URL also narrows what an agent-written message can cause:
-    # a credentialed (audited, read-only, fixed-argv) gh call now happens only for
-    # a subject the instruction spelled out in full. A shorthand-only instruction
-    # is simply not gated, which costs a turn per interval -- today's cost, and the
-    # safe direction.
+    if not isinstance(text, str) or not text:
+        return found
     for match in _PR_URL.finditer(text):
         try:
             number = int(match.group("pr"))
@@ -140,6 +133,35 @@ def infer(text: str) -> Target | None:
         if number <= 0:
             continue
         found.add((match.group("owner"), match.group("repo"), number))
+    return found
+
+
+def names_pull_request(text: str) -> bool:
+    """Whether *text* names a pull request by full URL at all, ambiguity included.
+
+    :func:`infer` answers WHICH subject, and returns ``None`` for two different
+    texts: one naming none, and one naming several. A caller deciding whether some
+    OTHER string may supply the subject needs those apart -- text that names nothing
+    can yield to another source, while merely ambiguous text must not, or the second
+    source silently resolves an ambiguity this module refuses to resolve itself.
+    """
+    return bool(_pull_requests_named(text))
+
+
+def infer(text: str) -> Target | None:
+    """Return the single subject *text* is about, or ``None``.
+
+    ``None`` on every doubtful case, and specifically when the text names more
+    than one distinct pull request. That case is common and it is exactly where
+    guessing does damage: a babysit instruction routinely names its own PR *and*
+    a PR it is blocked on ("gated on #7 merging first"), and a watch armed on
+    the blocker would report the blocker's progress while staying silent about
+    the PR the loop actually owns.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+
+    found = _pull_requests_named(text)
 
     # Exactly one subject, or nothing. Ambiguity is not resolved by preferring
     # the first mention: reading order does not tell which PR the loop owns, and

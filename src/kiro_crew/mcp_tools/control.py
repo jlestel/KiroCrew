@@ -1491,7 +1491,6 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # the loop that will actually exist.
     stored_message, _ = redact_exfiltration_urls(message)
     stored_message, _ = redact_credentials(stored_message)
-    gated = autonudge.infer_monitor(stored_message, time.time()) if gate else None
     # ``banner`` is CONDITIONAL, unlike the fields above: a caller that sets no
     # banner must see the payload shape it saw before, because the tool's
     # contract test asserts this dict by EXACT equality. The applier reads it
@@ -1504,6 +1503,20 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
         judge_spec = validate_judge_spec(args.get("judge"))
     except ValidationError as exc:
         return f"monitor_start: {exc.field}: {exc.message}"
+    # After the brief is validated, because the brief's own ``targets`` list is the
+    # FIRST place the subject is looked for -- a loop naming its pull request there
+    # and not in the message is gated, and an ack derived from the message alone
+    # would tell its caller the opposite. Scrubbed for the same reason the message
+    # above is: the disclosure has to describe the loop that will actually exist.
+    gated = (
+        autonudge.infer_monitor(
+            stored_message,
+            time.time(),
+            judge=autonudge.scrubbed_judge_spec(judge_spec) if judge_spec else None,
+        )
+        if gate
+        else None
+    )
     # Before the payload is built, so the emitted dict is byte-identical to what
     # it was (its shape is asserted by exact equality in the contract test) and a
     # certain refusal is reported instead of acknowledged.

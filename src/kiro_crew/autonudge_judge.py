@@ -142,6 +142,27 @@ def is_session_target(value: str) -> bool:
     return SESSION_TARGET_RE.fullmatch(value or "") is not None
 
 
+def pr_targets_of(spec: Mapping[str, Any] | None) -> list[str]:
+    """The pull requests the brief's OWN target list names, as the owner spelled them.
+
+    The message is deliberately not consulted, which is what separates this from
+    :func:`parse_targets`: this answers "what did the BRIEF name", and the caller
+    decides what an empty answer means.
+
+    It exists because the monitor and the collector have to be about one pull
+    request. :func:`parse_targets` reads this list BEFORE the instruction and
+    returns nothing else once it is present, so the collector asks about these
+    strings and no others -- and a monitor built from the instruction instead then
+    publishes a reading of a different pull request, which
+    :func:`pr_observation_is_about` correctly drops on every tick. Both halves read
+    this field first, or the watch reads nothing.
+
+    Every entry has already been through the same inference the collector admits it
+    by, so a shorthand the collector drops is absent here too.
+    """
+    return [target for target in parse_targets(spec, "") if not is_session_target(target)]
+
+
 def session_evidence(
     rows: Sequence[Mapping[str, Any]],
     target: str,
