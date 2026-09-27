@@ -3130,6 +3130,7 @@
         "retryAgents": "재시도",
         "start": "시작",
         "toggleTasks": "액션 아이템",
+        "titleLabel": "회의 제목",
         "toggleTranslation": "번역",
         "unpause": "재개"
       },
@@ -3187,6 +3188,7 @@
         "ended": "회의가 종료되었습니다.",
         "messageFailed": "해당 메시지를 보낼 수 없습니다.",
         "minutesRevertFailed": "편집을 취소할 수 없습니다.",
+        "renameFailed": "회의 이름을 변경할 수 없습니다.",
         "minutesSaveFailed": "편집을 저장할 수 없습니다.",
         "startFailed": "회의를 시작할 수 없습니다.",
         "started": "회의가 시작되었습니다.",

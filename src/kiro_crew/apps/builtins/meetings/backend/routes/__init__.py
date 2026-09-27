@@ -186,6 +186,7 @@ def register_routes(app: web.Application) -> None:
     router.add_delete(
         BASE + "/meetings/{meeting_id}", route(lifecycle_routes.handle_delete_meeting)
     )
+    router.add_patch(BASE + "/meetings/{meeting_id}", route(lifecycle_routes.handle_patch_meeting))
     router.add_post(
         BASE + "/meetings/{meeting_id}/init", route(lifecycle_routes.handle_meeting_init)
     )

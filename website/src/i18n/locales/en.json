@@ -1916,6 +1916,7 @@
         "restart": "Restart",
         "retryAgents": "Retry",
         "start": "Start",
+        "titleLabel": "Meeting title",
         "toggleTasks": "Action items",
         "toggleTranslation": "Translation",
         "unpause": "Resume"
@@ -1990,6 +1991,7 @@
         "taskFileFailed": "Could not file that action item.",
         "taskFiled": "Action item filed.",
         "untitled": "Untitled meeting",
+        "renameFailed": "Could not rename the meeting.",
         "minutesSaveFailed": "Could not save your edits.",
         "minutesRevertFailed": "Could not discard your edits."
       },

@@ -15,6 +15,7 @@ import {
   meetingsApi,
   safeMeetingId,
   type AgentDef,
+  type LiveStatus,
   type MeetingMeta,
   type MeetingStatus,
   type MeetingsConfig,
@@ -625,7 +626,8 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
   const startMutation = useMutation({
     mutationFn: (opts: { restart?: boolean }) =>
       meetingsApi.start(meetingId, {
-        title: meta?.title || fallbackTitle,
+        // A stored title is never resent: a cached one may predate a rename.
+        title: meta?.title ? undefined : fallbackTitle,
         preset: selectedPreset || undefined,
         // OMITTED, not `[]`, while the roster is still unknown: absent means "use
         // the configured defaults" to the server, which is what an unloaded config
@@ -694,6 +696,18 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       void queryClient.invalidateQueries({ queryKey: ['meetings', 'list'] })
     },
     onError: error => failureNotice(error, i18nT('apps.meetings.session.stopFailed')),
+  })
+
+  // The saved title goes straight into the cache so the header shows it at once.
+  const renameMutation = useMutation({
+    mutationFn: (title: string) => meetingsApi.renameMeeting(meetingId, title),
+    onSuccess: ({ meta: saved }) => {
+      queryClient.setQueryData<{ meta: MeetingMeta; live: LiveStatus | null }>(
+        [...scope, 'meta'],
+        old => (old ? { ...old, meta: { ...old.meta, title: saved.title } } : old),
+      )
+      void queryClient.invalidateQueries({ queryKey: ['meetings', 'list'] })
+    },
   })
 
   const muteMutation = useMutation({
@@ -846,6 +860,7 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       review: () => requestStatus('reviewing'),
       backToMeeting: () => requestStatus('paused'),
       stop: () => stopMutation.mutate(),
+      rename: (title: string) => renameMutation.mutateAsync(title),
       mute: (agentId: string, muted: boolean) => muteMutation.mutate({ agentId, muted }),
       toggleAgent: (agentId: string, enable: boolean) =>
         toggleAgentMutation.mutate({ agentId, enable }),

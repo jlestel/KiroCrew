@@ -71,6 +71,7 @@ class TestAuthorizationGate:
                 ("get", f"{BASE}/meetings"),
                 ("get", f"{BASE}/status"),
                 ("post", f"{BASE}/meetings/x/init"),
+                ("patch", f"{BASE}/meetings/x"),
                 ("post", f"{BASE}/calendar/sync"),
             ):
                 resp = await getattr(client, method)(path, json={})
@@ -891,6 +892,49 @@ class TestMeetingLifecycleRoutes:
         out = task_routes._normalize_task({"description": "d", "labels": labels})
         assert out is not None
         assert out["labels"] == expected
+
+
+class TestRenameRoute:
+    @pytest.mark.asyncio
+    async def test_rename_trims_and_persists(self, app):
+        async with client_for(app) as client:
+            await client.post(f"{BASE}/meetings/standup/init", json={"title": "Standup"})
+            resp = await client.patch(f"{BASE}/meetings/standup", json={"title": "  Retro  "})
+            assert resp.status == 200
+            assert (await resp.json())["meta"]["title"] == "Retro"
+            got = await (await client.get(f"{BASE}/meetings/standup")).json()
+            assert got["meta"]["title"] == "Retro"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("title", ["", "   ", None, 7])
+    async def test_empty_or_missing_title_is_400(self, app, title):
+        async with client_for(app) as client:
+            await client.post(f"{BASE}/meetings/standup/init", json={"title": "Standup"})
+            resp = await client.patch(f"{BASE}/meetings/standup", json={"title": title})
+            assert resp.status == 400
+            got = await (await client.get(f"{BASE}/meetings/standup")).json()
+            assert got["meta"]["title"] == "Standup"
+
+    @pytest.mark.asyncio
+    async def test_too_long_title_is_400(self, app):
+        async with client_for(app) as client:
+            await client.post(f"{BASE}/meetings/standup/init", json={"title": "Standup"})
+            ok = await client.patch(
+                f"{BASE}/meetings/standup", json={"title": "x" * k.MAX_TITLE_LEN}
+            )
+            assert ok.status == 200
+            resp = await client.patch(
+                f"{BASE}/meetings/standup", json={"title": "x" * (k.MAX_TITLE_LEN + 1)}
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_unknown_meeting_is_404_and_creates_nothing(self, app, root: Path):
+        async with client_for(app) as client:
+            resp = await client.patch(f"{BASE}/meetings/ghost", json={"title": "Ghost"})
+            assert resp.status == 404
+            assert (await resp.json())["code"] == "meeting_not_found"
+        assert not store.meeting_dir("ghost", root).exists()
 
 
 class TestAttachmentRoutes:

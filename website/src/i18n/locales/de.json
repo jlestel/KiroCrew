@@ -3188,6 +3188,7 @@
         "retryAgents": "Erneut versuchen",
         "start": "Starten",
         "toggleTasks": "Aufgaben",
+        "titleLabel": "Titel der Besprechung",
         "toggleTranslation": "Übersetzung",
         "unpause": "Fortsetzen"
       },
@@ -3261,6 +3262,7 @@
         "taskFileFailed": "Diese Aufgabe konnte nicht angelegt werden.",
         "taskFiled": "Aufgabe angelegt.",
         "untitled": "Besprechung ohne Titel",
+        "renameFailed": "Die Besprechung konnte nicht umbenannt werden.",
         "minutesSaveFailed": "Deine Änderungen konnten nicht gespeichert werden.",
         "minutesRevertFailed": "Deine Änderungen konnten nicht verworfen werden."
       },

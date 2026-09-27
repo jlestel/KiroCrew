@@ -3246,6 +3246,7 @@
         "retryAgents": "Réessayer",
         "start": "Démarrer",
         "toggleTasks": "Actions à suivre",
+        "titleLabel": "Titre de la réunion",
         "toggleTranslation": "Traduction",
         "unpause": "Reprendre"
       },
@@ -3321,6 +3322,7 @@
         "taskFileFailed": "Impossible d’enregistrer cette action.",
         "taskFiled": "Action enregistrée.",
         "untitled": "Réunion sans titre",
+        "renameFailed": "Impossible de renommer la réunion.",
         "minutesSaveFailed": "Impossible d'enregistrer tes modifications.",
         "minutesRevertFailed": "Impossible d'abandonner tes modifications."
       },

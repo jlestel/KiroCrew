@@ -29,6 +29,7 @@ import type { MeetingsConfig } from './api'
 import AgentPanel from './components/AgentPanel'
 import AgentPillBar from './components/AgentPillBar'
 import BroadcastBar from './components/BroadcastBar'
+import MeetingTitle from './components/MeetingTitle'
 import MeetingWorkspace from './components/MeetingWorkspace'
 import TaskSidebar from './components/TaskSidebar'
 import TranscriptPanel from './components/TranscriptPanel'
@@ -149,9 +150,7 @@ export default function MeetingView({
               <ArrowLeft className="lucide-inline" />
               {i18nT('apps.meetings.meeting.back')}
             </Btn>
-            <h2 className="text-lg font-semibold text-text-strong truncate">
-              {meta?.title || i18nT('apps.meetings.session.untitled')}
-            </h2>
+            <MeetingTitle title={meta?.title ?? ''} onRename={actions.rename} />
             {status === 'active'
               && pending.settingStatus !== 'paused'
               && pending.settingStatus !== 'reviewing' && (

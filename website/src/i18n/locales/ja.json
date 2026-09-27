@@ -3130,6 +3130,7 @@
         "retryAgents": "再試行",
         "start": "開始",
         "toggleTasks": "アクションアイテム",
+        "titleLabel": "ミーティングのタイトル",
         "toggleTranslation": "翻訳",
         "unpause": "再開"
       },
@@ -3187,6 +3188,7 @@
         "ended": "ミーティング終了。",
         "messageFailed": "そのメッセージを送信できませんでした。",
         "minutesRevertFailed": "編集を破棄できませんでした。",
+        "renameFailed": "ミーティングの名前を変更できませんでした。",
         "minutesSaveFailed": "編集を保存できませんでした。",
         "startFailed": "ミーティングを開始できませんでした。",
         "started": "ミーティング開始。",

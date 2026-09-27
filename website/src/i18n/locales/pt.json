@@ -3171,6 +3171,7 @@
         "retryAgents": "Tentar de novo",
         "start": "Começar",
         "toggleTasks": "Tarefas",
+        "titleLabel": "Título da reunião",
         "toggleTranslation": "Tradução",
         "unpause": "Retomar"
       },
@@ -3246,6 +3247,7 @@
         "taskFileFailed": "Não foi possível registar essa tarefa.",
         "taskFiled": "Tarefa registada.",
         "untitled": "Reunião sem título",
+        "renameFailed": "Não foi possível renomear a reunião.",
         "minutesSaveFailed": "Não foi possível salvar suas edições.",
         "minutesRevertFailed": "Não foi possível descartar suas edições."
       },

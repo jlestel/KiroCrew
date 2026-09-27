@@ -56,6 +56,7 @@ GET    /task-providers              registered task providers + the active one
 GET    /meetings                    every meeting with metadata on disk
 GET    /meetings/{id}               one meeting's metadata + live status
 DELETE /meetings/{id}               permanently remove an inactive meeting's local data
+PATCH  /meetings/{id}               {title} — rename; trimmed, non-empty, ≤ MAX_TITLE_LEN
 POST   /meetings/{id}/init          create folder/metadata/tasks/outputs (idempotent)
 POST   /meetings/{id}/start         activate: seed outputs, spawn agent sessions
 POST   /meetings/{id}/status        {status} — active | paused | reviewing | ended

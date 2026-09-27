@@ -446,7 +446,7 @@ describe('useMeetingSession transcription binding', () => {
 })
 
 describe('useMeetingSession lifecycle actions', () => {
-  it('starts a meeting with the title, preset and roster it knows', async () => {
+  it('starts a meeting with the preset and roster it knows, never resending a stored title', async () => {
     const view = await mountLoaded()
 
     await act(async () => {
@@ -454,7 +454,7 @@ describe('useMeetingSession lifecycle actions', () => {
     })
 
     await waitFor(() => expect(apiMocks.start).toHaveBeenCalledWith('weekly_sync', {
-      title: 'Weekly Sync',
+      title: undefined,
       preset: 'standup',
       agents_enabled: ['note-taker'],
       muted_agents: [],

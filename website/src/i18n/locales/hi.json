@@ -3113,6 +3113,7 @@
         "retryAgents": "पुनः प्रयास करें",
         "start": "शुरू करें",
         "toggleTasks": "कार्य-बिंदु",
+        "titleLabel": "मीटिंग का शीर्षक",
         "toggleTranslation": "अनुवाद",
         "unpause": "जारी रखें"
       },
@@ -3186,6 +3187,7 @@
         "taskFileFailed": "वह कार्य-बिंदु दर्ज नहीं हो सका।",
         "taskFiled": "कार्य-बिंदु दर्ज हुआ।",
         "untitled": "बिना शीर्षक मीटिंग",
+        "renameFailed": "मीटिंग का नाम नहीं बदला जा सका।",
         "minutesSaveFailed": "तुम्हारे बदलाव सहेजे नहीं जा सके।",
         "minutesRevertFailed": "तुम्हारे बदलाव छोड़े नहीं जा सके।"
       },

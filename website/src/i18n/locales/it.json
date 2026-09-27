@@ -3171,6 +3171,7 @@
         "retryAgents": "Riprova",
         "start": "Avvia",
         "toggleTasks": "Azioni da fare",
+        "titleLabel": "Titolo della riunione",
         "toggleTranslation": "Traduzione",
         "unpause": "Riprendi"
       },
@@ -3246,6 +3247,7 @@
         "taskFileFailed": "Non è stato possibile registrare quell’azione.",
         "taskFiled": "Azione registrata.",
         "untitled": "Riunione senza titolo",
+        "renameFailed": "Non è stato possibile rinominare la riunione.",
         "minutesSaveFailed": "Non è stato possibile salvare le tue modifiche.",
         "minutesRevertFailed": "Non è stato possibile scartare le tue modifiche."
       },

@@ -301,6 +301,11 @@ export const meetingsApi = {
   meetings: () => request<{ meetings: MeetingSummary[] }>('/meetings'),
   meeting: (id: string) =>
     request<{ meta: MeetingMeta; live: LiveStatus | null }>(`/meetings/${encodeURIComponent(id)}`),
+  renameMeeting: (id: string, title: string) =>
+    request<{ ok: boolean; meta: MeetingMeta }>(`/meetings/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    }),
   deleteMeeting: (id: string) =>
     request<void>(`/meetings/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   init: (id: string, title: string) =>

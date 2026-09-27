@@ -3055,6 +3055,7 @@
         "retryAgents": "重试",
         "start": "开始",
         "toggleTasks": "行动项",
+        "titleLabel": "会议标题",
         "toggleTranslation": "翻译",
         "unpause": "继续"
       },
@@ -3126,6 +3127,7 @@
         "taskFileFailed": "无法提交该行动项。",
         "taskFiled": "行动项已提交。",
         "untitled": "未命名会议",
+        "renameFailed": "无法重命名会议。",
         "minutesSaveFailed": "无法保存你的修改。",
         "minutesRevertFailed": "无法放弃你的修改。"
       },
