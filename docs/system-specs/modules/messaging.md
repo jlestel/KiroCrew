@@ -2356,7 +2356,14 @@ default install no Slack session was ever LLM-titled.
   `bg:{source}_auto_title` so it is attributable per channel.
 - `clean_title` keeps the first line, trims quoting, and drops `<`/`>` — they open
   a link in Slack's mrkdwn and a tag in Telegram's HTML, and a title is rendered
-  as-is on both.
+  as-is on both. It then runs the two checks every label path shares from
+  `kiro_crew.label_guard`: the taught `SKIP` verdict means "no title" alone or
+  with a reason attached (`is_verdict_reply`: `SKIP - too vague`), and a reply
+  shaped like a sentence about the task (`looks_like_prose`: a refusal opener,
+  a terminator mid-line, more words than a name carries) is discarded the same
+  way. The disposition is the one the dashboard title uses — no title, keep
+  the fallback, never store the refusal — and it matters most here because a
+  `set_channel_title` hook writes this name to the Slack thread itself.
 
 ## Slack reference implementation
 

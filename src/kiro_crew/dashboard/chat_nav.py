@@ -11,6 +11,7 @@ from aiohttp import web
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.label_guard import looks_like_prose
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.platform import redact_log_via_context
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session import BACKGROUND_KEY
@@ -72,10 +73,35 @@ def _build_link_summary_prompt(links: list[dict]) -> str:
 # not serve it.
 _LINK_SUMMARY_MODEL = "auto"
 
+#: Unspaced-script ceiling for the prose guard on a 3-8 word label. The prompt
+#: teaches no character budget (the title's "~4-14 characters" hint is not sent
+#: here), so a legitimate Thai or long-katakana label can run past the title's
+#: 24; 48 keeps such a name while a refusal sentence still runs well past it.
+_LINK_LABEL_MAX_UNSPACED_CHARS = 48
+
 #: A leading list enumerator the model adds on its own ("1. ", "2) "). It is
-#: stripped from the label, and its presence tells a refusal line apart from
-#: narration around the list -- see ``_resolve_link_summaries``.
+#: stripped from the label; a numbered line is by definition a slot, never a
+#: preamble -- see ``_resolve_link_summaries``.
 _ENUMERATOR_RE = re.compile(r"^\d{1,2}[.)]\s+")
+
+#: A list preamble the model adds before the labels, matched as a COMPLETE
+#: phrase: "Here are the labels:", "Here are the labels for your links:",
+#: "Labels:", "The following labels:", "Below are the labels:", "以下是标签：".
+#: A whole-line phrase is required (not a shared first word) so a real label
+#: that starts like one ("Label Printing Bug:", "API Reference Docs:") is never
+#: taken for a preamble; the line-count check in ``_resolve_link_summaries`` is
+#: the second condition.
+_PREAMBLE_RE = re.compile(
+    r"^(?:"
+    r"here(?:'s| is| are) (?:the |your )?labels?(?: for (?:the |your |each |these )?"
+    r"(?:links?|urls?))?"
+    r"|(?:the |your )?labels?"
+    r"|(?:the )?following(?: labels?)?"
+    r"|below (?:is|are) (?:the |your )?labels?"
+    r"|\u4ee5\u4e0b(?:\u662f)?(?:\u94fe\u63a5)?\u6807\u7b7e"
+    r")[:\uff1a]$",
+    re.IGNORECASE,
+)
 
 
 async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> list[str]:
@@ -89,12 +115,27 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
 
     # Parse: one label per line. The frontend merges the reply POSITIONALLY
     # (label i -> link i), so alignment matters as much as content.
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    surplus = len(lines) > len(links)
     results: list[str] = []
-    for raw_line in text.strip().splitlines():
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
+    for index, raw_line in enumerate(lines):
         ln, enumerated = _ENUMERATOR_RE.subn("", raw_line)
+        if index == 0 and not enumerated and surplus and _PREAMBLE_RE.search(ln):
+            # A list preamble ("Here are the labels:") is recognised as a
+            # COMPLETE phrase with a closing colon (``_PREAMBLE_RE``) AND by
+            # count -- an unnumbered first line in a reply that has more lines
+            # than links -- and is not a slot, so it is dropped. Each weaker
+            # rule misfired: a colon alone drops a real label ("API Reference
+            # Docs:"), a surplus count alone drops a first-link refusal when a
+            # courtesy line trails, a shared first word drops "Label Printing
+            # Bug:". Nothing else is ever dropped, because dropping a slot
+            # shifts every later label onto the wrong link. Gate-side log line:
+            # context-aware redaction, so raw model output never reaches the log.
+            # Redact BEFORE truncating: a cut can split a credential so no
+            # pattern matches the surviving fragment.
+            shown = redact_log_via_context(ln)[:120]
+            logger.info("Link summary reply opened with a preamble, dropping: %r", shown)
+            continue
         ln, redacted_url = redact_exfiltration_urls(ln)
         ln, redacted_cred = redact_credentials(ln)
         if redacted_url or redacted_cred:
@@ -103,18 +144,19 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
                 source="chat_nav", outcome="redacted",
                 metadata={"redacted_url": bool(redacted_url), "redacted_cred": bool(redacted_cred)},
             )
-        if looks_like_prose(ln):
-            # The model narrated instead of labeling ("I cannot access these
-            # links."). The prompt is a list of URLs and the turn is tool-free,
+        if looks_like_prose(ln, max_unspaced_chars=_LINK_LABEL_MAX_UNSPACED_CHARS):
+            # The model narrated instead of labeling ("I cannot access this
+            # link."). The prompt is a list of URLs and the turn is tool-free,
             # so this is the same refusal the dashboard title discards; never
-            # store it as a chip. An ENUMERATED refusal ("2. I cannot access
-            # this link") still occupies its slot, so an empty label keeps the
-            # later labels on their own links; an unnumbered one is narration
-            # around the list ("Here are the labels:") and is dropped, because
-            # keeping it would shift every later label onto the wrong link.
-            logger.info("Link summary reply is prose, discarding: %r", ln[:120])
-            if enumerated:
-                results.append("")
+            # store it as a chip. The line still OCCUPIES its slot: an empty
+            # label keeps every later label on its own link (the frontend
+            # already treats "" as "no label"), whereas dropping it would
+            # silently chip link i with link i+1's label for the session.
+            # Gate-side log line: the context-aware, non-raising redactor, so a
+            # host with a companion loaded is not scanned with the baseline pass.
+            shown = redact_log_via_context(ln)[:120]
+            logger.info("Link summary reply is prose, discarding: %r", shown)
+            results.append("")
             continue
         results.append(ln[:80])
     return results

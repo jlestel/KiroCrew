@@ -154,45 +154,196 @@ class TestResolveLinkSummaries:
         ],
     )
     async def test_a_refusal_is_never_stored_as_a_chip_label(self, reply):
-        """#10375: the prompt is a list of URLs and the turn is tool-free, so
-        the model narrates the denial; that sentence became a 28-character
-        nav chip. Mutation: drop the ``looks_like_prose`` branch -- red."""
+        """The prompt is a list of URLs and the turn is tool-free, so the model
+        narrates the denial; without the guard that sentence is a 28-character
+        nav chip. The slot stays (empty) and the endpoint pads the rest.
+        Mutation: drop the ``looks_like_prose`` branch -- red."""
         result = await _resolve_link_summaries(
             self._state_replying(reply),
             [{"url": "https://a.com"}, {"url": "https://b.com"}],
         )
-        assert result == []
+        assert result == [""]
 
     @pytest.mark.asyncio
-    async def test_an_enumerated_refusal_keeps_its_slot(self):
+    @pytest.mark.parametrize("numbered", [True, False])
+    async def test_a_per_link_refusal_keeps_its_slot(self, numbered):
         """Labels are merged positionally (label i -> link i). A refusal for
-        link 2 in a numbered reply must leave an EMPTY slot 2, so label 3 stays
-        on link 3. Mutation: ``continue`` without appending -- red (the third
-        label shifts onto the second link)."""
+        link 2 must leave an EMPTY slot 2, so label 3 stays on link 3 -- in the
+        bare shape the prompt asks for as much as in a numbered one. Mutation:
+        ``continue`` without appending -- red (the third label shifts onto the
+        second link)."""
+        prefix = ("1. ", "2. ", "3. ") if numbered else ("", "", "")
         result = await _resolve_link_summaries(
             self._state_replying(
-                "1. Nav Panel Feature CR\n"
-                "2. I cannot access this link.\n"
-                "3. Memory V2 Design Doc\n"
+                f"{prefix[0]}Nav Panel Feature CR\n"
+                f"{prefix[1]}I cannot access this link.\n"
+                f"{prefix[2]}Memory V2 Design Doc\n"
             ),
             [{"url": "https://a.com"}, {"url": "https://b.com"}, {"url": "https://c.com"}],
         )
         assert result == ["Nav Panel Feature CR", "", "Memory V2 Design Doc"]
 
     @pytest.mark.asyncio
-    async def test_leading_narration_does_not_shift_the_labels(self):
-        """An unnumbered sentence AROUND the list ("Here are the labels:") is
-        not a slot: keeping it (even as "") would put every later label on the
-        wrong link. Mutation: append "" for every prose line -- red."""
+    async def test_a_leading_refusal_for_the_first_link_keeps_its_slot(self):
+        """A bare refusal on line 1 with as many lines as links is link 1's
+        slot, not a preamble. Mutation: drop every leading prose line -- red."""
+        result = await _resolve_link_summaries(
+            self._state_replying("I cannot access this link.\nMemory V2 Design Doc\n"),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert result == ["", "Memory V2 Design Doc"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "preamble",
+        [
+            "Here are the labels for your links:",
+            "Labels:",
+            "The following labels:",
+            "Below are the labels:",
+            "\u4ee5\u4e0b\u662f\u6807\u7b7e\uff1a",
+        ],
+    )
+    @pytest.mark.parametrize("numbered", [True, False])
+    async def test_a_recognised_preamble_does_not_shift_the_labels(self, preamble, numbered):
+        """An unnumbered first line with list-preamble WORDING and a closing
+        colon, in a reply longer than the link list, is not a slot: keeping it
+        (even as "") would put every later label on the wrong link. Mutation:
+        drop the preamble branch -- red."""
+        prefix = ("1. ", "2. ") if numbered else ("", "")
         result = await _resolve_link_summaries(
             self._state_replying(
-                "Here are the labels for your links:\n"
-                "1. Nav Panel Feature CR\n"
-                "2. Memory V2 Design Doc\n"
+                f"{preamble}\n"
+                f"{prefix[0]}Nav Panel Feature CR\n"
+                f"{prefix[1]}Memory V2 Design Doc\n"
             ),
             [{"url": "https://a.com"}, {"url": "https://b.com"}],
         )
         assert result == ["Nav Panel Feature CR", "Memory V2 Design Doc"]
+
+    @pytest.mark.asyncio
+    async def test_preamble_wording_alone_does_not_drop_when_counts_match(self):
+        """``Labels:`` as line 1 of a reply with exactly one line per link is
+        kept as a slot: with nothing surplus, dropping it would leave the last
+        link unlabeled and assume a missing line the count does not show.
+        Mutation: drop on wording without the surplus check -- red."""
+        result = await _resolve_link_summaries(
+            self._state_replying("Labels:\nMemory V2 Design Doc\n"),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert result == ["Labels:", "Memory V2 Design Doc"]
+
+    @pytest.mark.asyncio
+    async def test_a_first_link_refusal_with_a_trailing_courtesy_keeps_its_slot(self):
+        """Refusal for link 1, real labels, then a courtesy line: the reply is
+        one line longer than the link count, yet the refusal is link 1's slot
+        and must stay empty rather than be dropped -- otherwise label 2 lands
+        on link 1 and the merge is silently wrong for the session. The
+        endpoint truncates the surplus tail. Mutation: drop a leading prose
+        line whenever the reply is longer than the link list -- red."""
+        result = await _resolve_link_summaries(
+            self._state_replying(
+                "I cannot access this link.\n"
+                "Memory V2 Design Doc\n"
+                "Nav Panel Feature CR\n"
+                "Let me know if you need anything else.\n"
+            ),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}, {"url": "https://c.com"}],
+        )
+        assert result[:3] == ["", "Memory V2 Design Doc", "Nav Panel Feature CR"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label", ["Label Printing Bug:", "Following up on the outage:", "Labels and tags cleanup:"]
+    )
+    async def test_a_label_sharing_a_preamble_word_keeps_its_slot(self, label):
+        """A first label that merely STARTS like a preamble ("Label Printing
+        Bug:") is a slot, even with a surplus courtesy line: only the complete
+        preamble phrase is dropped. Mutation: match on the first word -- red."""
+        result = await _resolve_link_summaries(
+            self._state_replying(f"{label}\nMemory V2 Design Doc\nHope this helps\n"),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert result[:2] == [label, "Memory V2 Design Doc"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("trailing", ["", "Hope this helps\n"])
+    async def test_a_colon_terminated_first_label_keeps_its_slot(self, trailing):
+        """``API Reference Docs:`` as line 1 is link 1's label, not a preamble
+        -- whether or not a courtesy line trails the list and makes the reply
+        longer than the link count. Only recognised preamble WORDING is ever
+        dropped. Mutation: drop on colon + surplus without the wording -- red
+        (the second label shifts onto the first link)."""
+        result = await _resolve_link_summaries(
+            self._state_replying(f"API Reference Docs:\nMemory V2 Design Doc\n{trailing}"),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert result[:2] == ["API Reference Docs:", "Memory V2 Design Doc"]
+
+    @pytest.mark.asyncio
+    async def test_the_dropped_preamble_is_logged_redacted(self, monkeypatch, caplog):
+        """The dropped preamble is raw model output; the log line must see it
+        only through the context-aware redactor. Mutation: log ``ln`` directly
+        -- red."""
+        import logging
+
+        from kiro_crew.dashboard import chat_nav
+
+        seen: list[str] = []
+
+        def fake_redact(text):
+            seen.append(text)
+            return "<redacted>"
+
+        monkeypatch.setattr(chat_nav, "redact_log_via_context", fake_redact)
+        with caplog.at_level(logging.INFO, logger=chat_nav.__name__):
+            await _resolve_link_summaries(
+                self._state_replying("Here are the labels for your links:\nA doc\nB doc\n"),
+                [{"url": "https://a.com"}, {"url": "https://b.com"}],
+            )
+        assert seen == ["Here are the labels for your links:"]
+        assert "Here are the labels" not in caplog.text
+        assert "<redacted>" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_discarded_prose_line_is_redacted_whole_before_truncation(self, monkeypatch):
+        """The redactor must see the FULL line; truncating first can split a
+        credential so no pattern matches the surviving fragment. Mutation:
+        ``redact(ln[:120])`` -- red (the redactor sees a 120-char cut)."""
+        from kiro_crew.dashboard import chat_nav
+
+        seen: list[str] = []
+        monkeypatch.setattr(
+            chat_nav, "redact_log_via_context", lambda text: seen.append(text) or "<r>"
+        )
+        long_refusal = "I cannot access this link because " + "x" * 150
+        await _resolve_link_summaries(
+            self._state_replying(f"{long_refusal}\nA doc\n"),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert seen == [long_refusal]
+
+    @pytest.mark.asyncio
+    async def test_a_long_unspaced_script_label_is_still_stored(self):
+        """A 3-8 word katakana/Thai label can exceed the title guard's 24
+        unspaced characters; this path uses its own ceiling. Mutation: call the
+        guard with the title default -- red."""
+        label = "\u30bb\u30c3\u30b7\u30e7\u30f3\u30bf\u30a4\u30c8\u30eb\u30b8\u30a7\u30cd\u30ec\u30fc\u30bf\u30fc\u306e\u30ea\u30d5\u30a1\u30af\u30bf\u30ea\u30f3\u30b0"
+        assert len(label) == 25
+        result = await _resolve_link_summaries(
+            self._state_replying(f"{label}\nA doc\n"),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert result == [label, "A doc"]
+
+    @pytest.mark.asyncio
+    async def test_a_numbered_first_line_is_never_a_preamble(self):
+        """``1. Docs:`` is a slot even though it ends in a colon."""
+        result = await _resolve_link_summaries(
+            self._state_replying("1. Docs:\n2. Memory V2 Design Doc\n"),
+            [{"url": "https://a.com"}, {"url": "https://b.com"}],
+        )
+        assert result == ["Docs:", "Memory V2 Design Doc"]
 
     @pytest.mark.asyncio
     async def test_legitimate_short_labels_still_pass(self):

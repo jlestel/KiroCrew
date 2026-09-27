@@ -70,6 +70,7 @@ from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_
 from kiro_crew.label_guard import is_verdict_reply, looks_like_prose
 from kiro_crew.llm_helpers import background_turn
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.platform import redact_log_via_context
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -93,6 +94,12 @@ TITLE_TURN_TIMEOUT_SECS = 30.0
 
 #: The verdict the prompt asks for when the topic is not nameable yet.
 TITLE_SKIP_VERDICT = "SKIP"
+
+#: Unspaced-script ceiling for the prose guard. This prompt teaches 3-6 words
+#: but no character budget (the dashboard title's "~4-14 characters" hint is
+#: not sent here), so a legitimate Thai or long-katakana name can run past the
+#: title's 24; 40 keeps such a name while a refusal sentence still runs past it.
+TITLE_PROSE_MAX_UNSPACED_CHARS = 40
 
 #: session_key -> claim kind (``None`` for an in-flight automatic claim).
 _titled: "OrderedDict[str, str | None]" = OrderedDict()
@@ -208,8 +215,13 @@ def clean_title(raw: str) -> str:
         return ""
     title, _ = redact_exfiltration_urls(title)
     title, _ = redact_credentials(title)
-    if looks_like_prose(title):
-        logger.info("Auto-title reply is prose, discarding: %r", title[:120])
+    if looks_like_prose(title, max_unspaced_chars=TITLE_PROSE_MAX_UNSPACED_CHARS):
+        # Gate-side log line: the context-aware, non-raising redactor, so a
+        # host with a companion loaded is not scanned with the baseline pass.
+        # Redact BEFORE truncating: a cut can split a credential so no pattern
+        # matches the surviving fragment.
+        shown = redact_log_via_context(title)[:120]
+        logger.info("Auto-title reply is prose, discarding: %r", shown)
         return ""
     return title[:TITLE_MAX_CHARS]
 

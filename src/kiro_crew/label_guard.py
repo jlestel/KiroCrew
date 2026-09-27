@@ -131,6 +131,8 @@ def looks_like_prose(
     *,
     max_words: int = TITLE_MAX_WORDS,
     max_unspaced_chars: int = TITLE_MAX_UNSPACED_CHARS,
+    openers: tuple[str, ...] = PROSE_OPENERS,
+    sentence_shape: bool = True,
 ) -> bool:
     """True when an LLM label reply is a sentence about the task, not a label.
 
@@ -161,7 +163,12 @@ def looks_like_prose(
 
     The two ceilings default to the 3-6 word title contract; a path whose
     prompt asks for a longer label (the 18-word session summary) passes its
-    own so a legitimate long reply is not mistaken for prose.
+    own so a legitimate long reply is not mistaken for prose. ``openers`` lets
+    a path drop the entries that describe ITS legitimate output (a summary may
+    well open with "the conversation"), and ``sentence_shape=False`` turns off
+    the terminator and Korean-conjugation signals for a path whose label is a
+    descriptive sentence by contract -- those two signals tell a name from a
+    sentence, and cannot tell a summary from a refusal.
 
     Known false negative: a SHORT refusal in an unspaced script with no
     terminator ("无法访问该链接") clears every ceiling and lands as the label.
@@ -173,15 +180,17 @@ def looks_like_prose(
     if not stripped:
         return False
     lowered = stripped.lower()
-    if lowered.startswith(PROSE_OPENERS):
+    if lowered.startswith(openers):
         return True
     if stripped.startswith(KO_PROSE_OPENERS):
-        return True
-    if stripped.endswith(KO_SENTENCE_ENDINGS):
         return True
     if len(stripped.split()) > max_words:
         return True
     if unspaced_script_chars(stripped) > max_unspaced_chars:
+        return True
+    if not sentence_shape:
+        return False
+    if stripped.endswith(KO_SENTENCE_ENDINGS):
         return True
     for index, char in enumerate(stripped[:-1]):
         if char in ".!?" and stripped[index + 1].isspace():

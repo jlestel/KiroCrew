@@ -2697,26 +2697,36 @@ auto-language workspaces have always sent.
 
 Two consequences fall out of naming in a non-latin script:
 
-- **The prose guard needs a second ceiling.** `_looks_like_prose` rejects a reply
-  that is a sentence rather than a name, and its word ceiling counts
-  `str.split()` tokens — which is 1 for any length of Chinese, Japanese or Thai.
-  `_TITLE_MAX_UNSPACED_CHARS` bounds those scripts by character instead, counting
+- **The prose guard needs a second ceiling.** `label_guard.looks_like_prose`
+  (shared by every label path -- the session title, the Slack/Telegram
+  conversation name, the nav link chips and the session summary -- and reached
+  from `chat_title` through its `_looks_like_prose` alias) rejects a reply that
+  is a sentence rather than a name, and its word ceiling counts `str.split()`
+  tokens — which is 1 for any length of Chinese, Japanese or Thai.
+  `TITLE_MAX_UNSPACED_CHARS` bounds those scripts by character instead, counting
   only unspaced-script characters so latin identifiers in a mixed title stay
   free, and the full-width terminators `。！？` are matched without the ASCII
   rule's trailing-whitespace requirement (those scripts do not space after
-  punctuation). A short refusal with no terminator remains a documented false
-  negative for those unspaced scripts. Korean is spaced, so the word ceiling
-  bounds its long sentences, but a SHORT Korean refusal clears every other
-  check -- and Korean puts the refusal verb last, so English-style prefix
-  openers cannot catch it. `_looks_like_prose` therefore also matches Korean
-  sentence shape: the sentence-final polite conjugations
-  (`_TITLE_KO_SENTENCE_ENDINGS`, the formal "-nida" family and the
-  informal-polite "-yo" family) plus the apology opener
-  (`_TITLE_KO_PROSE_OPENERS`), which a title as a noun phrase never carries. A
-  plain-form (banmal) Korean refusal remains a documented false negative, and
-  a sentence-form Korean title loses to the fallback name -- the deliberate
-  direction of the trade, since a fallback name is still the user's own words
-  while a stored refusal is the bug.
+  punctuation). Both ceilings are parameters, because the prompts differ: the
+  title defaults (12 words / 24 characters) sit above its 3-6 word contract,
+  and the 18-word session summary passes its own. A short refusal with no
+  terminator remains a documented false negative for those unspaced scripts.
+  Korean is spaced, so the word ceiling bounds its long sentences, but a SHORT
+  Korean refusal clears every other check -- and Korean puts the refusal verb
+  last, so English-style prefix openers cannot catch it. `looks_like_prose`
+  therefore also matches Korean sentence shape: the sentence-final polite
+  conjugations (`KO_SENTENCE_ENDINGS`, the formal "-nida" family and the
+  informal-polite "-yo" family) plus the apology opener (`KO_PROSE_OPENERS`),
+  which a title as a noun phrase never carries. A plain-form (banmal) Korean
+  refusal remains a documented false negative, and a sentence-form Korean
+  title loses to the fallback name -- the deliberate direction of the trade,
+  since a fallback name is still the user's own words while a stored refusal
+  is the bug. The sentence-shape signals (terminators, Korean conjugation) and
+  the narration openers (`PROSE_OPENERS`) are parameters too, for the one path
+  whose label IS a descriptive sentence: the session summary runs the guard
+  with `sentence_shape=False` and without the conversation-referring openers,
+  since "the conversation covers ..." is its legitimate shape and a false
+  positive there is re-spent on a model turn at every later list.
 - **The reveal animation needs characters.** The sidebar types a new title in one
   word at a time; a single-token title skipped the animation entirely, so
   `_title_reveal_prefixes` steps unspaced scripts two characters at a time
@@ -2729,9 +2739,10 @@ It also keeps the reply's first line only -- the rule
 `SKIP` verdict followed by a reason collapses back to the bare control word.
 `_validate_title_reply` treats BOTH taught control words (`SKIP`, `KEEP`) as
 no-title sentinels on every path, matched case-insensitively, alone or with a
-punctuation-separated reason on one line (`_is_verdict_reply`) -- while a real
-title that merely opens with the word ("SKIP and KEEP handling", "KEEP-ALIVE
-header bug") survives.
+punctuation-separated reason on one line (`label_guard.is_verdict_reply`, the
+same check the messaging namer and the session summary run against their own
+taught word) -- while a real title that merely opens with the word ("SKIP and
+KEEP handling", "KEEP-ALIVE header bug") survives.
 
 ### Response verbosity reaches every agent
 

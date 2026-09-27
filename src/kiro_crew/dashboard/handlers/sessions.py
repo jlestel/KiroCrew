@@ -76,7 +76,7 @@ from kiro_crew.history import (
     transcript_stems,
     transcript_withholds_derivation,
 )
-from kiro_crew.label_guard import is_verdict_reply, looks_like_prose
+from kiro_crew.label_guard import PROSE_OPENERS, is_verdict_reply, looks_like_prose
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.mcp_discovery import sync_discovered_servers
 from kiro_crew.messaging.link import _in_namespace, canonical_key
@@ -1567,6 +1567,39 @@ _SUMMARIZE_TIMEOUT_SECS = (
 # contract: a legitimate long summary clears them, a refusal paragraph does not.
 _SUMMARIZE_PROSE_MAX_WORDS = 36
 _SUMMARIZE_PROSE_MAX_UNSPACED_CHARS = 72
+# A summary DESCRIBES the conversation, so the openers that mark a title reply
+# as narration ("the conversation covers ...", "based on the transcript ...")
+# are its legitimate shape here; the refusal openers stay. Likewise the
+# sentence-shape signals (a mid-line terminator, a Korean polite ending) tell a
+# name from a sentence and cannot tell a summary from a refusal, so the guard
+# runs without them on this path -- a false positive here is not free: the
+# summary is lost AND the model is re-asked on every later list until the
+# transcript changes, because "" is never cached.
+_SUMMARIZE_NARRATION_PREFIXES = ("the conversation", "this conversation", "based on the")
+_SUMMARIZE_PROSE_OPENERS = tuple(
+    opener for opener in PROSE_OPENERS if opener not in _SUMMARIZE_NARRATION_PREFIXES
+)
+# The exemption above is for the AFFIRMATIVE summary shape only. A refusal can
+# open the same way ("The conversation is too vague to summarize", "Based on
+# the transcript, I cannot determine a topic"), so a line that starts with one
+# of the exempted prefixes is still rejected when a refusal marker follows.
+_SUMMARIZE_REFUSAL_MARKERS = re.compile(
+    r"\b(?:cannot|can't|can not|unable|too (?:vague|short|brief|little)|not enough"
+    r"|insufficient|unclear|no clear|nothing to summari[sz]e|not possible"
+    r"|do(?:es)? not (?:contain|provide|have|include)|doesn't (?:contain|provide|have|include)"
+    r"|don't have|i need|would need)\b",
+    re.IGNORECASE,
+)
+
+
+def _summary_is_narrated_refusal(summary: str) -> bool:
+    """True for a refusal that opens with an exempted narration prefix."""
+    lowered = summary.strip().lower()
+    return lowered.startswith(_SUMMARIZE_NARRATION_PREFIXES) and bool(
+        _SUMMARIZE_REFUSAL_MARKERS.search(lowered)
+    )
+
+
 _SUMMARIZE_PROMPT = (
     "Summarize the following conversation in ONE terse line (max 18 words), "
     "describing what the user and assistant are working on. No preamble, no "
@@ -1662,15 +1695,20 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     except Exception:
         logger.debug("Session summary generation failed for %s", key, exc_info=True)
         return ""
-    summary = text.strip().strip('"').strip("'").strip(".")
+    # First line only: the prompt asks for ONE line, and a verdict followed by
+    # an explanation ("SKIP\n\nThe topic is unclear.") must reduce to the bare
+    # verdict rather than pass the checks below as a five-word "summary".
+    summary = text.strip().split("\n", 1)[0].strip().strip('"').strip("'").strip(".")
     if not summary or is_verdict_reply(summary, ("SKIP",)):
         return ""
     summary, _ = redact_exfiltration_urls(summary)
     summary, _ = redact_credentials(summary)
-    if looks_like_prose(
+    if _summary_is_narrated_refusal(summary) or looks_like_prose(
         summary,
         max_words=_SUMMARIZE_PROSE_MAX_WORDS,
         max_unspaced_chars=_SUMMARIZE_PROSE_MAX_UNSPACED_CHARS,
+        openers=_SUMMARIZE_PROSE_OPENERS,
+        sentence_shape=False,
     ):
         # The model refused or narrated instead of summarizing. Return "" so the
         # caller falls back to the stored title, and -- crucially -- do NOT reach

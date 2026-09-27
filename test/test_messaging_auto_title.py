@@ -1141,11 +1141,11 @@ class TestCleaning:
         ],
     )
     def test_a_refusal_or_sentence_is_not_stored_as_the_name(self, reply):
-        """#10375: the Slack/Telegram namer stored a model refusal as the
-        conversation name -- and Slack writes that name to the thread other
-        people see. The same prose guard the dashboard title has run since #1106
-        now applies here. Mutation: drop the ``looks_like_prose`` branch -- red
-        on every row (each is a sentence by opener, terminator or word count)."""
+        """A model refusal must not become the conversation name -- Slack writes
+        that name to the thread other people see. The same prose guard the
+        dashboard title runs applies here. Mutation: drop the
+        ``looks_like_prose`` branch -- red on every row (each is a sentence by
+        opener, terminator or word count)."""
         assert auto_title.clean_title(reply) == ""
 
     @pytest.mark.parametrize(
@@ -1158,9 +1158,9 @@ class TestCleaning:
         ],
     )
     def test_a_one_line_verdict_with_a_reason_means_no_title(self, reply):
-        """#10375: ``"SKIP - THE TOPIC IS NOT CLEAR YET" != "SKIP"``, so the
-        exact-equality test stored the verdict line as the name. Mutation:
-        restore ``title.upper() == TITLE_SKIP_VERDICT`` -- red on every row."""
+        """``"SKIP - THE TOPIC IS NOT CLEAR YET" != "SKIP"``, so an exact-equality
+        test stores the verdict line as the name. Mutation: replace the check
+        with ``title.upper() == TITLE_SKIP_VERDICT`` -- red on every row."""
         assert auto_title.clean_title(reply) == ""
 
     @pytest.mark.parametrize(
@@ -1181,8 +1181,28 @@ class TestCleaning:
         all survive. Mutation: make the guard reject everything -- red."""
         assert auto_title.clean_title(reply) == expected
 
+    def test_a_discarded_prose_reply_is_redacted_whole_before_truncation(self, monkeypatch):
+        """The redactor must see the FULL line; truncating first can split a
+        credential so no pattern matches the surviving fragment. Mutation:
+        ``redact(title[:120])`` -- red."""
+        seen: list[str] = []
+        monkeypatch.setattr(
+            auto_title, "redact_log_via_context", lambda text: seen.append(text) or "<r>"
+        )
+        long_refusal = "I cannot access that link because " + "x" * 150
+        assert auto_title.clean_title(long_refusal) == ""
+        assert seen == [long_refusal]
+
+    def test_a_long_unspaced_script_name_is_still_stored(self):
+        """This prompt teaches 3-6 words but no character budget, so a katakana
+        or Thai name may exceed the dashboard title's 24 unspaced characters;
+        this path uses its own ceiling. Mutation: use the title default -- red."""
+        name = "\u30bb\u30c3\u30b7\u30e7\u30f3\u30bf\u30a4\u30c8\u30eb\u30b8\u30a7\u30cd\u30ec\u30fc\u30bf\u30fc\u306e\u30ea\u30d5\u30a1\u30af\u30bf\u30ea\u30f3\u30b0"
+        assert len(name) == 25
+        assert auto_title.clean_title(name) == name
+
     def test_the_multi_line_verdict_still_means_no_title(self):
-        """The first-line reduction #10207 praised is unchanged."""
+        """The first-line reduction still collapses a multi-line verdict."""
         assert auto_title.clean_title("SKIP\n\nThe topic is unclear.") == ""
 
 

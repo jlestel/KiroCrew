@@ -185,6 +185,12 @@ workspace-scoped by default (fail-closed via `_caller_workspace`/`_ws_bucket`,
   one-line LLM summary per session — MCP core has no LLM access, so the LLM leg
   runs gateway-side on an ephemeral background session (cheap Haiku model),
   bounded to 8 sessions and best-effort (falls back to the title on any failure).
+  The reply is shape-checked before anything is stored: the taught `SKIP`
+  verdict, alone or with a reason, and a refusal (`label_guard.looks_like_prose`
+  with the summary's own ceilings, without the conversation-referring openers
+  and without the sentence-shape signals, since a summary is a sentence by
+  contract) both return `""` — never a cached value — so one model refusal is
+  not served on every later list until the transcript changes.
   A generated summary is cached in a **sidecar file** (`sessions/.summaries/`),
   never in the session JSONL, keyed by the session file mtime — so summarizing an
   active session never rewrites (and cannot clobber a concurrently-appended

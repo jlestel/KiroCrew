@@ -269,6 +269,8 @@ class TestSessionsSummarizeHandler:
             "Discarding summary for alpha: the transcript became restricted during "
             "summarisation" in caplog.text
         )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "reply",
         [
@@ -277,13 +279,17 @@ class TestSessionsSummarizeHandler:
             "As an AI, I do not have access to the linked document",
             "SKIP, the topic is unclear",
             "SKIP - only a greeting so far",
+            "SKIP\n\nThe topic is unclear.",
+            "The conversation is too vague to summarize",
+            "This conversation does not contain enough information",
+            "Based on the transcript, I cannot determine a topic",
         ],
     )
     async def test_a_refusal_or_verdict_reason_is_not_served_or_cached(self, tmp_path, reply):
-        """#10375: the session summary tested only ``summary.upper() == "SKIP"``
-        and then persisted the reply through the sidecar cache, so one refusal
-        sentence (or ``SKIP, <reason>``) was served on every later list until
-        the transcript changed. Neither may be returned NOR cached. Mutation:
+        """An exact ``summary.upper() == "SKIP"`` test lets a refusal sentence
+        (or ``SKIP, <reason>``) through to the sidecar cache, where it is served
+        on every later list until the transcript changes. Neither may be
+        returned NOR cached. Mutation:
         drop the ``looks_like_prose`` branch / restore the exact-equality test
         -- red on the response AND on the cache read."""
         log = ConversationLog(base_dir=tmp_path)
@@ -297,6 +303,17 @@ class TestSessionsSummarizeHandler:
         assert not log.get_cached_summary("alpha")
 
     @pytest.mark.asyncio
+    async def test_only_the_first_line_of_a_multi_line_reply_is_the_summary(self, tmp_path):
+        """The prompt asks for ONE line; an unasked-for explanation after it is
+        not part of the summary. Mutation: keep the whole reply -- red."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "help me tune the redis timeout")
+        reply = "Tuning the redis client timeout\n\nThe user also mentioned retries."
+        async with TestClient(TestServer(_make_app(log, reply, []))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert (await resp.json())["summaries"]["alpha"] == "Tuning the redis client timeout"
+
+    @pytest.mark.asyncio
     async def test_a_legitimate_long_summary_is_still_stored(self, tmp_path):
         """The summary contract is 18 words, three times the title's, so the
         title's 12-word ceiling must NOT apply here. Mutation: call the guard
@@ -306,6 +323,32 @@ class TestSessionsSummarizeHandler:
             "backoff and verify against staging"
         )
         assert 12 < len(reply.split()) <= 18
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "help me tune the redis timeout")
+        async with TestClient(TestServer(_make_app(log, reply, []))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert (await resp.json())["summaries"]["alpha"] == reply
+        assert log.get_cached_summary("alpha") == reply
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "The conversation covers tuning the redis client timeout",
+            "This conversation is about a Tailwind v4 migration",
+            "Based on the transcript, user and assistant debug a flaky login test",
+            "User tunes the redis timeout. Assistant adds retry with backoff",
+            "\uc0ac\uc6a9\uc790\uac00 redis \ud0c0\uc784\uc544\uc6c3\uc744 \uc870\uc815\ud569\ub2c8\ub2e4",
+        ],
+    )
+    async def test_a_summary_shaped_reply_is_stored_and_cached(self, tmp_path, reply):
+        """A summary DESCRIBES the conversation, so the title guard's narration
+        openers, mid-line terminator and Korean polite ending are its legitimate
+        shape here. Rejecting one loses the summary AND re-asks the model on
+        every later list, because "" is never cached. The exemption is for the
+        affirmative shape only: a refusal opening the same way is still
+        rejected (see the refusal rows above). Mutation: pass the title
+        defaults for ``openers`` / ``sentence_shape`` -- red."""
         log = ConversationLog(base_dir=tmp_path)
         log.append("alpha", "user", "help me tune the redis timeout")
         async with TestClient(TestServer(_make_app(log, reply, []))) as c:
