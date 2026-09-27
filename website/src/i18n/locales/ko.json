@@ -7558,8 +7558,8 @@
       "configured_default_marker": "설정된 기본값",
       "reasoning_effort": "추론 강도",
       "smarter": "똑똑하게",
-      "use_configured_default": "설정된 기본값 사용",
-      "use_model_default": "모델 기본값 사용"
+      "use_configured_default": "기본 추론 강도 사용 ({{level}})",
+      "use_default_effort": "기본 추론 강도 사용"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "조직 레지스트리를 추가하여 팀 전용 앱을 찾아보세요",

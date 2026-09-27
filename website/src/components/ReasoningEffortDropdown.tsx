@@ -188,10 +188,15 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
   const atMax = !isDefault && idx >= maxIdx
   // Turning the toggle on clears the per-slot override — which yields the
   // Settings default when one is configured, and only the model's own choice
-  // when it is not. Label each case for what it actually does.
+  // when it is not. The row sits right under the model list, so the label
+  // names EFFORT: a bare "model default" there reads as being about which
+  // model runs. Both states share ONE stem ("Use default effort") and differ
+  // only by the level suffix a configured default adds: the reader should not
+  // have to open Settings to learn what "default" will run at, and two stems
+  // for one switch read as two different controls.
   const defaultToggleLabel = defaultEffort
-    ? i18nT('components.reasoningEffortDropdown.use_configured_default')
-    : i18nT('components.reasoningEffortDropdown.use_model_default')
+    ? i18nT('components.reasoningEffortDropdown.use_configured_default', { level: effortLabel(defaultEffort) })
+    : i18nT('components.reasoningEffortDropdown.use_default_effort')
 
   return (
     <div className={embedded ? 'px-3 py-2.5' : 'rounded-lg bg-bg-elevated border border-border px-4 py-3.5 w-[240px] max-w-[calc(100vw-16px)]'}>
@@ -211,7 +216,10 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
             </motion.span>
           </AnimatePresence>
         </span>
-        <span className="ml-auto flex"><InfoTip text={i18nT('components.reasoningEffortDropdown.effort_help')} placement="top" /></span>
+        {/* A Tab stop for the embedding model picker's routing (see
+            routeModelPickerKeys): without the mark, routed Tab from the filter
+            or the manage row skips straight to the slider. */}
+        <span className="ml-auto flex"><InfoTip text={i18nT('components.reasoningEffortDropdown.effort_help')} placement="top" buttonProps={{ 'data-model-picker-stop': '' }} /></span>
       </div>
       <Slider
         aria-label={i18nT('components.reasoningEffortDropdown.reasoning_effort')}

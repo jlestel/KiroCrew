@@ -5059,8 +5059,8 @@
       "faster": "Faster",
       "reasoning_effort": "Reasoning effort",
       "smarter": "Smarter",
-      "use_configured_default": "Use configured default",
-      "use_model_default": "Use model default"
+      "use_configured_default": "Use default effort ({{level}})",
+      "use_default_effort": "Use default effort"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Add an org registry to discover team-specific apps",

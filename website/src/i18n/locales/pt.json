@@ -7792,8 +7792,8 @@
       "configured_default_marker": "Padrão configurado",
       "reasoning_effort": "Esforço de raciocínio",
       "smarter": "Mais inteligente",
-      "use_configured_default": "Usar o padrão configurado",
-      "use_model_default": "Usar o padrão do modelo"
+      "use_configured_default": "Usar o esforço padrão ({{level}})",
+      "use_default_effort": "Usar o esforço padrão"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Adicione um registro da organização para descobrir apps específicos da equipe",

@@ -7675,8 +7675,8 @@
       "configured_default_marker": "कॉन्फ़िगर किया गया डिफ़ॉल्ट",
       "reasoning_effort": "रीज़निंग प्रयास",
       "smarter": "अधिक स्मार्ट",
-      "use_configured_default": "कॉन्फ़िगर किया गया डिफ़ॉल्ट उपयोग करें",
-      "use_model_default": "मॉडल का डिफ़ॉल्ट उपयोग करें"
+      "use_configured_default": "डिफ़ॉल्ट प्रयास उपयोग करो ({{level}})",
+      "use_default_effort": "डिफ़ॉल्ट प्रयास उपयोग करो"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "टीम-विशिष्ट ऐप्स खोजने के लिए संगठन की रजिस्ट्री जोड़ें",

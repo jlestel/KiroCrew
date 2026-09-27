@@ -37,6 +37,7 @@ import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import ModelDropdownList from './ModelDropdownList'
 import ReasoningEffortDropdown from './ReasoningEffortDropdown'
 import { ManageModelsFooter } from './ModelEffortDropdown'
+import { routeModelPickerKeys } from './modelPickerKeyRouting'
 import { settingsPath } from './settingsPath'
 import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
@@ -52,6 +53,7 @@ import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, 
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { useAppSelector, useAppDispatch, store } from '../store'
 import { PANE_HYDRATE_LIMIT, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
@@ -631,24 +633,10 @@ export default function ChatPane({
     [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel, codexPairModels],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
-  const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
-  const reasoningEffortDropdownRef = useRef<HTMLDivElement>(null)
   // Picker anchors: keep each portaled menu glued to the ChatInput chip that
   // opened it while the menu is open (#10616, same class as #10580).
   const { rect: agentBtnRect, anchorTo: anchorAgentBtn } = useAnchoredTriggerRect(agentDD.open)
   const { rect: modelBtnRect, anchorTo: anchorModelBtn } = useAnchoredTriggerRect(modelDD.open)
-  const { rect: reasoningEffortBtnRect, anchorTo: anchorReasoningEffortBtn } = useAnchoredTriggerRect(reasoningEffortDropdown)
-  useEffect(() => {
-    if (!reasoningEffortDropdown) return
-    const closeOutside = (event: MouseEvent) => {
-      if (reasoningEffortDropdownRef.current?.contains(event.target as Node)) return
-      const rect = reasoningEffortBtnRect
-      if (rect && event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom) return
-      setReasoningEffortDropdown(false)
-    }
-    document.addEventListener('mousedown', closeOutside)
-    return () => document.removeEventListener('mousedown', closeOutside)
-  }, [reasoningEffortDropdown, reasoningEffortBtnRect])
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The slot's own `model_withheld` verdict answers that when the
   // backend has one; the degraded flag gates only the list-membership fallback —
@@ -820,6 +808,12 @@ export default function ChatPane({
     onEnterSingleMatch: () => { switchModel(modelDD.filtered[0].name); modelDD.setOpen(false) },
     closeToTrigger: () => modelDD.setOpen(false),
   })
+  // The pane's model picker embeds the reasoning-effort slider below the list
+  // (one control, see ModelEffortDropdown and
+  // docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md).
+  // Keys route through the same helper as ModelEffortDropdown; the IME guard
+  // claims a Tab before the helper re-aims it into the embedded controls.
+  const modelDialogIme = useImeGuard()
 
   // File upload as a mutation (isPending replaces a manual `uploading` flag).
   //
@@ -1901,11 +1895,9 @@ export default function ChatPane({
           agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
           modelName={shownModel}
           reasoningEffort={effectiveEffort}
-          separateEffort={effortSupported}
-          onReasoningEffortClick={effortSupported ? (rect, trigger) => {
-            anchorReasoningEffortBtn(rect, trigger)
-            setReasoningEffortDropdown(!reasoningEffortDropdown)
-          } : undefined}
+          // Effort is edited inside the model picker below; the chip only
+          // names the level in force.
+          hasEffort={effortSupported}
           modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
           // See ChatPage: the slot's RAW model, because `shownModel` substitutes
           // the served id and would hide every routed turn.
@@ -2039,17 +2031,29 @@ export default function ChatPane({
             role="dialog"
             aria-label={i18nT('components.chatPane.model_list')}
             tabIndex={-1}
-            onKeyDown={onModelListKeyDown}
-            className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl min-w-[252px] max-w-[348px] flex flex-col p-1 gap-0.5 animate-slide-up"
-            style={(() => { const left = Math.max(8, Math.min(modelBtnRect.left, window.innerWidth - 348)); return { bottom: window.innerHeight - modelBtnRect.top + 4, left } })()}
+            onKeyDown={event => routeModelPickerKeys(event, modelDialogIme.claimKey, onModelListKeyDown)}
+            className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl min-w-[252px] max-w-[348px] flex flex-col p-1 overflow-hidden animate-slide-up"
+            /* Capped to the space above the chip, like ModelEffortDropdown: the
+               effort block below the list adds height, and a short split pane
+               would otherwise let the dialog grow past the viewport top. The
+               model list shrinks first (min-h-0); once the cap drops below the
+               fixed rows' own height the body column scrolls instead of
+               clipping the effort block. */
+            style={(() => { const left = Math.max(8, Math.min(modelBtnRect.left, window.innerWidth - 348)); return { bottom: window.innerHeight - modelBtnRect.top + 4, left, maxHeight: Math.max(0, modelBtnRect.top - 12) } })()}
           >
-            <div className="px-1.5 pt-1.5 pb-1">
+           <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto">
+            <div className="shrink-0 px-1.5 pt-1.5 pb-1">
               <input
                 ref={modelDD.inputRef}
                 type="text"
                 aria-label={i18nT('components.chatPane.type_to_filter')}
                 placeholder={i18nT('components.chatPane.type_to_filter')}
                 value={modelDD.filter}
+                /* Tracks composition for the dialog's Tab claim (see
+                   routeModelPickerKeys): the latch has to see the composition
+                   to know a Tab inside the post-composition window is the
+                   IME's, not the user's. */
+                {...modelDialogIme.bindComposition<HTMLInputElement>()}
                 onChange={(e) => modelDD.setFilter(e.target.value)}
                 /* Enter/Escape live on the portal container's onListKeyDown
                    (useListboxKeyboard), which claims Enter against IME
@@ -2059,7 +2063,7 @@ export default function ChatPane({
               />
             </div>
             {hiddenModelsQ.isError && (
-              <div className="flex items-center gap-2 px-1.5 py-1">
+              <div className="flex shrink-0 items-center gap-2 px-1.5 py-1">
                 {/* No hand-off: this pane's composer may hold an unsent draft.
                     Retry keeps the user in the owning chat. */}
                 <ErrorNotice
@@ -2073,7 +2077,7 @@ export default function ChatPane({
               </div>
             )}
             {paneRemoteCrew.failed && (
-              <div className="flex items-center gap-2 px-1.5 py-1">
+              <div className="flex shrink-0 items-center gap-2 px-1.5 py-1">
                 {/* No hand-off: this pane's composer may hold an unsent draft.
                     Retry keeps the user in the owning chat. */}
                 <ErrorNotice
@@ -2087,32 +2091,29 @@ export default function ChatPane({
                 </Btn>
               </div>
             )}
-            <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
+            <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="min-h-0 flex-1 overflow-y-auto max-h-[280px]">
               <ModelDropdownList models={modelDD.filtered} activeModel={jevRouteShownModel(shownModel, paneSlot)} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)
               navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: 'key:dashboard.model_picker_hidden_models' }))
             }} />}
-          </div>,
-          document.body,
-        )}
-        {reasoningEffortDropdown && reasoningEffortBtnRect && effortSupported && createPortal(
-          <div
-            ref={reasoningEffortDropdownRef}
-            className="fixed z-[9999] animate-slide-up"
-            style={{
-              bottom: window.innerHeight - reasoningEffortBtnRect.top + 4,
-              left: Math.max(8, Math.min(reasoningEffortBtnRect.left, window.innerWidth - Math.min(240, window.innerWidth - 16) - 8)),
-            }}
-          >
-            <ReasoningEffortDropdown
-              slot={slotKey}
-              currentEffort={paneSlot?.reasoning_effort || legacyCodexEffort(paneSlot?.model || '', '', codexPairModels)}
-              defaultEffort={defaultEffort}
-              levelsOverride={effortLevelsOverride}
-              onClose={() => setReasoningEffortDropdown(false)}
-            />
+            {/* Reasoning effort lives INSIDE the model picker (one control),
+                fed by the slot's ACP capability read: the agent's own answer
+                decides whether the row exists and which levels it offers. */}
+            {effortSupported && (
+              <div className="mt-0.5 shrink-0 border-t border-border">
+                <ReasoningEffortDropdown
+                  slot={slotKey}
+                  currentEffort={paneSlot?.reasoning_effort || legacyCodexEffort(paneSlot?.model || '', '', codexPairModels)}
+                  defaultEffort={defaultEffort}
+                  levelsOverride={effortLevelsOverride}
+                  onClose={() => modelDD.setOpen(false)}
+                  embedded
+                />
+              </div>
+            )}
+           </div>
           </div>,
           document.body,
         )}

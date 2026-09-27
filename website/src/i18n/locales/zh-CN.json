@@ -7558,8 +7558,8 @@
       "configured_default_marker": "已配置默认值",
       "reasoning_effort": "推理强度",
       "smarter": "更聪明",
-      "use_configured_default": "使用已配置的默认值",
-      "use_model_default": "使用模型默认值"
+      "use_configured_default": "使用默认推理强度（{{level}}）",
+      "use_default_effort": "使用默认推理强度"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "添加组织注册表以发现团队专属应用",

@@ -3,8 +3,14 @@ import { createPortal } from 'react-dom'
 
 import { i18nT } from '../i18n/t'
 
-/** Tiny ? button that shows a tooltip on click. Portal-rendered to escape overflow clipping. */
-export default function InfoTip({ text, placement = 'auto' }: { text: string; placement?: 'auto' | 'top' }) {
+/** Tiny ? button that shows a tooltip on click. Portal-rendered to escape overflow clipping.
+ *  `buttonProps` lets a host mark the button (e.g. a `data-*` hook for its own
+ *  keyboard routing); the tip's own attributes win over it. */
+export default function InfoTip({ text, placement = 'auto', buttonProps }: {
+  text: string
+  placement?: 'auto' | 'top'
+  buttonProps?: Record<`data-${string}`, string>
+}) {
   const [open, setOpen] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
@@ -46,6 +52,7 @@ export default function InfoTip({ text, placement = 'auto' }: { text: string; pl
   return (
     <>
       <button
+        {...buttonProps}
         ref={btnRef}
         /* The visible glyph is a bare "?", which assistive technology announces as
            "question mark" — a control with no discoverable purpose. The NAME is a

@@ -6,8 +6,8 @@ import type { ModelInfo } from '../providers/types'
 const EFFORT_SUFFIX = /^(.*)\[(low|medium|high|xhigh|max)\]$/
 
 /** Codex advertises each model/effort pair as a model ID. Keep the base model
- *  visible while effort is selected through its own control. Window suffixes
- *  such as [1m] remain part of the model ID. */
+ *  visible while effort is selected through the slider embedded in the model
+ *  picker. Window suffixes such as [1m] remain part of the model ID. */
 export function modelWithoutEffort(name: string): string {
   return EFFORT_SUFFIX.exec(name)?.[1] || name
 }
@@ -53,12 +53,12 @@ export function filterInteractiveModels(
   models: ModelInfo[],
   hiddenModels: readonly string[],
   activeModels: readonly string[] = [],
-  separateEffort = false,
+  groupEffortPairs = false,
 ): ModelInfo[] {
   const hidden = new Set(hiddenModels)
   const kept = new Set(activeModels.filter(Boolean))
   const visible = models.filter(model => model.name === 'auto' || kept.has(model.name) || !hidden.has(model.name))
-  if (!separateEffort) return visible
+  if (!groupEffortPairs) return visible
 
   const seen = new Set<string>()
   const baseModels = new Map(visible.filter(model => modelWithoutEffort(model.name) === model.name).map(model => [model.name, model]))

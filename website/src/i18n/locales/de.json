@@ -7675,8 +7675,8 @@
       "configured_default_marker": "Konfigurierter Standard",
       "reasoning_effort": "Denkaufwand",
       "smarter": "Intelligenter",
-      "use_configured_default": "Konfigurierten Standard verwenden",
-      "use_model_default": "Modellstandard verwenden"
+      "use_configured_default": "Standardaufwand verwenden ({{level}})",
+      "use_default_effort": "Standardaufwand verwenden"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Fügen Sie eine Organisations-Registry hinzu, um teamspezifische Apps zu entdecken",

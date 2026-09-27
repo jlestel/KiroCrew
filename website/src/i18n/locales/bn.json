@@ -7675,8 +7675,8 @@
       "configured_default_marker": "কনফিগার করা ডিফল্ট",
       "reasoning_effort": "রিজনিং প্রচেষ্টা",
       "smarter": "আরও বুদ্ধিমান",
-      "use_configured_default": "কনফিগার করা ডিফল্ট ব্যবহার করুন",
-      "use_model_default": "মডেলের ডিফল্ট ব্যবহার করুন"
+      "use_configured_default": "ডিফল্ট প্রচেষ্টা ব্যবহার করো ({{level}})",
+      "use_default_effort": "ডিফল্ট প্রচেষ্টা ব্যবহার করো"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "টিম-নির্দিষ্ট অ্যাপ খুঁজে পেতে প্রতিষ্ঠানের একটি রেজিস্ট্রি যোগ করুন",

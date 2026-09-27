@@ -7792,8 +7792,8 @@
       "configured_default_marker": "Predefinito configurato",
       "reasoning_effort": "Livello di ragionamento",
       "smarter": "Più intelligente",
-      "use_configured_default": "Usa il valore predefinito configurato",
-      "use_model_default": "Usa il valore predefinito del modello"
+      "use_configured_default": "Usa il livello predefinito ({{level}})",
+      "use_default_effort": "Usa il livello predefinito"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Aggiungi un registry dell'organizzazione per scoprire app specifiche del team",

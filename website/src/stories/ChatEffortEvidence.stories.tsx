@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { configureStore } from '@reduxjs/toolkit'
@@ -7,15 +7,16 @@ import { Provider } from 'react-redux'
 import ChatInput from '../components/ChatInput'
 import ErrorNotice from '../components/ErrorNotice'
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
-import ReasoningEffortDropdown from '../components/ReasoningEffortDropdown'
 import { filterInteractiveModels, shouldSeparateModelEffort } from '../hooks/useInteractiveModels'
 import { i18nT } from '../i18n/t'
 import chatReducer from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 
-/** Visual fixture: real composer controls with representative ACP capability data. */
-type State = 'default' | 'selected' | 'compact' | 'tiny-split-pane' | 'models' | 'effort-menu' | 'read-error'
+/** Visual fixture: real composer controls with representative ACP capability data.
+ *  Model + effort are ONE control: the effort slider lives inside the model
+ *  picker (docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md). */
+type State = 'default' | 'selected' | 'compact' | 'tiny-split-pane' | 'tiny-split-pane-models' | 'models' | 'models-configured-default' | 'read-error'
 
 const advertisedModels = [
   { name: 'gpt-6-sol[low]', description: '' },
@@ -34,9 +35,32 @@ function ChatEffortEvidence({ state }: { state: State }) {
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
   }))
   const compact = state === 'compact'
-  const tinySplitPane = state === 'tiny-split-pane'
+  // 'tiny-split-pane-models' is the short pane with its picker OPEN: the pane
+  // hangs from the viewport top so its chip sits ~300px down, and the picker
+  // is capped to that space (the model list, not the filter, shrinks).
+  const tinySplitPaneModels = state === 'tiny-split-pane-models'
+  const tinySplitPane = state === 'tiny-split-pane' || tinySplitPaneModels
   const readError = state === 'read-error'
-  const selected = state === 'selected' || state === 'compact' || state === 'effort-menu'
+  // The open picker over the composer. 'models' carries a per-slot override
+  // (toggle reads "Use default effort"); 'models-configured-default' runs at
+  // the configured default instead, so the toggle names its level.
+  const pickerOpen = state === 'models' || state === 'models-configured-default' || tinySplitPaneModels
+  const configuredDefault = state === 'models-configured-default'
+  const selected = state === 'selected' || state === 'compact' || state === 'models' || tinySplitPaneModels
+  // The short pane's picker anchors to the chip the pane actually renders, so
+  // the cap in the frame is the one the product computes for that geometry.
+  const paneRef = useRef<HTMLDivElement>(null)
+  const [chipRect, setChipRect] = useState<DOMRect | null>(null)
+  useLayoutEffect(() => {
+    if (!tinySplitPaneModels) return
+    setChipRect(paneRef.current?.querySelector('[data-testid="composer-model-chip"]')?.getBoundingClientRect() ?? null)
+  }, [tinySplitPaneModels])
+  // What the chip is handed: ChatPage/ChatPane pass the effort IN FORCE
+  // (per-slot override, else the configured default), so a slot running at a
+  // configured "high" shows "· High" on the chip -- never a bare "· Default".
+  // The fixture must hand the chip the same resolved value or the screenshot
+  // shows a state the product never renders.
+  const chipEffort = selected || configuredDefault ? 'high' : ''
   const pairIds = shouldSeparateModelEffort(true, advertisedModels)
   const groupedModels = filterInteractiveModels(advertisedModels, [], [], pairIds)
   const shownModels = groupedModels.filter(model => model.name.toLowerCase().includes(filter.toLowerCase()))
@@ -44,11 +68,11 @@ function ChatEffortEvidence({ state }: { state: State }) {
   return (
     <QueryClientProvider client={queryClient}>
       <Provider store={store}>
-        <div style={{
+        <div ref={paneRef} style={{
           width: tinySplitPane ? 157 : compact ? 312 : 680,
           position: 'absolute', left: tinySplitPane ? 24 : compact ? 460 : 276,
-          bottom: 72,
-          ...(tinySplitPane ? { height: 420, border: '1px solid var(--border)', display: 'flex', flexDirection: 'column' as const, justifyContent: 'space-between' } : {}),
+          ...(tinySplitPaneModels ? { top: 24 } : { bottom: 72 }),
+          ...(tinySplitPane ? { height: tinySplitPaneModels ? 300 : 420, border: '1px solid var(--border)', display: 'flex', flexDirection: 'column' as const, justifyContent: 'space-between' } : {}),
         }}>
           {tinySplitPane && <div className="border-b border-border px-2 py-1 text-[11px] text-muted">Split pane · 157px</div>}
           {/* No hand-off: navigating away would discard the unsent composer draft. */}
@@ -66,14 +90,13 @@ function ChatEffortEvidence({ state }: { state: State }) {
             providerId="acp"
             modelName="gpt-6-sol"
             onModelClick={() => {}}
-            reasoningEffort={selected ? 'high' : ''}
-            onReasoningEffortClick={readError ? undefined : () => {}}
-            separateEffort
+            reasoningEffort={chipEffort}
+            hasEffort={!readError}
           />
         </div>
-        {state === 'models' && (
+        {pickerOpen && (!tinySplitPaneModels || chipRect) && (
           <ModelEffortDropdown
-            anchorRect={new DOMRect(686, 760, 190, 28)}
+            anchorRect={tinySplitPaneModels && chipRect ? chipRect : new DOMRect(686, 760, 190, 28)}
             dropdownRef={() => {}}
             inputRef={() => {}}
             models={shownModels}
@@ -81,18 +104,14 @@ function ChatEffortEvidence({ state }: { state: State }) {
             onSelectModel={() => {}}
             filter={filter}
             setFilter={setFilter}
+            onClose={() => {}}
+            hasEffort
+            slot="evidence-preview"
+            currentEffort={configuredDefault ? '' : 'high'}
+            defaultEffort={configuredDefault ? 'high' : ''}
+            effortLevelsOverride={['low', 'medium', 'high']}
             onListKeyDown={() => {}}
           />
-        )}
-        {state === 'effort-menu' && (
-          <div style={{ position: 'absolute', left: 660, bottom: 180 }}>
-            <ReasoningEffortDropdown
-              slot="evidence-preview"
-              currentEffort="high"
-              levelsOverride={['low', 'medium', 'high', 'xhigh', 'max']}
-              onClose={() => {}}
-            />
-          </div>
         )}
       </Provider>
     </QueryClientProvider>
@@ -112,6 +131,7 @@ export const Default: Story = {}
 export const Selected: Story = { args: { state: 'selected' } }
 export const Compact: Story = { args: { state: 'compact' } }
 export const TinySplitPane: Story = { args: { state: 'tiny-split-pane' } }
+export const TinySplitPaneModels: Story = { args: { state: 'tiny-split-pane-models' } }
 export const GroupedModels: Story = { args: { state: 'models' } }
-export const EffortMenu: Story = { args: { state: 'effort-menu' } }
+export const GroupedModelsConfiguredDefault: Story = { args: { state: 'models-configured-default' } }
 export const ReadError: Story = { args: { state: 'read-error' } }

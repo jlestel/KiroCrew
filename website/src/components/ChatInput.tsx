@@ -1,6 +1,6 @@
 import { Component, useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo, lazy, Suspense } from 'react'
 import { markComposerResize } from '../utils/composerResize'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, BrainCircuit, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
 import SketchDialog from './SketchDialog'
 import AppIcon from './AppIcon'
 import CopyBranchButton from './CopyBranchButton'
@@ -629,8 +629,11 @@ interface ChatInputProps {
   stopState?: 'idle' | 'soft_pending' | 'killing'
   approvalMode?: string
   reasoningEffort?: string
-  onReasoningEffortClick?: (rect: DOMRect, trigger: HTMLElement) => void
-  separateEffort?: boolean
+  /** True when the session's model takes a reasoning-effort level. The chip
+   *  then names the level in force beside the model; the slider that CHANGES
+   *  it lives inside the model picker the chip opens -- model + effort are one
+   *  control, never a second composer button (docs/decisions/2026-06-14). */
+  hasEffort?: boolean
   providerId?: string
   /** Invoked when an @-mention picks a file or directory. `kind` defaults to
    *  'file'. `token` is the exact composer text the pick inserted (e.g.
@@ -1001,8 +1004,7 @@ function ChatInput({
   stopState,
   approvalMode,
   reasoningEffort,
-  onReasoningEffortClick,
-  separateEffort,
+  hasEffort,
   providerId: _providerId,
   onFileSelect,
   onFileOpen,
@@ -1512,9 +1514,10 @@ function ChatInput({
   // Below ~340px the labels no longer fit comfortably alongside the context bar
   // + model chip, so collapse the chips (agent/project) to icon-only.
   const shelfCompact = shelfWidth < 340
-  // A two-column split can leave under 200px per composer. Keep the value
-  // visible at ordinary compact widths, but let the title/aria label carry it
-  // when even the other shelf chips have no room for text.
+  // A two-column split can leave under 200px per composer. The effort level on
+  // the model chip is the only at-a-glance readout of what a turn runs at, so
+  // it survives the compact collapse and drops only when even a short word has
+  // no room (the picker the chip opens always shows the level in force).
   const shelfTiny = shelfWidth < 220
   // Tooltip for the project chip. The chip itself shows the basename (plus the
   // branch when known); the tooltip carries the full path so nothing that was
@@ -5256,7 +5259,21 @@ function ChatInput({
             </div>
             )
           })()}
-          {onModelClick && modelName && (
+          {onModelClick && modelName && (() => {
+            // The chip shows the level in every state (running, routed, pinned
+            // or inherited), so its title / accessible name carries it in every
+            // state too -- one suffix, appended to each branch.
+            const effortSuffix = hasEffort
+              ? ` · ${i18nT('components.reasoningEffortDropdown.reasoning_effort')}: ${effortLabel(reasoningEffort || '')}`
+              : ''
+            const modelChipLabel = `${isRunning
+              ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
+              : modelIsJevRouted
+                ? i18nT('pages.chatPage.model_auto_jev_description')
+                : modelIsInheritedDefault
+                  ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                  : i18nT('components.chatInput.model_2', { name: modelName })}${effortSuffix}`
+            return (
             <button
               className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
               onMouseDown={() => {
@@ -5274,20 +5291,12 @@ function ChatInput({
               // the label, and the explanation on hover (title) AND keyboard
               // focus / screen readers (aria-label), because a bare served id
               // reads exactly like a pin. A pinned chip keeps the plain hint.
-              title={isRunning
-                ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsJevRouted
-                  ? i18nT('pages.chatPage.model_auto_jev_description')
-                  : modelIsInheritedDefault
-                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                    : i18nT('components.chatInput.model_2', { name: modelName })}
-              aria-label={isRunning
-                ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsJevRouted
-                  ? i18nT('pages.chatPage.model_auto_jev_description')
-                  : modelIsInheritedDefault
-                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                    : i18nT('components.chatInput.model_2', { name: modelName })}
+              // The effort level rides along on both: `aria-label` REPLACES the
+              // chip's content in the accessible name, so without it a screen
+              // reader never hears the level the chip shows, and the tooltip is
+              // the only readout left when the shelf is too narrow to show it.
+              title={modelChipLabel}
+              aria-label={modelChipLabel}
             >
               <span className="truncate max-w-[180px]">
                 {modelIsJevRouted ? i18nT('components.modelDropdownList.auto_jev') : modelName}
@@ -5304,30 +5313,15 @@ function ChatInput({
                   <span className="opacity-60 shrink-0">{i18nT('components.agentSelector.default')}</span>
                 </>
               )}
-              {onReasoningEffortClick && !separateEffort && !shelfCompact && (
+              {hasEffort && !shelfTiny && (
                 <>
                   <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
                   <span className="opacity-60 shrink-0">{effortLabel(reasoningEffort || '')}</span>
                 </>
               )}
             </button>
-          )}
-          {separateEffort && onReasoningEffortClick && (
-            <div className="ml-1 pl-1 border-l border-border flex items-center shrink-0">
-              <Btn
-                type="button"
-                className={`inline-flex items-center h-7 gap-1.5 text-[12px] text-muted hover:text-text rounded-md border-none bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors ${shelfCompact ? 'px-1' : 'px-2'}`}
-                aria-label={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
-                title={`${i18nT('components.reasoningEffortDropdown.reasoning_effort')}: ${effortLabel(reasoningEffort || '')}`}
-                disabled={isRunning}
-                onClick={e => onReasoningEffortClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
-                data-testid="composer-effort-chip"
-              >
-                <BrainCircuit size={13} className="shrink-0 opacity-70" aria-hidden="true" />
-                {!shelfTiny && <span className="whitespace-nowrap">{i18nT('components.reasoningEffortDropdown.effort')}: {effortLabel(reasoningEffort || '')}</span>}
-              </Btn>
-            </div>
-          )}
+            )
+          })()}
           </div>
         </div>
       )}

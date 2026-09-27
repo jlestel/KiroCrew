@@ -7558,8 +7558,8 @@
       "configured_default_marker": "設定済みのデフォルト",
       "reasoning_effort": "推論エフォート",
       "smarter": "スマート",
-      "use_configured_default": "設定されたデフォルトを使用",
-      "use_model_default": "モデルのデフォルトを使用"
+      "use_configured_default": "デフォルトのエフォートを使用（{{level}}）",
+      "use_default_effort": "デフォルトのエフォートを使用"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "チームに固有のアプリを検出するために組織レジストリを追加",
