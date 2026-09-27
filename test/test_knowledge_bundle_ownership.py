@@ -989,6 +989,35 @@ class TestTheMergeTakesOnlyWhatThisImportWrote:
         assert _group_of(importer) == {local_item}, "a foreign document was merged in"
         assert _item_count(importer, "remote body") == 0
 
+    def test_a_shared_id_does_not_reach_the_disjoint_row_it_escaped_the_block_for(
+        self, exporter, importer
+    ):
+        """The blocking pass cannot supply the merge's precondition, so this pass tests
+        it. An id two bundle rows both claim is SHARED, so the block never withholds it
+        -- the bundle does not agree who owns it -- and it arrives with the disjoint live
+        local row still sitting on its key. Merging there files imported content under an
+        unrelated local document, whose own delete then destroys it, unannounced."""
+        _, remote_item = _owned_doc(exporter, slug="doc", body="remote body", name="Remote")
+        local_sid, local_item = _owned_doc(importer, slug="doc", body="local body", name="Local")
+        bundle = exporter.export_all()
+        first = bundle["agent_item_state"][0]
+        bundle["agent_item_state"].append({**first, "slug": "sibling", "name": "Sibling"})
+
+        result = importer.import_bundle(bundle)
+
+        assert result["items_imported"] == 1, "the shared id must still arrive"
+        assert _group_of(importer) == {
+            local_item
+        }, "the unrelated local document absorbed the imported item"
+        named = [
+            w for w in result["withheld"] if w.get("reason") == "ownership_row_key_held_locally"
+        ]
+        assert [(w["key"], w["items"]) for w in named] == [("doc", remote_item)]
+        assert _owner_of(importer, "agent_item_state", remote_item) != (
+            local_sid,
+            "doc",
+        ), "the item is owned by the row whose document would delete it"
+
     def test_the_merge_leaves_the_local_rows_identity_alone(self, exporter, importer):
         """The bundle reaching this branch can be OLDER than the local copy, so its
         hash and name must not replace the ones describing what this store holds."""
@@ -1196,6 +1225,68 @@ class TestAKeyThisStoreAlreadyHoldsBlocksTheItems:
 
         assert result["items_imported"] == 1
         assert result["ownership_rows_imported"] == 1
+
+
+class TestOnlyARestoredTableCanExemptAClaimedId:
+    """The claimed-id rule's one exception is the document this bundle is RESTORING
+    meeting its own row. `folder_file_state` and `artifact_item_state` restore nothing
+    here (`_BUNDLE_STATE_RESTORED_TABLES` holds `agent_item_state` alone), so exempting
+    the ids such a row names takes them off nothing: the stale local claim stays their
+    only holder, and that owner reaps by absence -- `FolderWatcher._do_scan` step 4 drops
+    a row whose path its walk did not yield, `reconcile_artifacts` removes a provably
+    absent slug's group -- so the claim deletes imported content on the next start."""
+
+    def test_a_folder_row_does_not_exempt_a_stale_local_claim(self, exporter, importer):
+        _, folder_item = _folder_doc(exporter)
+        bundle = exporter.export_all()
+        shipped = bundle["folder_file_state"][0]
+        assert folder_item in json.loads(
+            shipped["item_ids"]
+        ), "fixture must ship the id the local row claims"
+        # A stale claim on the arriving id under the SAME (source, file_path) pair the
+        # bundle's row names -- exactly the pair the exemption is keyed on.
+        local_sid = importer.add_source(
+            name="Notes", source_type="local_folder", uri="/remote/notes"
+        )
+        importer.db.execute(
+            "INSERT INTO folder_file_state (source_id, file_path, content_hash, "
+            "text_hash, mtime, item_ids, last_seen, status, attempts) "
+            "VALUES (?, ?, 'stale-hash', 'stale-text', 1.0, ?, "
+            "'2026-01-01T00:00:00', 'done', 0)",
+            (local_sid, shipped["file_path"], json.dumps([folder_item])),
+        )
+        importer.db.commit()
+
+        result = importer.import_bundle(bundle)
+
+        assert result["items_withheld"] == 1
+        assert _item_count(importer, "folder body") == 0, "a stale claim captured the import"
+        assert [
+            w["item_id"]
+            for w in result["withheld"]
+            if w.get("reason") == "item_id_claimed_by_another_document"
+        ] == [folder_item]
+
+    def test_an_agent_row_still_exempts_the_document_it_restores(self, exporter, importer):
+        """The exception is load-bearing where a restore DOES happen. `agent_item_state`
+        is restored, so a row meeting its own stale group -- what `_delete_item_cascade`
+        leaves behind -- must not withhold the only copy of the chunk it brings."""
+        _, item_id = _owned_doc(exporter, slug="doc", body="saved body", name="Doc")
+        local_sid = importer.add_source(name="Auto-added", source_type="agent", uri=AGGREGATE_URI)
+        # The deleter's own row: same slug, group still naming the id it removed.
+        importer.db.execute(
+            "INSERT INTO agent_item_state (source_id, slug, content_hash, item_ids, "
+            "updated_at, name, status, source_uri) VALUES (?, 'doc', 'hash-doc', ?, "
+            "'2026-01-01T00:00:00', 'Doc', 'active', 'https://x/y')",
+            (local_sid, json.dumps([item_id])),
+        )
+        importer.db.commit()
+
+        result = importer.import_bundle(exporter.export_all())
+
+        assert result["items_withheld"] == 0, "the bundle's own row withheld its own item"
+        assert _item_count(importer, "saved body") == 1
+        assert _owner_of(importer, "agent_item_state", item_id) == (local_sid, "doc")
 
 
 class TestOneItemIsNeverOwnedByTwoRows:

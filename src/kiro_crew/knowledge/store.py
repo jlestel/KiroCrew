@@ -3398,7 +3398,11 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
 
         The rule and its one exception: an id a local row claims must not be handed to an
         import, UNLESS the claiming row is a document this bundle is restoring. Both
-        halves are load-bearing and they fail in opposite directions.
+        halves are load-bearing and they fail in opposite directions. "Restoring" is
+        literal: only :func:`_bundle_state_restores` tables are restored, so only those
+        can exempt anything. A row of a table nobody restores writes no ownership here,
+        so exempting its ids leaves the stale local claim as their only holder -- and its
+        owner reaps by absence, so that claim deletes them on the next start.
 
         Without the rule, a stale group belonging to an UNRELATED document captures the
         item: the claim is read before the item loop, so the id does not exist yet, the
@@ -3422,6 +3426,17 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             if not isinstance(rows, list) or not rows:
                 continue
             stated.add(table)
+            if not _bundle_state_restores(table):
+                # The exemption exists for a document this bundle RESTORES meeting its
+                # own row, so a table no restore touches earns none. Granting it there
+                # takes the id off nothing: no row is written, so the stale local claim
+                # is the only thing naming content this import created -- and both of
+                # the other two owners reap by absence (``FolderWatcher._do_scan`` step
+                # 4, ``reconcile_artifacts``), which makes that claim a deletion order
+                # on the next start rather than a marker. Those ids stay contested and
+                # are reported as ``item_id_claimed_by_another_document``, which is the
+                # visible refusal the rule exists to produce.
+                continue
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -3458,7 +3473,6 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 # local row holds a stale claim on them.
                 contested |= overlap - restored_groups.get(
                     (table, row["source_id"], row["row_key"]), set())
-        return contested
         return contested
 
     def _items_exist(self, item_ids: set[str]) -> tuple[set[str], set[str]]:
@@ -3502,8 +3516,13 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
         the new chunks searchable and owned by nothing -- ``agent_item_state`` is the
         one table a bundle restores and no pass reaps it, so the document's own delete
         takes the ids its row names and walks past the rest. The arriving ids therefore
-        join the live local row's group, which is the same document coming back: the
-        blocking pass only lets a bundle's items through when the two groups overlap.
+        join the live local row's group WHEN that row's own group overlaps the bundle's,
+        which is what says the two are one document coming back. This pass tests that
+        itself rather than inheriting it from the blocking pass, which cannot supply it:
+        an id two bundle rows both name is shared, so it is never blocked, and it arrives
+        with a DISJOINT live row sitting on its key. Merging there would file it under an
+        unrelated local document whose own delete would then destroy it, so such a row is
+        skipped and its items arrive unowned, reported as ``ownership_row_key_held_locally``.
         A merge extends that row's group and touches nothing else, because its hash,
         name and status describe this store's copy and the bundle can be older than it.
 
@@ -3557,13 +3576,32 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                     f"SELECT {_OWNERSHIP_HASH_COL[table]} AS owned_hash, item_ids "  # noqa: S608
                     f"FROM {table} WHERE source_id = ? AND {key_col} = ?",
                     (target_source, key)).fetchone()
-                # A live local row on this key is THIS document already here -- the
-                # blocking pass only lets the bundle's items through when the two groups
-                # overlap -- so its group is the base the arriving ids join, and its own
-                # ids are already owned rather than missing.
-                merging = existing is not None and self._state_row_owns_items(
+                local_group = (_bundle_item_group(existing["item_ids"])
+                               if existing is not None else [])
+                live = existing is not None and self._state_row_owns_items(
                     existing["item_ids"], target_source)
-                base = _bundle_item_group(existing["item_ids"]) if merging else []
+                if live and not set(local_group) & set(group):
+                    # A live local row sharing NO id with the bundle's group is a
+                    # DIFFERENT document holding this key, and the blocking pass does not
+                    # keep the two apart on its own: an id two bundle rows both name is
+                    # shared, so it is never blocked, and it reaches here with that
+                    # disjoint row in place. Merging would put the arriving id into this
+                    # store's unrelated document, whose own delete then takes content the
+                    # import brought -- with no pass that reaps the row or reports it.
+                    # Skip the row instead: its items arrive unowned, the outcome every
+                    # other untrustworthy ownership row already gets, and the account
+                    # names the key that held them back.
+                    stranded = sorted(set(group) & inserted_items)
+                    if stranded:
+                        dropped.append({"reason": "ownership_row_key_held_locally",
+                                        "table": table, "source_id": target_source,
+                                        "key": key, "items": ",".join(stranded)})
+                    continue
+                # A live local row whose group OVERLAPS the bundle's is THIS document
+                # already here, so its group is the base the arriving ids join and its
+                # own ids are already owned rather than missing.
+                merging = live
+                base = local_group if merging else []
                 # What this import actually wrote for this row, and what the row names
                 # that nothing here hands it. Ownership covers the first; the second is
                 # local content or absent content, and claiming either would let a
