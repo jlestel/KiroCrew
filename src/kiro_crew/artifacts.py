@@ -62,7 +62,7 @@ from typing import Any, Callable, Iterator
 from typing import List as _List
 from typing import Mapping
 
-from kiro_crew import hooks, pinned_fs
+from kiro_crew import hooks, pinned_fs, platform_compat
 from kiro_crew.artifact_source import is_verifiable_root
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.constants import ARTIFACT_MAX_CONTENT_BYTES
@@ -3881,16 +3881,65 @@ class ArtifactStore:
 
     @staticmethod
     def _rmtree(path: Path) -> None:
-        # Stdlib-only recursive delete (we don't depend on shutil here for clarity).
-        for sub in sorted(path.rglob("*"), key=lambda p: -len(str(p))):
+        """Remove *path* and everything under it, holding each directory PINNED.
+
+        Stdlib-only (no ``shutil``), and deliberately not an ``os.walk``. Screening a
+        name for a link and then letting a walker descend that name are two
+        operations on two objects: ``os.walk``'s own descent-time re-check is
+        ``os.path.islink``, which answers False for a Windows junction, so a junction
+        planted at a child AFTER it screened clean is still descended -- and this
+        function then unlinks the link target's files, outside the artifact store.
+        Creating a junction needs no elevation and the agent both triggers a delete
+        and can retry it, so that window is ordinary rather than exotic.
+
+        :func:`platform_compat.pin_directory` is what closes it, and it is the same
+        object twice rather than a tighter re-check: the open REFUSES a reparse point
+        at the name instead of following it, and on Windows the handle is opened
+        without ``FILE_SHARE_DELETE``, so while it lives this directory and every
+        ancestor can be neither renamed nor deleted. On POSIX it is
+        ``O_DIRECTORY | O_NOFOLLOW`` and the descriptor lists the directory it
+        inspected. The pin is released only once the directory is empty, because a
+        pinned directory on Windows cannot itself be removed.
+
+        A link found among the entries is removed with
+        :func:`platform_compat.unlink_link_or_junction`, which unlinks the link and
+        never what it points at.
+
+        Failures: each entry that will not go is logged and the sweep continues, so
+        the warnings name every residual rather than stopping at the first. The final
+        removal of *path* is NOT guarded -- a residual anywhere keeps it non-empty, so
+        it fails, and the caller must see that: it logs a successful delete and fires
+        its ``"delete"`` event unconditionally, and a Windows sharing violation on a
+        store file is an ordinary occurrence, not an exotic one.
+        """
+        list_takes_fd = os.listdir in getattr(os, "supports_fd", set())
+
+        def _purge(directory: Path) -> None:
             try:
-                if sub.is_file() or sub.is_symlink():
-                    sub.unlink()
-                elif sub.is_dir():
-                    sub.rmdir()
-            except OSError as exc:  # pragma: no cover — best-effort cleanup
-                logger.warning("rmtree partial failure at %s: %s", sub, exc)
-        path.rmdir()
+                fd = platform_compat.pin_directory(directory)
+            except NotADirectoryError:
+                # A reparse point arrived at this name after the caller screened it.
+                # It is a link, so remove the link itself and leave its target alone.
+                platform_compat.unlink_link_or_junction(directory)
+                return
+            try:
+                names = sorted(os.listdir(fd) if list_takes_fd else os.listdir(directory))
+                for name in names:
+                    entry = directory / name
+                    try:
+                        if platform_compat.is_link_or_junction(entry):
+                            platform_compat.unlink_link_or_junction(entry)
+                        elif entry.is_dir():
+                            _purge(entry)
+                        else:
+                            os.unlink(entry)
+                    except OSError as exc:
+                        logger.warning("rmtree partial failure at %s: %s", entry, exc)
+            finally:
+                os.close(fd)
+            os.rmdir(directory)
+
+        _purge(path)
 
 
 # ── Artifact folders ────────────────────────────────────────────

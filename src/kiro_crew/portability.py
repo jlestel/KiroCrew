@@ -768,16 +768,36 @@ def _strip_host_local_store_state(snap: Path) -> None:
     root = snap / MEMORY_STORES_DIR_NAME
     if not root.is_dir():
         return
-    for path in sorted(root.rglob("*"), key=lambda p: len(p.parts)):
-        if not path.exists() and not path.is_symlink():
-            continue  # inside a subtree an earlier iteration already removed
-        rel = (MEMORY_STORES_DIR_NAME, *path.relative_to(root).parts)
-        if not is_host_local_store_state(rel):
-            continue
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(str(path))
-        else:
-            path.unlink()
+    # ``os.walk`` with the link prune below rather than ``rglob``: a Windows
+    # directory junction answers False to ``Path.is_symlink()`` and True to
+    # ``is_dir()``, and BOTH walkers descend through one. A junction in a
+    # hand-built archive therefore had its target's tree enumerated here, and any
+    # entry out there whose relative name matched the predicate was unlinked -- a
+    # delete outside the extracted archive entirely. The same link also reached
+    # ``shutil.rmtree``, which refuses a reparse point and raised out of the
+    # import. A link is removed when the predicate matches it and is never
+    # descended either way, because what it points at is not in this archive.
+    for dirpath, dirnames, filenames in os.walk(str(root), topdown=True):
+        here = Path(dirpath)
+        for name in list(dirnames):
+            entry = here / name
+            rel = (MEMORY_STORES_DIR_NAME, *entry.relative_to(root).parts)
+            if platform_compat.is_link_or_junction(entry):
+                dirnames.remove(name)
+                if is_host_local_store_state(rel):
+                    platform_compat.unlink_link_or_junction(entry)
+                continue
+            if is_host_local_store_state(rel):
+                # Pruned from the walk as well as removed, so a whole
+                # ``.execution-logs/`` or ``<store>/backups/`` goes as one removal
+                # and its contents are never judged individually.
+                dirnames.remove(name)
+                shutil.rmtree(str(entry))
+        for name in filenames:
+            entry = here / name
+            rel = (MEMORY_STORES_DIR_NAME, *entry.relative_to(root).parts)
+            if is_host_local_store_state(rel):
+                entry.unlink()
 
 
 def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:

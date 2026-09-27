@@ -5225,15 +5225,28 @@ class SkillsLoader:
 
     @staticmethod
     def _candidate_has_symlink(pdir: Path) -> bool:
-        """True if the candidate dir itself or any entry under it is a symlink —
+        """True if the candidate dir itself or any entry under it is a link —
         so the read/approve paths never follow an LLM-planted link to a
         sensitive file. (Scripts always require human review before going live;
-        this is defense-in-depth, not the primary control.)"""
-        if os.path.islink(str(pdir)):
+        this is defense-in-depth, not the primary control.)
+
+        "Link" is :func:`platform_compat.is_link_or_junction`, not
+        ``os.path.islink``: a Windows directory junction is a reparse point
+        ``islink`` reports as a plain directory, so the fence answered False for
+        one AND ``os.walk`` descended through it -- the read path then reached
+        whatever it pointed at, which is the exact escape this refuses.
+        Directories are tested before files because a topdown walk offers a
+        directory in ``dirs`` before descending into it, so answering there is
+        what keeps this from ever walking THROUGH a link to reach its verdict.
+        """
+        if is_link_or_junction(pdir):
             return True
         for root, dirs, files in os.walk(pdir):
-            for nm in list(dirs) + list(files):
-                if os.path.islink(os.path.join(root, nm)):
+            for nm in list(dirs):
+                if is_link_or_junction(os.path.join(root, nm)):
+                    return True
+            for nm in files:
+                if is_link_or_junction(os.path.join(root, nm)):
                     return True
         return False
 
