@@ -6,6 +6,7 @@ import { useAppSelector } from '../store'
 import { i18nT } from '../i18n/t'
 import { settingsPath } from './settingsPath'
 import type { UpdateState } from '../hooks/useUpdateSubscription'
+import { DropdownMenuItem } from './ui/dropdown-menu'
 
 /**
  * Top-bar update pill: the persistent, passive home for update state.
@@ -25,7 +26,14 @@ import type { UpdateState } from '../hooks/useUpdateSubscription'
  * interruption, and a user who skipped a version still deserves a quiet,
  * visible way back in.
  */
-export default function UpdatePill() {
+/**
+ * `variant="menu-item"`: the same update lifecycle (available → downloading N%
+ * → ready) as a row inside a DropdownMenu, for a bar that has no room for the
+ * pill — the phone chat page's single top bar holds two controls on its right
+ * and the update lands as the first item of its overflow menu. Same label
+ * source, same destination (Settings › About), so the two forms cannot drift.
+ */
+export default function UpdatePill({ variant = 'pill' }: { variant?: 'pill' | 'menu-item' } = {}) {
   const navigate = useNavigate()
   const updateAvailable = useAppSelector(
     s => s.dashboard.status?.update_available === true || s.dashboard.desktopUpdateAvailable
@@ -53,6 +61,18 @@ export default function UpdatePill() {
   } else if (desktop?.state === 'downloaded') {
     label = i18nT('components.updatePill.update_ready')
     Icon = RefreshCw
+  }
+
+  if (variant === 'menu-item') {
+    return (
+      <DropdownMenuItem
+        data-testid="update-menu-item"
+        className="[@media(hover:none)]:min-h-10 text-accent"
+        onSelect={() => navigate(settingsPath({ tab: 'about' }))}
+      >
+        <span className="flex items-center gap-2"><Icon size={14} className="shrink-0" /><span>{label}</span></span>
+      </DropdownMenuItem>
+    )
   }
 
   return (

@@ -256,6 +256,72 @@ Carbon's five-action cap, Apple's "define which items move to the overflow menu"
 is what `AUTOSDE.yaml`'s `max-two-buttons-per-row` encodes. Wrapping such a row below `md`
 keeps the controls reachable, but it is an interim, not the answer.
 
+## The phone chat page has ONE top bar
+
+Below `md` the chat route used to stack two bars: the shell's (logo -> nav drawer,
+search square, readout capsule, bell) over the page's own title row (sessions
+toggle, title, pop-out, activity panel). Two bars cost 84px of a 844px screen for
+chrome and offered a phone user two drawers for one gesture. There is now one bar,
+the shell's, and the chat page fills it:
+
+| cell | who renders it | what is in it |
+|---|---|---|
+| leading (`auto`) | `App.tsx` | the crew switcher (when a remote crew exists) and downstream widgets (while they exist); usually empty. Not the update pill: beside a remote crew's chip + dropdown it was a third action, so on this page a pending update is the first item of the overflow menu (`UpdatePill variant="menu-item"`, same lifecycle label) |
+| centre (`minmax(0,1fr)`) | `ChatPage.tsx`, by `createPortal` into `#mobile-topbar-slot` | sessions toggle, then ONE control that is the session title with the menu chevron flush after it (`ChatHeaderMenu` `triggerLabel`); Rename and Auto-title are items of that menu (`SessionActionsMenu` `onRename` / `onAutoTitle`), and Rename swaps in the shared title editor |
+| trailing (`auto`, `.tb-trail`) | `App.tsx`, plus a portal into `#mobile-topbar-trail-slot` | exactly two: the bell, then the page's overflow menu (update when pending, pop out, activity panel, split view) |
+
+That is the `topbar-single` header variant (`index.css`), applied only while
+`isMobile && isChat`. **Its side cells are plain flex divs, not `.tb-left` /
+`.tb-right`.** Those two are inline-size containers for the collapse ladders, and
+a size container in an `auto` track has no content size to give, so it collapses
+to its padding and clips its contents -- the measurement is recorded in
+`test/topbarMenuButtonNarrow.test.ts`, and `test/topbarSingleVariant.test.ts`
+pins that no container class reaches the variant's side cells. The single bar
+has no ladder to run (the readout capsule is not rendered on it), so it needs no
+containers. `.tb-trail` keeps `.tb-right`'s padding/negative-margin pair for the
+bell badge's 4px overhang.
+
+The hand-off is the same shape as the desktop activity panel's `#activity-bar-slot`:
+the page resolves the slot element with `useShellSlot` (lazy initialiser plus a
+MutationObserver for the breakpoint-crossing case), and derives "the row is in the
+bar" from the ELEMENT, never from `isMobile` -- the two can disagree for a render on
+a crossing, and the inline row, the fixed corner sessions button, the transcript's
+64px header spacer and the split view's inline toggle all key off that one flag so
+the row is in exactly one place. Where the shell renders no slot (the popout
+window, an embedded host, a desktop width) the page keeps its inline row: a missing
+target degrades to yesterday's layout, never to no title.
+
+**What left the bar, and where it went.** The readout capsule (connection dot,
+metrics, credits) is not rendered on the phone at all: a phone user does not act on
+a resource readout, and the bar's right side holds two controls (bell + overflow
+menu) by the max-two-buttons-per-row rule; the session-expired banner remains the
+offline signal. The search square moved off the bar into the two phone drawers, same
+label, same command palette: the chat drawer's rail pins it at the foot (below), and
+the nav drawer carries it as a row in its bottom group, so every non-chat phone page
+still reaches it. Off the chat route the phone header keeps the logo -> nav drawer
+and the bell, and renders an empty centre spacer so the header still has three
+in-flow children -- with two, the actions group would be auto-placed into the `auto`
+centre track and collapse.
+
+**The chat page's ONE drawer carries the main navigation.** Its sessions
+`OverlayDrawer` (unchanged width, slide, scrim, keyboard inset and Back handling)
+now holds a 72px icon rail on the left -- the shell's, rendered by `App.tsx` and
+handed down through `MobileNavRailContext` -- beside the sessions pane. The rail is
+built from the same registry as the desktop rail (`advertisedNavItems`,
+`sortedAppGroup`, the Bottom group) through the same `NavItem`, with `touch` for a
+64x56 `rounded-xl` tile carrying a 10px caption under the glyph (a finger cannot summon
+the desktop rail's hover tip), a full-opacity muted glyph (the desktop rail's 70% dimming
+measured 3.4:1 on these flat tiles) and the desktop rail's selected paint, on a
+`bg-bg-accent` surface that reads apart from the `bg-bg-elevated` pane. The brand mark on
+top is the "home" control (chat root; a cold reader tapped it expecting that); Search is pinned at
+its foot. Because the drawer minted a duplicate history entry on open
+(`pushDrawerEntry`), rows behave in two ways: the row for the page the user is on
+only closes the drawer, and a row that leaves the page navigates with `replace`
+so Back returns to the chat rather than to a second copy of it. The shell's nav
+drawer has no trigger on this route and its header swipe is gated off
+(`useDrawerSwipe(shellRef, { enabled: isMobile && !isChat })`); the chat
+container already claims its own swipe via `data-owns-swipe`.
+
 ## A horizontal drag on mobile belongs to the nav drawer unless a page claims it
 
 The mobile nav drawer is bound app-wide: **one** `useDrawerSwipe` on the shell

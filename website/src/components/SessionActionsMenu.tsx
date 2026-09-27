@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop } from 'lucide-react'
+import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
 import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
@@ -40,6 +40,10 @@ export interface SessionActionsMenuProps {
   onReveal?: () => void
   /** Rename entry point — differs per surface (sidebar inline row-edit vs header title editor). */
   onRename?: () => void
+  /** Auto-title entry point for a surface whose title row cannot host the
+   *  hover-revealed button (the phone's single top bar): the LLM rename lands
+   *  here as a menu item so the capability keeps a touch-reachable home. */
+  onAutoTitle?: () => void
   /**
    * Open this session as a tab on the calling surface. Present only where a tab
    * strip exists (the dashboard chat surface), which is why it is a bubble prop
@@ -103,7 +107,7 @@ export function collapseGroups<T>(groups: (T | false | null | undefined)[][]): T
  *   [close]          Close session
  */
 export default function SessionActionsMenu({
-  variant, slotKey, mode, onReveal, onRename, onOpenInNewTab, infoSlots, onColorPicked, sidebarOnScreen = false,
+  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, infoSlots, onColorPicked, sidebarOnScreen = false,
 }: SessionActionsMenuProps) {
   const Item = variant === 'context' ? ContextMenuItem : DropdownMenuItem
   const Separator = variant === 'context' ? ContextMenuSeparator : DropdownMenuSeparator
@@ -163,6 +167,11 @@ export default function SessionActionsMenu({
       onRename && (
         <Item key="rename" onSelect={onRename}>
           <Pencil size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.rename')}
+        </Item>
+      ),
+      onAutoTitle && (
+        <Item key="auto-title" onSelect={onAutoTitle}>
+          <Sparkles size={13} className="shrink-0 text-muted" /> {i18nT('pages.chatPage.auto_title')}
         </Item>
       ),
       <Item key="read" onSelect={() => toggleRead(slotKey)}>
