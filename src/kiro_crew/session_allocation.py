@@ -28,6 +28,7 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_session_started,
 )
+from kiro_crew.runtime_ownership import PidRefcount
 from kiro_crew.validation import bounded_session_id
 
 if TYPE_CHECKING:
@@ -176,7 +177,11 @@ class SessionRegistryState:
     update_pause_owned: bool = False
     update_restart_fenced: bool = False
     start_sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
-    starting_pids: set[int] = field(default_factory=set)
+    #: COUNTED, not listed: two starts can legitimately shield one pid (the
+    #: allocator carries a race budget for starting one session twice), and as a
+    #: plain set the first to finish tore the shield off a process the other was
+    #: still cold-starting. Reads like the set it replaces.
+    starting_pids: PidRefcount = field(default_factory=PidRefcount)
     allocation_reservations: dict[str, set[object]] = field(default_factory=dict)
     inbound_callback_reservations: set[object] = field(default_factory=set)
     ownership_generations: dict[str, int] = field(default_factory=dict)
@@ -432,11 +437,11 @@ class SessionAllocationService:
         self.state.start_sem = value
 
     @property
-    def _starting_pids(self) -> set[int]:
+    def _starting_pids(self) -> PidRefcount:
         return self.state.starting_pids
 
     @_starting_pids.setter
-    def _starting_pids(self, value: set[int]) -> None:
+    def _starting_pids(self, value: PidRefcount) -> None:
         self.state.starting_pids = value
 
     @property

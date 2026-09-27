@@ -148,6 +148,7 @@ from kiro_crew.metrics.events import (
 )
 from kiro_crew.providers.mirrors.registry import has_mirror, mirror_for
 from kiro_crew.resource_status import inject_xdist_auto_cap
+from kiro_crew.runtime_ownership import note_runtime_kill
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
     BoundWorkspaceMismatch,
@@ -3242,6 +3243,11 @@ class AcpRuntime:
         platform-agnostic code that happens to no-op.
         Every call is off-loop: ``taskkill`` is a blocking spawn, and the group
         walk reads ``/proc``.
+
+        The kill is attributed once, in ``kill``, not here. ``_kill_inner`` is
+        this method's only caller, so the whole ladder -- SIGTERM, the grace, the
+        SIGKILL escalation, the vouched-group arm -- is the mechanics of that one
+        decision, and noting it per signal would write the same shot three times.
         """
         loop = asyncio.get_running_loop()
         # kill_process_tree resolves the group FROM the root's number, so it may
@@ -3363,7 +3369,12 @@ class AcpRuntime:
         field: a runtime killed under a live turn surfaces to the turn only
         as a bare "process died during prompt", and a log line that says
         "killed" without saying WHO killed leaves nothing to correlate.
+
+        The attribution line is written HERE, before any signal, rather than
+        where the process is reaped -- a line saying a process died cannot say
+        who decided it should.
         """
+        note_runtime_kill(self, reason=reason or "runtime kill", caller="AcpRuntime.kill")
         self._process_tree_confirmed_dead = False
         try:
             await self._kill_inner(expected=expected, reason=reason)
