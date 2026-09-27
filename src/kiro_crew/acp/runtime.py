@@ -157,8 +157,10 @@ from kiro_crew.sandbox import (
     bind_voice_safe_agent_workspace_async,
     cgroup_scope_argv,
     create_subprocess_limited,
+    name_scope_unit,
     release_bound_agent_workspace,
     resolve_bound_session_workspace,
+    scope_unit_name,
     scrub_agent_subprocess_env,
     wrap_argv,
     wrap_argv_async,
@@ -1720,6 +1722,13 @@ class AcpRuntime:
         # compared against later. See AcpClient.process_instance for why the
         # session id cannot serve: a resume reuses it on a new process.
         self._process_instance: str = ""
+        # The scope unit name systemd ACTUALLY received for this spawn, empty when
+        # no scope was created. Held separately from the token because the token
+        # alone cannot answer that question: name_scope_unit degrades to a no-op on
+        # a host without cgroup delegation, so deriving the name from the token at
+        # log time would announce a scope that does not exist. Set from the argv
+        # the wrap returned, and cleared with the process.
+        self._scope_unit: str = ""
 
         # Single reader task — the ONLY coroutine that reads stdout
         self._reader_task: asyncio.Task | None = None  # type: ignore[type-arg]
@@ -2616,6 +2625,13 @@ class AcpRuntime:
         # and the audit-or-deny step can refuse a delegation after it was chosen.
         self._sandbox_wrapped_by_crew = wrapped_by_crew_sandbox(argv)
         self._sandbox_hidden_dirs = tuple(plan.extra_hidden_dirs)
+        # The incarnation this spawn is. Minted BEFORE the cgroup wrap because
+        # two things carry it: the scope's unit name, and the child's own
+        # environment further down. One token for both is what lets a reader
+        # holding either one reach the other -- a scope resolves to the runtime
+        # incarnation inside it, and a process resolves to the scope bounding it.
+        # Random rather than pid-derived so a recycled pid cannot false-match.
+        spawn_instance = uuid.uuid4().hex[:16]
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
         # No-op + loud warning where cgroup delegation is unavailable. --scope
@@ -2625,6 +2641,22 @@ class AcpRuntime:
         # run on the loop. Guarded: wrap_argv above allocated the sandbox temp
         # file, so a cancellation here must not orphan it.
         argv = await self._to_thread_guarding_sandbox(cgroup_scope_argv, argv)
+        # Name that scope after this spawn, because the ceiling above binds the
+        # whole runtime: when the kernel OOM-kills the scope, every session the
+        # runtime serves dies together, and an anonymous ``run-u<N>.scope`` in
+        # that report names no runtime to resolve those sessions from. A no-op
+        # where the wrap did not happen (no cgroup delegation), so it cannot turn
+        # a degraded host into a failed spawn, and pure argv rewriting, so it
+        # stays on the loop rather than costing a second thread hop.
+        named_argv = name_scope_unit(argv, spawn_instance)
+        # Whether the naming ACTUALLY happened is read off the argv, not re-derived
+        # from the token. name_scope_unit returns argv unchanged on every host where
+        # cgroup_scope_argv handed back the bare command (macOS, Windows, Linux
+        # without cgroup-v2 --user delegation, systemd-run outside a trusted dir),
+        # and the token is always spellable, so a token-derived name would claim a
+        # scope for exactly those hosts that have none.
+        scope_unit = (scope_unit_name(spawn_instance) or "") if named_argv is not argv else ""
+        argv = named_argv
 
         env = {**os.environ}
         if self._extra_env:
@@ -2684,12 +2716,11 @@ class AcpRuntime:
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
         env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
-        # The incarnation this spawn is. Minted here, before the process exists,
-        # because it has to travel in the child's environment: it is what a
-        # teardown reads back out of /proc/<pid>/environ to prove a process is
-        # THIS spawn's descendant once the root itself is gone. Random rather
-        # than pid-derived so a recycled pid cannot false-match.
-        spawn_instance = uuid.uuid4().hex[:16]
+        # The incarnation this spawn is (minted above the cgroup wrap, which
+        # names the scope after the same token). It has to travel in the child's
+        # environment: it is what a teardown reads back out of
+        # /proc/<pid>/environ to prove a process is THIS spawn's descendant once
+        # the root itself is gone.
         env[KIROCREW_SPAWN_INSTANCE_ENV] = spawn_instance
         # Own browser session per agent process, matching AcpClient._spawn (see
         # browser_session_env). Per PROCESS, not per agent: with session sharing
@@ -2775,6 +2806,9 @@ class AcpRuntime:
         # it could be passed in); random, not pid-derived, so it cannot
         # false-match a later spawn that the OS handed a recycled pid.
         self._process_instance = spawn_instance
+        # Recorded from the wrap's own result above, so the init log names a scope
+        # only when one exists.
+        self._scope_unit = scope_unit
         # The subprocess is LIVE from here on but nothing has recorded it yet, so
         # this window needs the same guard AcpClient._spawn has. finish_suspended_spawn
         # documents its own resume failure as FATAL, and the identity read can fail;
@@ -2987,7 +3021,21 @@ class AcpRuntime:
 
             await asyncio.to_thread(require_unchanged_derived_spec, self._derived_spec_snapshot)
             self._initialized = True
-            logger.info("AcpRuntime initialized (PID %d)", self._pid)
+            # The scope unit name is logged beside the PID because it is the only
+            # durable half of the join. An OOM report or ``systemctl`` listing
+            # names ``kirocrew-rt-<token>.scope``; the token otherwise lives only
+            # in the child's /proc/<pid>/environ and in _process_instance, both of
+            # which the kill destroys. This line survives it, so the token in the
+            # report resolves to this runtime's pid. A spawn that dies BEFORE this
+            # point has served no session, so there is nothing to resolve for it.
+            # ``unnamed`` is the honest reading on a host where no scope was
+            # created, and it is reachable: _scope_unit is empty whenever the
+            # cgroup wrap did not happen, which is every non-delegated host.
+            logger.info(
+                "AcpRuntime initialized (PID %d, scope %s)",
+                self._pid,
+                self._scope_unit or "unnamed",
+            )
             # INSIDE the guard, which is what makes a cancelled scan safe. The
             # runtime is already `_initialized` here and the caller does not hold
             # it yet, so a CancelledError raised inside the scan -- an ordinary
@@ -3441,6 +3489,7 @@ class AcpRuntime:
             self._process_tree_confirmed_dead = process.returncode is not None
             self._process = None
             self._process_instance = ""
+            self._scope_unit = ""
             # Tracking was retired by the shared drain under the original pin.
             return
 
@@ -3511,6 +3560,7 @@ class AcpRuntime:
             # The id names the process that just ended; the next spawn mints its
             # own, and nothing may answer with this one in between.
             self._process_instance = ""
+            self._scope_unit = ""
             if platform_compat.pid_exists(pid):
                 # Both kill_process_tree calls above swallow OSError by design
                 # (racing a normal exit), which makes a signal-delivery failure

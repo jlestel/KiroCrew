@@ -226,6 +226,24 @@ memory-ballooning command is killed *before* `memory.max` takes out the entire a
 It is requested explicitly (`--oom-bias`) by the `tool`, `build` and `extractor` profiles
 only (`_PROFILE_OOM_BIAS`).
 
+### Scope unit names
+
+`systemd-run` names a scope after the invocation (`run-u<N>.scope`) unless it is
+given a `--unit`, so a scope in a kernel OOM report or a `systemctl` listing
+identifies nothing about what it held. `AcpRuntime._spawn` passes
+`--unit kirocrew-rt-<spawn instance>.scope` (`sandbox.scope_unit_name` builds the
+name, `sandbox.name_scope_unit` inserts it) and logs that unit name beside the
+runtime's pid at initialization, so an operator reading a kill can join the scope
+back to the runtime it held, and from that pid to the sessions it served — those
+are logged against the same pid as they are created.
+
+Every other wrap keeps the default anonymous name: `AcpClient._spawn`, cron,
+app-backend, hook, git and tool spawns. For `AcpClient._spawn` that is deliberate
+here — its spawn instance exists only in memory and is never written to the
+child's environment, so a name alone would not outlive the kill it is meant to
+explain. Giving that path a durable token is harness-parity work, not part of this
+naming pass.
+
 ### The aggregate slice ceiling (`memory.high` on `kirocrew-agents.slice`)
 
 `MemoryMax` is a **per-scope** cap, and scopes are created per spawn — so several

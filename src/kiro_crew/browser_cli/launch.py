@@ -447,6 +447,15 @@ def browser_session_env(env: Mapping[str, str]) -> dict[str, str]:
     :meth:`kiro_crew.session.SessionManager.get_or_create`). Uniqueness per
     process is the entire requirement; legibility is served by the prefix.
 
+    The panel browser names itself per SLOT instead
+    (``panel-<owner6>-<slot8>``, :mod:`kiro_crew.browser_cli.launcher`), and the
+    difference is not an inconsistency: a panel browser is launched for a slot
+    that already exists, so the slot is nameable at launch, while this name has
+    to exist before any session claims the process. The cost of the difference is
+    real and belongs to the sessions, not to this function -- sessions served by
+    one process share this browser, so one session's ``close`` shuts the others'
+    too, and an agent that needs its own must pass ``-s=``.
+
     Empty when the variable is already set to a name we did not generate, the
     same override doctrine as :func:`cli_env_overrides`: an operator who named a
     session means one specific browser. Every process then shares that name,

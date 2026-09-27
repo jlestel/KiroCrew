@@ -638,6 +638,15 @@ def scratch_env(path: Path, *, shared: Path | None = None) -> dict[str, str]:
     set, it overrides any inherited value, because an inherited value names a
     path SHARED with other processes, which is the failure this exists to prevent.
 
+    Per-process is per RUNTIME and not per session: one process can serve several
+    sessions, so their conversations interleave in one log and
+    :func:`cap_kiro_cli_logs` truncating it drops records belonging to all of
+    them. Splitting the log per session is not reachable from here -- kiro-cli
+    reads this variable once at startup and holds the file open in append mode
+    for the life of the process, so a session that joins a running process cannot
+    be given a file of its own, and no value written here reaches it. Bounding
+    the loss, not dividing the log, is what this layer can do.
+
     *shared* is the session tree's work directory when this process is not
     the tree's first (see :func:`shared_scratch_window`): ``KIROCREW_SCRATCH``
     then names THAT directory, so a subagent and its parent -- or a recycled
@@ -671,7 +680,10 @@ def cap_kiro_cli_logs(
     is truncated to zero. ``O_APPEND`` makes the writer's next record land at
     the new end, so no hole is created. Records written between the tail copy
     and the truncate are lost; this is a diagnostic log, and losing a few
-    lines beats losing the disk.
+    lines beats losing the disk. One log can hold the conversations of every
+    session the process serves (see :func:`scratch_env`), so the loss is not
+    confined to one of them and the warning below can name none: raising the cap
+    is the only lever here that reduces it.
 
     Every scratch directory is OWNED by a sandboxed agent process while this
     runs unsandboxed, so nothing here trusts a name the agent controls: the

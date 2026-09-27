@@ -7802,10 +7802,32 @@ def main():
         # pids, so session identity, claim-push, and systemd stay intact.
         # Only ``kill`` needs arg inspection: tkill/tgkill/pidfd_send_signal
         # are inherently targeted (no broadcast semantics). pid==0 and
-        # negative process-group targets stay ALLOWED on purpose — the spawn
-        # already setsid()s, so every reachable process group is inside the
-        # sandbox session, and denying killpg breaks legitimate tooling
-        # (timeout(1), shell job control, cleanup traps).
+        # negative process-group targets stay ALLOWED on purpose, because
+        # denying killpg breaks legitimate tooling (timeout(1), shell job
+        # control, cleanup traps).
+        #
+        # What this filter denies is exactly one thing: the ``kill(-1, sig)``
+        # host-wide broadcast. A NAMED negative target — ``kill(-<pgid>, sig)``
+        # for a process group outside the spawn — is not denied at the syscall
+        # layer, and the subtree shares the host pid namespace (no CLONE_NEWPID
+        # here, by the same deliberate choice as above), so such a signal is
+        # same-uid permitted and lands outside the spawn's own tree. setsid()
+        # places the spawn in its own group; it does not restrict which groups
+        # the spawn may signal.
+        #
+        # Session isolation is therefore not a property of this filter at all.
+        # It is also not expressible here: one agent RUNTIME can serve several
+        # sessions at once (a parent plus the subagents whose sessions are
+        # created on its runtime), so the narrower rule "deny group targets
+        # while more than one session is being served" would need a session
+        # count, and this is a static BPF program installed before the first
+        # session is claimed — it cannot read that count, which changes after
+        # the filter is sealed. The containable form of the problem lives one
+        # layer out, where a signal is matched against the runtime's own session
+        # set, so the ownership model is the thing that has to answer it.
+        # TODO(ownership): once a runtime's session set is a first-class object,
+        # state in docs/decisions/ whether an in-sandbox group signal is
+        # acceptable for a multi-session runtime, and link that decision here.
         if _libc.prctl:
             _PR_SET_SECCOMP = 22
             _SECCOMP_MODE_FILTER = 2
@@ -13291,6 +13313,50 @@ def apply_windows_resource_ceiling(pid: int) -> bool:
     )
 
 
+# Prefix of the scope unit name a caller gets from ``scope_unit_name``. Carries
+# the owning gateway's product name so a human reading ``systemctl --user
+# list-units`` can tell an agent scope from anything else in the slice, and is
+# the token the reverse lookup matches on.
+_SCOPE_UNIT_PREFIX = "kirocrew-rt-"
+# systemd unit names accept alphanumerics and ``:-_.\`` plus escapes; anything
+# else has to be escaped to be a legal name. Rather than escape, a token
+# carrying something else is REFUSED (see ``scope_unit_name``), because every
+# caller mints its own token and a token needing escapes is a caller bug.
+_SCOPE_UNIT_TOKEN_SAFE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+
+def scope_unit_name(token: str) -> str | None:
+    """The scope unit name for a spawn identified by *token*, or None.
+
+    ``cgroup_scope_argv`` otherwise lets systemd auto-name the scope
+    ``run-u<N>.scope``, whose only content is "the Nth transient unit this user
+    manager made". One scope holds one spawn, and one spawn is one agent
+    RUNTIME, which may serve several sessions -- so an anonymous scope name is
+    the reason a reader holding a scope (the slice OOM report at
+    :func:`check_agents_slice_pressure`, ``systemd-cgls``, an operator reading
+    ``systemctl --user list-units``) can name the victim's directory but not the
+    runtime it held, nor the sessions leasing that runtime. Naming the scope
+    after the runtime's own spawn token closes that: the SAME token travels in
+    the child's environment as ``KIROCREW_SPAWN_INSTANCE``, so a scope name and
+    a live process both resolve to one incarnation. For the case that matters
+    most -- a scope the kernel already killed, where both the environment and the
+    in-memory ``_process_instance`` are gone -- ``AcpRuntime`` logs this unit name
+    beside its pid at initialization, and sessions are logged against that same
+    pid as they are created, so the join survives the process.
+
+    Returns ``None`` when *token* cannot form a legal unit name, and the caller
+    then wraps the spawn exactly as before -- anonymously, but bounded. That
+    direction is deliberate: the scope's JOB is the DoS ceiling, and a naming
+    defect must never be able to cost a spawn its ceiling or fail the spawn
+    outright. ``token`` is expected to be an opaque random identifier, so it is
+    validated rather than escaped; a value needing escapes is a caller bug and
+    is refused rather than mangled into a name a reverse lookup would miss.
+    """
+    if not _SCOPE_UNIT_TOKEN_SAFE.match(token or ""):
+        return None
+    return f"{_SCOPE_UNIT_PREFIX}{token}.scope"
+
+
 def cgroup_scope_argv(argv: list[str]) -> list[str]:
     """Wrap *argv* in a transient systemd --user --scope with cgroup v2 limits.
 
@@ -13319,6 +13385,23 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
 
     Layers OUTSIDE the OS-level sandbox: callers pass the already-``wrap_argv``-ed
     argv here so the child is filesystem-isolated AND cgroup-bounded.
+
+    The ceiling is per SPAWN, and therefore per agent RUNTIME rather than per
+    SESSION: one process can serve several sessions (a parent and the subagents
+    whose sessions are created on its runtime), and cgroup v2 kills a breaching
+    scope as ONE unit, so every session on that runtime goes together. The
+    per-scope values come from :func:`_cgroup_limits_from_config`, which is where
+    a ceiling that scales with the number of sessions a runtime serves would
+    attach -- it is the single place both the value and its config source are
+    resolved, so a scaling factor applied there reaches every caller without any
+    spawn site being taught about sessions.
+
+    The scope itself is left ANONYMOUS here -- systemd auto-names it
+    ``run-u<N>.scope``. A caller that can name the runtime it is spawning passes
+    the result through :func:`name_scope_unit`, which is a separate step so that
+    this function's argv stays byte-identical for the many callers wrapping a
+    one-off tool or app subprocess that no reader needs to resolve back to a
+    runtime.
 
     On a host without cgroup v2 delegation (older Linux, no systemd user
     session, macOS), returns *argv* unchanged and logs a one-time loud SECURITY
@@ -13382,6 +13465,33 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
         "--",
         *argv,
     ]
+
+
+def name_scope_unit(argv: list[str], token: str) -> list[str]:
+    """Name the scope in a :func:`cgroup_scope_argv` result after *token*.
+
+    Returns *argv* UNCHANGED unless it really is a systemd-run scope wrapper AND
+    *token* forms a legal unit name (:func:`scope_unit_name`). Both degradations
+    are one decision: the scope's job is the DoS ceiling, the name is a
+    diagnostic, and a diagnostic must never cost a spawn its ceiling nor fail the
+    spawn outright. A host without cgroup delegation (where ``cgroup_scope_argv``
+    hands back the bare command) and a token that cannot be spelled as a unit
+    therefore both leave the spawn exactly as it would otherwise have been.
+
+    A separate step rather than a keyword on ``cgroup_scope_argv`` because that
+    function has dozens of callers and is widely replaced by one-argument stubs in
+    tests: a keyword there would make every one of those stubs refuse the call,
+    for callers that have no runtime to name anyway. The recognition check here
+    makes a stubbed wrap a silent no-op instead.
+
+    ``--unit`` goes BEFORE the ``--`` separator. After it, systemd-run reads it as
+    an argument to the wrapped command instead of a property of the scope.
+    """
+    unit = scope_unit_name(token)
+    if unit is None or "--scope" not in argv or "--" not in argv:
+        return argv
+    at = argv.index("--")
+    return [*argv[:at], "--unit", unit, *argv[at:]]
 
 
 # ── aggregate ceiling on the parent slice ──
