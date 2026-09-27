@@ -1685,12 +1685,12 @@ describe('KiroPrerequisiteGate agent choice', () => {
     expect(screen.getByRole('button', { name: /Use Claude Code/ })).toBeEnabled()
   })
 
-  it('opens the dashboard for a configured, usable non-Kiro agent with no Kiro CLI', async () => {
+  it.each(['installed', 'unknown'] as const)('opens the dashboard for a configured, usable non-Kiro agent with no Kiro CLI (probe: %s)', async (installed) => {
     // The bug this fixes: an operator on Claude Code with no Kiro CLI was held
     // on "Set up Kiro" forever, by checks about an agent they do not run.
     vi.mocked(api.kiroPrerequisite).mockResolvedValue(status())
     vi.mocked(api.kirocrewConfig).mockResolvedValue({ agent: { acp_backend: 'claude' } })
-    vi.mocked(api.acpBackends).mockResolvedValue({ backends: [probe()] })
+    vi.mocked(api.acpBackends).mockResolvedValue({ backends: [probe({ installed })] })
     render()
 
     await settle()
@@ -1808,6 +1808,27 @@ describe('KiroPrerequisiteGate agent choice', () => {
     expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
   })
 
+  it('preserves the unsaved agent choice while retrying a config read failure', async () => {
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status())
+    vi.mocked(api.kirocrewConfig).mockRejectedValue(new ApiError(500, 'Config read failed'))
+    vi.mocked(api.acpBackends).mockResolvedValue({
+      backends: [probe(), probe({ id: 'codex', policy_id: 'codex' })],
+    })
+    render()
+
+    const notice = await screen.findByTestId('kiro-gate-config-error')
+    fireEvent.click(screen.getByRole('button', { name: 'Use other coding agents' }))
+    fireEvent.click(await screen.findByRole('radio', { name: 'codex' }))
+    expect(within(notice).queryByRole('button', { name: /Ask the agent/ })).not.toBeInTheDocument()
+    expect(api.patchConfig).not.toHaveBeenCalled()
+
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ agent: {} })
+    fireEvent.click(within(notice).getByRole('button', { name: 'Try again' }))
+    await waitFor(() => expect(screen.queryByTestId('kiro-gate-config-error')).not.toBeInTheDocument())
+    expect(screen.getByRole('radio', { name: 'codex' })).toBeChecked()
+    expect(api.patchConfig).not.toHaveBeenCalled()
+  })
+
   it.each(['', 'claude'])('surfaces a harness probe failure and keeps the Kiro checks (configured: %s)', async (configured) => {
     vi.mocked(api.kiroPrerequisite).mockResolvedValue(status())
     vi.mocked(api.kirocrewConfig).mockResolvedValue({ agent: { acp_backend: configured } })
@@ -1821,7 +1842,7 @@ describe('KiroPrerequisiteGate agent choice', () => {
     const notice = await screen.findByTestId('other-agents-probe-error')
     expect(notice).toHaveAttribute('role', 'alert')
     expect(notice).toHaveTextContent('Could not check the other agents on this host. You can choose one later in Developer > Agent Backend.')
-    expect(within(notice).queryByRole('button', { name: /Ask the agent/ })).not.toBeInTheDocument()
+    expect(within(notice).getByRole('button', { name: /Ask the agent/ })).toBeEnabled()
     expect(screen.getByRole('heading', { name: 'Get Kiro CLI' })).toBeInTheDocument()
     expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
   })

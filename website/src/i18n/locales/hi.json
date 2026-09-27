@@ -6898,7 +6898,6 @@
       "copied": "कॉपी हो गया",
       "copy_command": "कमांड कॉपी करें",
       "copy_failed": "कॉपी नहीं हो सका। कमांड का टेक्स्ट चुनकर हाथ से कॉपी करो।",
-      "copy_sign_in_command": "साइन-इन कमांड कॉपी करें",
       "could_not_check_kiro_cli": "Kiro CLI की जाँच नहीं हो सकी।",
       "gateway": "गेटवे",
       "gateway_setup_required": "गेटवे सेटअप आवश्यक",

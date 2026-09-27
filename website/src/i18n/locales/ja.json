@@ -6790,7 +6790,6 @@
       "copied": "コピーしました",
       "copy_command": "コマンドをコピー",
       "copy_failed": "コピーできませんでした。コマンドのテキストを選択して手動でコピーしてください。",
-      "copy_sign_in_command": "サインインコマンドをコピー",
       "could_not_check_kiro_cli": "Kiro CLIを確認できませんでした。",
       "gateway": "ゲートウェイ",
       "gateway_setup_required": "ゲートウェイセットアップが必要",

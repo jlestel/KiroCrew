@@ -7006,7 +7006,6 @@
       "copied": "Copiado",
       "copy_command": "Copiar comando",
       "copy_failed": "No se pudo copiar. Selecciona el texto del comando y cópialo a mano.",
-      "copy_sign_in_command": "Copiar el comando de inicio de sesión",
       "could_not_check_kiro_cli": "No se pudo comprobar Kiro CLI.",
       "gateway": "gateway",
       "gateway_setup_required": "Es necesario configurar el gateway",

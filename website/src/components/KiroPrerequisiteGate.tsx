@@ -1249,14 +1249,11 @@ function OtherCodingAgents({
               {i18nT('components.kiroPrerequisiteGate.other_agents_checking')}
             </p>
           ) : failed && others.length === 0 ? (
-            <>
-              {/* No hand-off: no usable agent has been confirmed, and this setup
-                  gate hides the chat the hand-off would open. */}
-              <ErrorNotice
-                message={i18nT('components.kiroPrerequisiteGate.other_agents_unavailable')}
-                testId="other-agents-probe-error"
-              />
-            </>
+            <ErrorNotice
+              message={i18nT('components.kiroPrerequisiteGate.other_agents_unavailable')}
+              testId="other-agents-probe-error"
+              askAgent
+            />
           ) : others.length === 0 ? (
             <p className="text-[13px] text-muted">
               {i18nT('components.kiroPrerequisiteGate.other_agents_none')}
@@ -1708,9 +1705,9 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
 
           {configQuery.isError && (
             <>
-              {/* No hand-off: the configured agent is unknown, and this setup
-                  gate hides the chat the hand-off would open. Retry the read here.
-                  Outside the collapsed picker so the Kiro fallback is not silent. */}
+              {/* No hand-off: OtherCodingAgents below holds the unsaved radio
+                  choice in picked until Use is pressed; navigating would lose it.
+                  Retry here without discarding that agent selection. */}
               <ErrorNotice
                 className="mb-5"
                 message={i18nT('pages.developer.agentBackendTab.could_not_load_the_agent_backend')}

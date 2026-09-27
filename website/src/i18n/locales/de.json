@@ -6898,7 +6898,6 @@
       "copied": "Kopiert",
       "copy_command": "Befehl kopieren",
       "copy_failed": "Kopieren fehlgeschlagen. Markiere den Befehlstext und kopiere ihn von Hand.",
-      "copy_sign_in_command": "Anmeldebefehl kopieren",
       "could_not_check_kiro_cli": "Kiro CLI konnte nicht geprüft werden.",
       "gateway": "Gateway",
       "gateway_setup_required": "Gateway-Einrichtung erforderlich",

@@ -7006,7 +7006,6 @@
       "copied": "Copié",
       "copy_command": "Copier la commande",
       "copy_failed": "La copie a échoué. Sélectionne le texte de la commande et copie-le à la main.",
-      "copy_sign_in_command": "Copier la commande de connexion",
       "could_not_check_kiro_cli": "Impossible de vérifier Kiro CLI.",
       "gateway": "passerelle",
       "gateway_setup_required": "Configuration de la passerelle requise",
