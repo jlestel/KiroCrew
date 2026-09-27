@@ -323,6 +323,8 @@ class TestWindowsCeiling:
     @pytest.fixture
     def windows(self, monkeypatch):
         monkeypatch.setattr(pdf_extract.platform_compat, "IS_WINDOWS", True)
+        # An interpreter, not a venv redirector: the ceiling is exactly one process.
+        monkeypatch.setattr(pdf_extract.platform_compat, "python_launcher_hops", lambda: 0)
         calls: dict[str, list] = {"apply": [], "resume": []}
         monkeypatch.setattr(
             pdf_extract.platform_compat,
@@ -345,6 +347,20 @@ class TestWindowsCeiling:
         assert kw == {"max_procs": 1, "max_memory_bytes": sandbox._EXTRACTOR_MAX_AS_BYTES}
         assert windows["resume"] == [pid]
 
+    def test_a_venv_redirector_is_counted_in_the_process_ceiling(self, windows, monkeypatch):
+        """``Scripts\\python.exe`` in a venv is a redirector that spawns the real
+        interpreter as its child: two live processes, so a ceiling of one refused
+        the very spawn the ceiling was meant to bound and every document came back
+        ``protocol`` from a venv-hosted gateway (measured: exit 101, ``Unable to
+        create process using ...``)."""
+        monkeypatch.setattr(pdf_extract.platform_compat, "python_launcher_hops", lambda: 1)
+        outcome = pdf_extract.extract_pdf_segments(
+            text_pdf("through a redirector"), max_chars=100, deadline=_soon()
+        )
+        assert outcome.segments == (("page 1", "through a redirector"),)
+        [(_pid, kw)] = windows["apply"]
+        assert kw["max_procs"] == 2
+
     def test_no_ceiling_means_no_parse(self, windows):
         windows["apply_ok"] = False
         outcome = pdf_extract.extract_pdf_segments(
@@ -360,6 +376,32 @@ class TestWindowsCeiling:
             text_pdf("frozen"), max_chars=100, deadline=_soon()
         )
         assert outcome == pdf_extract.PdfExtraction((), True, "spawn", 0)
+
+    def test_a_timed_out_child_is_killed_as_a_tree(self, windows, monkeypatch):
+        """On Windows the pid may be a venv redirector whose interpreter is its
+        CHILD, and the Job carries no ``KILL_ON_JOB_CLOSE``: killing the redirector
+        alone leaves the interpreter parsing a slow document for as long as it
+        likes. The deadline path kills the tree, and does so while the redirector
+        is alive to name its children."""
+        trees: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            pdf_extract.platform_compat,
+            "kill_process_tree",
+            lambda pid, sig: trees.append((pid, sig)) or True,
+        )
+        monkeypatch.setattr(
+            pdf_extract,
+            "_child_argv",
+            lambda *_a: [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+        outcome = pdf_extract.extract_pdf_segments(
+            text_pdf("slow"), max_chars=10, deadline=time.monotonic() + 0.5
+        )
+        assert outcome == pdf_extract.PdfExtraction((), True, "timeout", 0)
+        [(pid, sig)] = trees
+        assert sig == pdf_extract.platform_compat.SIGKILL
+        [(applied_pid, _kw)] = windows["apply"]
+        assert pid == applied_pid
 
 
 _ARGV_100_5 = ["--max-chars=100", "--max-pages=5", "--max-rss=1000000000"]

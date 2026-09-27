@@ -247,7 +247,7 @@ def test_snapshot_keeps_installed_legacy_local_grant_effective(
 async def test_get_returns_snapshot_shape(home: Path, mock_sel):
     async with _client() as client:
         resp = await client.get("/api/security/trusted-apps")
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
         body = await resp.json()
         assert body == {"apps": [], "ineffective": [], "allowAll": False}
     # reads do not audit
@@ -262,11 +262,11 @@ async def test_grant_persists_and_is_idempotent(home: Path, tmp_path: Path, mock
     _install(tmp_path, _APP)
     async with _client() as client:
         first = await client.post(f"/api/security/trusted-apps/{_APP}")
-        assert first.status == 200
+        assert first.status == 200, await first.text()
         assert (await first.json()) == {"apps": [_APP], "ineffective": [], "allowAll": False}
 
         second = await client.post(f"/api/security/trusted-apps/{_APP}")
-        assert second.status == 200
+        assert second.status == 200, await second.text()
         # Idempotent: no duplicate entry in the response or on disk.
         assert (await second.json())["apps"] == [_APP]
 
@@ -320,7 +320,7 @@ async def test_revoke_removes_grant_and_is_idempotent(home: Path, tmp_path: Path
         await client.post(f"/api/security/trusted-apps/{_APP}")
 
         first = await client.delete(f"/api/security/trusted-apps/{_APP}")
-        assert first.status == 200
+        assert first.status == 200, await first.text()
         # `warnings` carries anything the teardown wants the operator to LEARN while
         # still reporting success — the leading case is the app's own on_shutdown
         # hook failing, which loses buffered state without leaving code running.
@@ -335,11 +335,11 @@ async def test_revoke_removes_grant_and_is_idempotent(home: Path, tmp_path: Path
 
         # Revoking a name that holds no grant is a 200, not a 404.
         second = await client.delete(f"/api/security/trusted-apps/{_APP}")
-        assert second.status == 200
+        assert second.status == 200, await second.text()
         assert (await second.json())["apps"] == []
 
         never = await client.delete("/api/security/trusted-apps/never-granted")
-        assert never.status == 200
+        assert never.status == 200, await never.text()
         assert (await never.json())["disabled"] is False
 
     assert _stored(home)["apps_trusted"] == []
@@ -353,7 +353,7 @@ async def test_revoke_disables_a_currently_enabled_app(home: Path, tmp_path: Pat
     async with _client() as client:
         await client.post(f"/api/security/trusted-apps/{_APP}")
         resp = await client.delete(f"/api/security/trusted-apps/{_APP}")
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
         body = await resp.json()
 
     # Revocation is EFFECTIVE, not merely declarative: the app's code stops.
@@ -404,7 +404,7 @@ async def test_revoke_tears_down_ineffective_legacy_repository_grant(
     with patch.object(security, "teardown_app_runtime", _teardown):
         async with _client() as client:
             response = await client.delete(f"/api/security/trusted-apps/{_APP}")
-            assert response.status == 200
+            assert response.status == 200, await response.text()
 
     assert torn == [_APP]
     assert _stored(home)["apps_trusted"] == []
@@ -418,7 +418,7 @@ async def test_revoke_tears_down_ineffective_legacy_repository_grant(
 async def test_allow_all_sets_the_blanket_flag(home: Path, mock_sel, value: bool):
     async with _client() as client:
         resp = await client.put("/api/security/trusted-apps/allow-all", json={"value": value})
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
         assert (await resp.json())["allowAll"] is value
     assert _stored(home)["apps_allow_third_party"] is value
 
@@ -539,7 +539,7 @@ async def test_corrupt_config_refusal_does_not_create_the_file(home: Path, mock_
     # implemented as "refuse whenever the parse fails".
     async with _client() as client:
         resp = await client.put("/api/security/trusted-apps/allow-all", json={"value": True})
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
     assert (home / "config.json").is_file()
     assert _stored(home)["apps_allow_third_party"] is True
 
@@ -622,7 +622,7 @@ async def test_revoke_stops_the_backend_process_and_the_beacon(
 
         async with _client() as client:
             resp = await client.delete(f"/api/security/trusted-apps/{_LOOP_APP}")
-            assert resp.status == 200
+            assert resp.status == 200, await resp.text()
             assert (await resp.json())["disabled"] is True
 
         # POSTCONDITION: the process is gone, the registry entry with it, and the
@@ -789,7 +789,7 @@ async def test_revoke_succeeds_when_the_backend_was_merely_dead(
         async with _client() as client:
             await client.post(f"/api/security/trusted-apps/{_APP}")
             resp = await client.delete(f"/api/security/trusted-apps/{_APP}")
-            assert resp.status == 200
+            assert resp.status == 200, await resp.text()
             assert (await resp.json())["disabled"] is True
 
     assert _APP not in build_trusted_apps_snapshot()["apps"]
@@ -844,7 +844,7 @@ async def test_revoke_tears_down_even_when_metadata_says_disabled(
         async with _client() as client:
             await client.post(f"/api/security/trusted-apps/{_APP}")
             resp = await client.delete(f"/api/security/trusted-apps/{_APP}")
-            assert resp.status == 200
+            assert resp.status == 200, await resp.text()
             # `disabled` still answers "did WE switch it off" — the app was already
             # recorded off, so claiming a disable would report a change we did not
             # make. The teardown ran regardless; that is the whole point.
@@ -870,7 +870,7 @@ async def test_revoke_of_a_builtin_still_skips_teardown_when_disabled(
     with patch.object(security, "teardown_app_runtime", _teardown):
         async with _client() as client:
             resp = await client.delete(f"/api/security/trusted-apps/{_BUILTIN}")
-            assert resp.status == 200
+            assert resp.status == 200, await resp.text()
 
     assert torn == []
 
@@ -901,7 +901,7 @@ async def test_blanket_off_sweeps_an_app_whose_metadata_says_disabled(
             off = await client.put(
                 "/api/security/trusted-apps/allow-all", json={"value": False}
             )
-            assert off.status == 200
+            assert off.status == 200, await off.text()
             body = await off.json()
 
     # Swept exactly once: the pre-write pass runs unconditionally, and the bounded
@@ -948,7 +948,7 @@ async def test_blanket_off_sweeps_legacy_repository_grant(
             off = await client.put(
                 "/api/security/trusted-apps/allow-all", json={"value": False}
             )
-            assert off.status == 200
+            assert off.status == 200, await off.text()
 
     assert torn == [_APP]
 
@@ -960,7 +960,7 @@ async def test_blanket_off_keeps_explicit_local_grant_running(
     _install(tmp_path, _APP, enabled=True)
     async with _client() as client:
         granted = await client.post(f"/api/security/trusted-apps/{_APP}")
-        assert granted.status == 200
+        assert granted.status == 200, await granted.text()
         assert (
             await client.put(
                 "/api/security/trusted-apps/allow-all", json={"value": True}
@@ -970,7 +970,7 @@ async def test_blanket_off_keeps_explicit_local_grant_running(
             off = await client.put(
                 "/api/security/trusted-apps/allow-all", json={"value": False}
             )
-            assert off.status == 200
+            assert off.status == 200, await off.text()
             teardown.assert_not_called()
 
 
@@ -1046,7 +1046,7 @@ async def test_blanket_off_sweeps_an_app_that_calls_itself_builtin(
             off = await client.put(
                 "/api/security/trusted-apps/allow-all", json={"value": False}
             )
-            assert off.status == 200
+            assert off.status == 200, await off.text()
 
     # The forged claim buys nothing: the app is still swept.
     assert torn == [_APP]
@@ -1089,7 +1089,7 @@ async def test_teardown_deregisters_even_when_the_app_calls_itself_self_managed(
         async with _client() as client:
             await client.post(f"/api/security/trusted-apps/{_APP}")
             resp = await client.delete(f"/api/security/trusted-apps/{_APP}")
-            assert resp.status == 200
+            assert resp.status == 200, await resp.text()
 
     # The forged claim buys nothing: registered resources are still torn down.
     assert dereg == [_APP]
@@ -1507,7 +1507,7 @@ async def test_a_failed_shutdown_hook_is_reported_without_blocking_the_revoke(
             await client.post(f"/api/security/trusted-apps/{_APP}")
             resp = await client.delete(f"/api/security/trusted-apps/{_APP}")
             # Revocation SUCCEEDS — the permission is withdrawn and the code stopped.
-            assert resp.status == 200
+            assert resp.status == 200, await resp.text()
             body = await resp.json()
 
     # ...and the operator can still learn that state may have been dropped.
@@ -1565,7 +1565,7 @@ async def test_revoke_without_a_grant_leaves_an_enabled_app_running(
 
     async with _client() as client:
         resp = await client.delete(f"/api/security/trusted-apps/{_APP}")
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
         body = await resp.json()
 
     # POSTCONDITION FIRST: the app is untouched. A caller holding no grant over
@@ -1599,7 +1599,7 @@ async def test_revoke_of_a_builtin_name_leaves_the_builtin_enabled(
 
     async with _client() as client:
         resp = await client.delete(f"/api/security/trusted-apps/{_BUILTIN}")
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
         body = await resp.json()
 
     # POSTCONDITION FIRST: the builtin's code is left alone. Shipped code is
@@ -1725,7 +1725,7 @@ async def test_grant_accepts_a_registry_name_that_is_not_installed(
             f"/api/security/trusted-apps/{_REG_ONLY}",
             json={"repository": _REG_ONLY_CLONE_TARGET},
         )
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
         assert (await resp.json())["apps"] == [_REG_ONLY]
 
     # Persisted AND effective, so the install that follows is admitted.
@@ -1768,7 +1768,7 @@ async def test_repository_grant_never_persists_embedded_clone_credentials(
             f"/api/security/trusted-apps/{_REG_ONLY}",
             json={"repository": reviewed},
         )
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
         assert secret not in await resp.text()
 
     stored_raw = (home / "config.json").read_text(encoding="utf-8")
@@ -1834,7 +1834,7 @@ async def test_legacy_registry_install_binds_grant_to_current_repository(
             f"/api/security/trusted-apps/{_APP}",
             json={"repository": current_repository},
         )
-        assert granted.status == 200
+        assert granted.status == 200, await granted.text()
 
     assert _stored(home)["apps_trusted_repositories"] == {
         _APP: current_repository
@@ -1920,7 +1920,7 @@ async def test_unrelated_mutation_never_heals_legacy_unsupported_binding(
             response = await client.post(f"/api/security/trusted-apps/{_APP}")
         else:
             response = await client.delete(f"/api/security/trusted-apps/{_APP}")
-        assert response.status == 200
+        assert response.status == 200, await response.text()
 
     stored = _stored(home)
     assert _OTHER in stored["apps_trusted"]
@@ -2111,7 +2111,7 @@ async def test_failed_cron_cleanup_does_not_report_a_successful_revoke(
     ):
         async with _client() as client:
             resp = await client.delete(f"/api/security/trusted-apps/{_APP}")
-            assert resp.status == 200
+            assert resp.status == 200, await resp.text()
             assert (await resp.json())["disabled"] is True
     assert _APP not in _stored(home).get("apps_trusted", [])
 
@@ -2169,7 +2169,7 @@ async def test_blanket_off_reports_apps_it_could_not_stop(home: Path, tmp_path: 
             on = await client.put(
                 "/api/security/trusted-apps/allow-all", json={"value": True}
             )
-            assert on.status == 200
+            assert on.status == 200, await on.text()
             off = await client.put(
                 "/api/security/trusted-apps/allow-all", json={"value": False}
             )
@@ -2786,7 +2786,7 @@ async def test_grant_preserves_base_settings_shadowed_by_the_overlay(
 
     async with _client() as client:
         resp = await client.post(f"/api/security/trusted-apps/{_APP}")
-        assert resp.status == 200
+        assert resp.status == 200, await resp.text()
 
     base = json.loads((home / "config.json").read_text(encoding="utf-8"))
     # The grant landed...
@@ -2882,7 +2882,7 @@ async def test_blanket_off_runs_shutdown_hooks_before_persisting_false(
             off = await client.put(
                 "/api/security/trusted-apps/allow-all", json={"value": False}
             )
-            assert off.status == 200
+            assert off.status == 200, await off.text()
             assert (await off.json())["allowAll"] is False
 
     # The hook ran, and it ran while the app was still permitted to execute.
@@ -2994,7 +2994,7 @@ async def test_grant_holds_the_app_lifecycle_lock_across_validate_and_write(
     with patch.object(sec, "_mutate_agent_config", _spy):
         async with _client() as client:
             resp = await client.post(f"/api/security/trusted-apps/{_APP}")
-            assert resp.status == 200
+            assert resp.status == 200, await resp.text()
 
     # The write ran while the per-app lifecycle lock was held, so an uninstall
     # cannot interleave between the existence check and the persisted grant.

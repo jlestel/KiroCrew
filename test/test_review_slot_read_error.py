@@ -148,16 +148,32 @@ def _owned_regions(lane: str) -> list[str]:
 
 
 def _fake_bin(tmp_path: Path, gh_body: str) -> Path:
-    """A PATH holding a scripted ``gh`` and a ``sleep`` that does not wait."""
+    """A PATH holding a scripted ``gh``."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     gh = bin_dir / "gh"
     gh.write_text("#!/usr/bin/env bash\n" + gh_body, encoding="utf-8", newline="\n")
     gh.chmod(0o755)
-    sleep = bin_dir / "sleep"
-    sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8", newline="\n")
-    sleep.chmod(0o755)
     return bin_dir
+
+
+SLEEP_LOG = "sleep-calls.txt"
+
+# The lane's retry backoff (``sleep $(( attempt * 5 ))``, 75 s across the six
+# comment reads) is overridden as a shell FUNCTION in the driver, not as a
+# ``sleep`` executable earlier on PATH. Git for Windows' ``bin\bash.exe`` launcher
+# prepends ``/mingw64/bin:/usr/bin`` to the PATH it is handed, so a shim never
+# outranks ``/usr/bin/sleep`` there and every failing read slept its full budget.
+# A function is resolved before any PATH lookup on every platform; each call is
+# recorded so the schedule can be asserted as an event, not inferred from time.
+_SLEEP_OVERRIDE = "\n".join(
+    (
+        "sleep() {",
+        f'  printf \'%s\\n\' "$1" >> "{SLEEP_LOG}"',
+        "}",
+        "",
+    )
+)
 
 
 def _run(bash: str, tmp_path: Path, bin_dir: Path, script: str) -> subprocess.CompletedProcess[str]:
@@ -176,7 +192,7 @@ def _run(bash: str, tmp_path: Path, bin_dir: Path, script: str) -> subprocess.Co
     # early and leaves the rest of the function unparseable. A file is read
     # byte-for-byte on every platform. ``newline`` keeps CRLF out of it.
     driver = tmp_path / "driver.sh"
-    driver.write_text(script, encoding="utf-8", newline="\n")
+    driver.write_text(_SLEEP_OVERRIDE + script, encoding="utf-8", newline="\n")
     return subprocess.run(
         [bash, driver.name],
         capture_output=True,

@@ -9422,6 +9422,44 @@ def nofile_soft_limit() -> int:
     return max(0, int(soft))
 
 
+def python_launcher_hops() -> int:
+    """How many EXTRA processes a Python child spawned from ``sys.executable`` occupies.
+
+    On Windows a virtual environment's ``Scripts\\python.exe`` is not an
+    interpreter: it is the venv redirector, which reads ``pyvenv.cfg``,
+    ``CreateProcess``-es the base interpreter as its own child, and stays alive
+    as that child's parent until it exits. A ``-m`` child launched through
+    ``sys.executable`` from a venv-hosted gateway is therefore TWO live processes
+    in the child's Job, not one. A caller sizing an ``ActiveProcessLimit`` for
+    "this child and nothing else" has to count that hop, or the redirector's own
+    ``CreateProcess`` is what the limit refuses (``ERROR_NOT_ENOUGH_QUOTA``, which
+    the redirector reports as ``Unable to create process using ...`` and exit
+    101) and the child never runs at all.
+
+    Returns ``1`` when ``sys.executable`` is such a redirector -- the interpreter
+    Python actually runs is ``sys._base_executable`` and it is a different file --
+    and ``0`` everywhere else: on POSIX a venv's
+    ``bin/python`` is a symlink or a copy of the real interpreter and spawns
+    nothing. Over-counting is harmless (a ceiling of two instead of one still
+    bounds a fork bomb); under-counting is the defect this exists to remove.
+    """
+    if not IS_WINDOWS:
+        return 0
+    base = getattr(sys, "_base_executable", None)
+    if not base:
+        return 0
+    try:
+        same = os.path.normcase(os.path.realpath(sys.executable)) == os.path.normcase(
+            os.path.realpath(base)
+        )
+    except OSError:
+        # Cannot resolve either path: fall back to the unresolved spellings and
+        # fail toward the hop, since over-counting is harmless and under-counting
+        # is the defect this exists to remove.
+        same = os.path.normcase(sys.executable) == os.path.normcase(base)
+    return 0 if same else 1
+
+
 # ---------------------------------------------------------------------------
 # Windows Job objects — the cgroup-v2-scope analogue
 # ---------------------------------------------------------------------------

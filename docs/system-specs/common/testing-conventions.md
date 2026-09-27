@@ -3036,6 +3036,114 @@ spawn semantics. `session_pid._sync_kill_provider` SIGKILLs a snapshot pid throu
 candidate for its own change, with a test that plants a reissued number. The dashboard
 files' `aiohttp` warnings remain class 15.
 
+### What a thirteenth five-run pass found (Windows host, eight workers, 126,965 tests per run)
+
+Native Windows (Server 2025, 16 cores), five rounds of the backend suite under the sweep
+skill's per-test probe on a test-only worktree off one commit, `-n 8 --timeout 120`, the
+results directory outside the checkout: 121,041 to 121,046 passed, 23 to 28 failed, 0 errors and 5,742 skipped per round, 59 to 80 minutes each (the 80 was the round during which eight extra workers reproduced a finding on the same host), minimum available memory 27.1 GiB. Twenty of the reds were the same twenty every round; the rest were four `pytest-timeout` worker kills a round and, once, two load-induced budget misses. Every round was comparable end to end;
+no round was lost. Two tests were red in all five rounds and are the host, not the suite
+(`test_crew_image_publish_contract.py`'s shared-fixture shell test and
+`test_windows_fleet_setup.py`'s `[pwsh]` case fail BY DESIGN on a host whose `PATH` carries
+no `bash` and no `pwsh`). Everything else red was reproduced on a clean second worktree at
+the same sha before it was touched, and sorted into four mechanisms -- one of them a
+production defect that no Windows developer running from a venv could have missed, one
+already fixed by the concurrent macOS pass, and none of them visible to CI, which runs
+every one of these files green.
+
+The generalisable lesson this time: **a test that passes on CI and fails on a developer's
+Windows box is asserting something about the CI runner.** Three of the four were exactly
+that -- a `HOME` the runner exports and a server session does not, a `python.exe` that is
+an interpreter on the runner and a redirector in every venv, a `sleep` shim the runner's
+Git Bash launcher happens to outrank too but only costs time there. Read the failing
+assertion for the host fact it depends on before reading the test for a bug.
+
+- **A `PATH` shim for a coreutil is not an override under Git for Windows.**
+  `test_withheld_verdict_retention.py` and `test_review_slot_read_error.py` drive the
+  review lanes' real bash with a scripted `gh` and a `sleep` that exits at once, both
+  planted in a directory prepended to `PATH`. Git for Windows' `bin\bash.exe` is a
+  launcher that prepends `/mingw64/bin:/usr/bin` to whatever `PATH` it is handed, so `gh`
+  (not under `/usr/bin`) resolved to the stub and `sleep` resolved to `/usr/bin/sleep`:
+  every failing-`gh` case slept the lane's whole retry budget, `5+10+15+20+25` s. Measured
+  at 76-77 s per test, 3,470 s of worker time in one file per round, and four
+  `pytest-timeout` worker kills per round (the `thread` method exits the worker, which
+  xdist reports as `worker 'gwN' crashed`). On CI the same tests pass at the same cost,
+  45 s inside the shard's `--timeout=120`. The override is now a shell FUNCTION defined at
+  the top of the driver script (`sleep() { printf '%s\n' "$1" >> sleep-calls.txt; }`):
+  functions are resolved before any `PATH` lookup on every platform, and each call is
+  recorded. The pin, `test_the_retry_backoff_is_intercepted_not_slept`, runs the
+  measured instance and asserts the recorded schedule is `5 10 15 20 25` -- an event
+  record, not a stopwatch; with the override removed it fails on "no sleep reached the
+  override" after 151 s. Both files: 444 tests in 54 s at `-n 4`.
+  `test_ai_review_workflows.py` carries the same shim at five sites and already skips
+  them on Windows outright; un-skipping them through the same function is a follow-up
+  that needs a host with `jq`.
+- **A process ceiling of one refuses the venv redirector's own spawn.**
+  `pdf_extract._windows_ceiling` attached a Job object with `ActiveProcessLimit=1` to
+  the suspended extractor child, "this child spawns nothing". Under a venv on Windows,
+  `sys.executable` is `Scripts\python.exe`, the venv REDIRECTOR: it reads `pyvenv.cfg`,
+  `CreateProcess`-es the base interpreter as its own child and stays alive as its
+  parent. With the limit at one that `CreateProcess` fails with `ERROR_NOT_ENOUGH_QUOTA`,
+  the redirector prints `Unable to create process using '"C:\Python312\python.exe" -s -P
+  -m kiro_crew.pdf_extract_child ...'` and exits 101, and the reader files it as
+  `protocol`. So PDF extraction never worked from a venv-hosted gateway on Windows; the
+  five red tests (`test_file_grep.py::TestDocumentPass`, `test_knowledge.py::
+  TestFileReaderPdf`) were deterministic, and CI's `setup-python` interpreter is not a
+  redirector, which is why they are green there. Probe: the same document under a limit
+  of 1 fails `protocol`, under 2 extracts `Hello PDF regression`. The fix is
+  `platform_compat.python_launcher_hops()` -- `1` when `sys.executable` and
+  `sys._base_executable` name different files on Windows, `0` otherwise -- and the
+  ceiling is `1 + hops`. Pins: `TestWindowsCeiling` asserts `max_procs == 2` when the hop
+  is `1` (and keeps the `== 1` pin with the hop pinned to `0`); `TestPythonLauncherHops`
+  derives the number on both platforms with pinned `sys` executables; and a native test
+  spawns `sys.executable -c` under a ceiling of `1 + hops` and asserts it ran, then --
+  on a venv host, where it can be shown -- under `1` and asserts exit 101 with the
+  redirector's message. Over-counting would still bound a fork bomb; under-counting is
+  the defect. The review lane then named the other half of the same shape: on the
+  deadline path `_kill` terminated the pid alone, which under a redirector is the
+  parent of the interpreter parsing the document, and the Job carries no
+  `KILL_ON_JOB_CLOSE` by design -- so the interpreter's end rested on the redirector's
+  own kill-on-close job, a CPython launcher detail (measured here: with the tree kill
+  neutralised the interpreter still died with the redirector). `_kill` now kills the
+  tree on Windows first, while the redirector is alive to name its child, so the
+  guarantee is the gateway's; pinned on the faked path (`kill_process_tree` receives
+  the applied pid) and natively on a venv host (the interpreter's pid is gone after
+  the timeout).
+- **A pass-through assertion needs the key in the parent.** `test_r8_s33_subprocess_env.py`
+  asserts the scrubbed child env still carries `HOME`; the scrub passes it through when
+  the parent has it, and this host's session has no `HOME` (Windows spells it
+  `USERPROFILE`; the CI runners export both). Five tests red every round, measuring the
+  host. An autouse fixture now plants `HOME` under `tmp_path` so the assertion measures
+  the allowlist.
+- **A process global a server-building test publishes outlives the test.**
+  `apps.hooks_integration.init_hooks_system()` sets `_lifecycle_dispatcher` and
+  `_route_registry` and nothing clears them. `test_dashboard_server_startup_coverage.py`
+  builds the server with a `MagicMock` cron service; every later test on that worker then
+  runs `teardown_app_runtime`'s cron cleanup against the mock, whose `remove_all_async`
+  is not awaitable, and the teardown reports `hooks disable failed` -- so
+  `test_trusted_apps_api.py`'s ten revoke tests answered 409 `teardown_incomplete` in
+  every round, spread across whichever workers had run the polluter first, and 113/113
+  green in any selection that had not (the neighbour set at `-n 8`, the whole
+  `test_[s-z]*` tail at `-n 8`). Found by reading the revoke handler's three 409 branches
+  and installing each candidate's leftover through a plugin until the body matched;
+  reproduced deterministically at `-n0` by running the two files in order (10 red on the
+  base). The eleventh pass, on macOS, met the same leak from the other side and carries
+  the fix in [#14388](https://github.com/kirodotdev/KiroCrew/pull/14388): a rootdir
+  conftest floor that hands the next test the two globals it inherited, pinned in
+  `test_host_isolation_floor.py`. This pass adds only the witness the diagnosis needed:
+  the revoke tests' status assertions now carry the response body, so the next 409 names
+  its branch in the failure instead of `assert 409 == 200`.
+What was flagged and read before being left alone. `slow`/`heavy_cpu` was dominated by the
+first mechanism above; the rest were the suite's own budgets (`test_2000_submissions_...`
+85-110 s under its `timeout(900)` marker, the two `test_members_dm_thread` thousand-event
+reads at ~99 s). `env_leak` was again the session-scoped temp-root fixture's arm and undo
+read against a worker's first and last test. `host_write` was the bytecode mirror and the
+hypothesis database, `test_computer_use_launch.py`'s deliberate real-install-directory
+probes and the data-home floor -- nothing touched the live data home or the checkout.
+`under_measured` was the probe's own budget on tests that spawn real children.
+`test_black_fleet_budget.py`'s two real-spawn cases hit their 45 s budget once, in the
+round during which eight extra workers were reproducing the fourth mechanism on the same
+host (6-11 s in every other round): the operator's load, not the suite's.
+
 ## Running the suite: the defaults, and how to narrow safely
 
 The checkpoint run before a commit is the change-related set on both surfaces,

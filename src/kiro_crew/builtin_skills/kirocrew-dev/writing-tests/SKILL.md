@@ -675,3 +675,15 @@ The consequence for how you write a test:
       `installed_kiro_cli_version()`, cached per process, so the module pins it to
       `SPEC_PERMISSIONS_MIN_VERSION` (house fixture) or the host's install decides the
       contract under test
+- [ ] A coreutil a real-bash harness must neutralise (`sleep` in a retry backoff) is a shell
+      FUNCTION defined at the top of the driver script, never an executable planted earlier on
+      `PATH`: Git for Windows' `bin\bash.exe` launcher prepends `/usr/bin` to whatever `PATH`
+      it is handed, so the shim never wins there and every failing case sleeps the whole
+      budget; record each call and assert the SCHEDULE, not the clock
+- [ ] A Windows Job `ActiveProcessLimit` sized as "this child and nothing else" is
+      `1 + platform_compat.python_launcher_hops()`: a venv's `Scripts\python.exe` is a
+      redirector that spawns the real interpreter as its child, so a ceiling of exactly one
+      refuses the spawn it was meant to bound (exit 101, `Unable to create process using`)
+- [ ] A test that asserts a key PASSES THROUGH a scrub (`HOME`, `PATH`) plants that key in the
+      parent first — CI runners export `HOME` on Windows, a server session does not, and the
+      assertion otherwise measures the host

@@ -55,6 +55,21 @@ _GIT_SUPPRESSION = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_CONFIG_NOSYSTEM": "1",
 }
+
+
+@pytest.fixture(autouse=True)
+def _parent_home(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Give the parent a ``HOME`` so the pass-through assertion measures the allowlist.
+
+    The claim under test is that the allowlist PASSES ``HOME`` through, and a
+    pass-through can only be observed when the parent holds the key. Windows
+    hosts carry ``USERPROFILE`` and not necessarily ``HOME`` (CI runners set it,
+    a plain server session does not), so without this pin the assertion reads
+    the host's environment rather than the scrub.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "r8-regression-home"))
+
+
 # Toolchain configuration an operator may have loaded with a secret: a `-D`
 # password in MAVEN_OPTS, a credential store under GRADLE_USER_HOME, an import
 # tree in PYTHONPATH/NODE_PATH. The general spawn allowlist carries all of them

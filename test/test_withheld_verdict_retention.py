@@ -406,10 +406,35 @@ def _fake_bin(tmp_path: Path, gh_body: str) -> Path:
     gh = bin_dir / "gh"
     gh.write_text("#!/usr/bin/env bash\n" + gh_body, encoding="utf-8", newline="\n")
     gh.chmod(0o755)
-    sleep = bin_dir / "sleep"
-    sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8", newline="\n")
-    sleep.chmod(0o755)
     return bin_dir
+
+
+SLEEP_LOG = "sleep-calls.txt"
+
+# The lane's retry backoff is real production budget (5+10+15+20+25 s for the six
+# comment reads alone) and pure latency here, so ``sleep`` is overridden. It is a
+# shell FUNCTION in the driver, not an executable earlier on PATH: Git for
+# Windows' ``bin\bash.exe`` launcher prepends ``/mingw64/bin:/usr/bin`` to
+# whatever PATH it is handed, so a shim directory never outranks ``/usr/bin/sleep``
+# there and every failing-``gh`` case slept its whole budget -- 75 s a test, and
+# past the suite's per-test timeout under load. A function is resolved before
+# any PATH lookup on every platform. Each call is recorded so a test can assert
+# the schedule was TAKEN (the record exists) rather than infer it from the clock.
+_SLEEP_OVERRIDE = "\n".join(
+    (
+        "sleep() {",
+        f'  printf \'%s\\n\' "$1" >> "{SLEEP_LOG}"',
+        "}",
+        "",
+    )
+)
+
+
+def _sleep_calls(tmp_path: Path) -> list[str]:
+    path = tmp_path / SLEEP_LOG
+    if not path.is_file():
+        return []
+    return path.read_text(encoding="utf-8").split()
 
 
 def _run(
@@ -439,7 +464,7 @@ def _run(
     (tmp_path / "step-output.txt").write_text("", encoding="utf-8", newline="\n")
     path = tmp_path / "driver.sh"
     path.write_text(
-        (_harness(lane) if harness is None else harness) + driver,
+        _SLEEP_OVERRIDE + (_harness(lane) if harness is None else harness) + driver,
         encoding="utf-8",
         newline="\n",
     )
@@ -1140,3 +1165,34 @@ class TestAVerdictWithheldBeforeAnyWriteIsRetained:
         assert f"is no longer this PR's head ({OTHER_HEAD})" in result.stdout, result.stdout
         assert not (tmp_path / RETAIN_DIR).exists(), sorted(tmp_path.iterdir())
         assert ARTIFACT_OUTPUT not in (tmp_path / "step-output.txt").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# The harness itself: the backoff is intercepted, not slept through.
+# --------------------------------------------------------------------------- #
+def test_the_retry_backoff_is_intercepted_not_slept(tmp_path: Path) -> None:
+    """The lane's backoff schedule reaches the override, so no test waits it out.
+
+    Pinned as an EVENT record rather than a stopwatch: every ``sleep`` the lane
+    issues lands in ``sleep-calls.txt``, and a real ``/usr/bin/sleep`` would land
+    nothing there. A PATH shim regresses silently on Git for Windows -- its
+    ``bin\\bash.exe`` launcher puts ``/usr/bin`` ahead of any shim directory -- and
+    showed up only as 75 s per failing-``gh`` case and worker timeouts under load.
+    The schedule asserted is the six-attempt comment-read budget the harness
+    slices out of the lane (``sleep $(( attempt * 5 ))`` for attempts 1..5), so a
+    lane that changes its budget changes this list, on purpose.
+    """
+    if not UPSERT_LANES:
+        pytest.skip("no lane slices an upsert harness")
+    lane = UPSERT_LANES[0]
+    result = _run(
+        lane,
+        tmp_path,
+        GH_LOOKUP_AND_HEAD_UNREADABLE,
+        _upsert_driver(),
+        harness=_upsert_harness(lane),
+    )
+    assert "RC=0" in result.stdout, (result.stdout, result.stderr)
+    calls = _sleep_calls(tmp_path)
+    assert calls, "no sleep reached the override: the lane's real backoff ran"
+    assert calls[:5] == ["5", "10", "15", "20", "25"], calls
