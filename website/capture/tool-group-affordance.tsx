@@ -14,25 +14,20 @@
  * items and a working step; a reasoning run only groups outside one), the real
  * renderer registry (`createTranscriptRenderers`, so an expanded group shows
  * ThinkingBlock rows, not an empty well) and the real host row wrapper — the
- * geometry a member DM or embed reader actually sees. And, as in
- * transcript-row-style.tsx, this file hand-writes NO Tailwind classes:
+ * geometry a member DM or embed reader actually sees. This file also
+ * hand-writes NO Tailwind classes:
  * `capture/` is outside the Tailwind content glob, so a class authored here is
  * never compiled and would make the frame unfalsifiable.
  *
  *   ?theme=dark|light
  */
 import { createRoot } from 'react-dom/client'
-import { combineReducers, configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 
 import { initI18n } from '../src/i18n'
-import dashboardReducer from '../src/store/dashboardSlice'
-import notificationsReducer from '../src/store/notificationsSlice'
-import chatReducer from '../src/store/chatSlice'
-import instancesReducer from '../src/store/instancesSlice'
-import { store as realStore } from '../src/store'
+import { store } from '../src/store'
 import ChatMessageList from '../src/app-sdk/ChatMessageList'
 import { createTranscriptRenderers } from '../src/pages/chat/transcriptRenderers'
 import type { ChatMessage } from '../src/types'
@@ -43,31 +38,10 @@ const theme = params.get('theme') || 'dark'
 
 document.documentElement.setAttribute('data-theme', theme === 'light' ? 'kiro-light' : 'kiro-dark')
 
-// MarkdownRenderer probes path-like inline code and unfurls links; neither
-// endpoint exists here and a pending probe leaves a chip mid-load.
-const realFetch = globalThis.fetch.bind(globalThis)
-globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
-  if (url.startsWith('/api/file-read')) {
-    return Promise.resolve(new Response(null, { status: 200, headers: { 'X-Path-Kind': 'file' } }))
-  }
-  if (url.startsWith('/api/link-meta')) return Promise.resolve(Response.json({}))
-  return realFetch(input as RequestInfo, init)
-}) as typeof fetch
-
+// The real store, unseeded: neither surface reads slot state. The endpoints
+// MarkdownRenderer probes for path-like code and link unfurls are answered by
+// the runner's Playwright routes (see scripts/capture-tool-group-affordance.mjs).
 const SLOT = 'main'
-
-const rootReducer = combineReducers({
-  dashboard: dashboardReducer,
-  notifications: notificationsReducer,
-  chat: chatReducer,
-  instances: instancesReducer,
-})
-const base = realStore.getState()
-const store = configureStore({
-  reducer: rootReducer,
-  preloadedState: { ...base, chat: { ...base.chat, activeSlot: SLOT } },
-})
 
 let seq = 0
 /** Distinct ts per row: ChatMessageList keys rows off it. */

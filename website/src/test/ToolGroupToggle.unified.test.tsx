@@ -5,9 +5,9 @@
  * through `ToolGroupToggle`, so a reader never meets a bare text row in one host
  * and a filled pill in the other for the same folded content. This file locks
  * the parts of that a reader can see or a screen reader can hear:
- * the same button classes, the same disclosure glyph, the same accessible
- * name shape, and — for TurnBlock — the count and toggle behaviour it already
- * had, unchanged.
+ * the same button classes, the same disclosure chevron, `aria-expanded` on
+ * both, an accessible name a speech-input user can say, and — for TurnBlock —
+ * the count and toggle behaviour it already had, unchanged.
  */
 import { describe, it, expect } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
@@ -31,7 +31,7 @@ const twoCalls = (): TurnItem[] => [
 const toggleOf = (c: HTMLElement) => c.querySelector<HTMLButtonElement>(TOGGLE)!
 
 describe('ToolGroupToggle — both hosts render the same affordance', () => {
-  it('TurnBlock and CollapsibleToolGroup emit a button with identical classes and glyph', () => {
+  it('TurnBlock and CollapsibleToolGroup emit a button with identical classes and chevron', () => {
     const turn = render(<TurnBlock turn={makeTurn(twoCalls())} renderItem={renderItem} />)
     const turnBtn = toggleOf(turn.container)
     turn.unmount()
@@ -44,9 +44,12 @@ describe('ToolGroupToggle — both hosts render the same affordance', () => {
     expect(turnBtn.className).toMatch(/\bbg-card\b/)
     expect(turnBtn.className).toMatch(/\bring-1\b/)
     expect(turnBtn.className).toMatch(/\bfont-mono\b/)
-    // One disclosure glyph in both, pointing right while collapsed.
-    expect(turnBtn.textContent).toContain('▶')
-    expect(groupBtn.textContent).toContain('▶')
+    // One Lucide disclosure chevron in both (no text glyph), pointing right
+    // while collapsed.
+    expect(turnBtn.querySelector('svg.lucide-chevron-right')).not.toBeNull()
+    expect(groupBtn.querySelector('svg.lucide-chevron-right')).not.toBeNull()
+    expect(turnBtn.textContent).not.toContain('▶')
+    expect(groupBtn.textContent).not.toContain('▶')
     expect(turnBtn.querySelector('.rotate-90')).toBeNull()
     expect(groupBtn.querySelector('.rotate-90')).toBeNull()
     // Both say "2 tool calls" with the wrench in front of it.
@@ -56,16 +59,20 @@ describe('ToolGroupToggle — both hosts render the same affordance', () => {
     expect(groupBtn.querySelector('svg.lucide-wrench')).not.toBeNull()
   })
 
-  it('carries the same a11y contract in both hosts: button role, aria-expanded, verb-led name', () => {
+  it('carries the a11y contract in both hosts: button role, aria-expanded, a sayable name', () => {
+    // TurnBlock's visible label already states the action, so it IS the name
+    // (WCAG 2.5.3 label-in-name): no aria-label, the state rides on aria-expanded.
     const turn = render(<TurnBlock turn={makeTurn(twoCalls())} renderItem={renderItem} />)
-    const turnBtn = screen.getByRole('button', { name: /^Expand .*2 tool calls/ })
+    const turnBtn = screen.getByRole('button', { name: '2 tool calls' })
     expect(turnBtn).toHaveAttribute('aria-expanded', 'false')
+    expect(turnBtn.hasAttribute('aria-label')).toBe(false)
     fireEvent.click(turnBtn)
     expect(turnBtn).toHaveAttribute('aria-expanded', 'true')
-    // The visible label flips to "Hide tool calls", the name keeps the count.
-    expect(turnBtn.textContent).toContain('Hide tool calls')
-    expect(turnBtn.getAttribute('aria-label')).toBe('Collapse 2 tool calls')
+    expect(screen.getByRole('button', { name: 'Hide tool calls' })).toBe(turnBtn)
     turn.unmount()
+
+    // The group's label is stateless ("2 tool calls" in both states), so its
+    // name leads with the verb the label lacks.
 
     render(<CollapsibleToolGroup count={2}><div>row</div></CollapsibleToolGroup>)
     const groupBtn = screen.getByRole('button', { name: /^Expand .*2 tool calls/ })

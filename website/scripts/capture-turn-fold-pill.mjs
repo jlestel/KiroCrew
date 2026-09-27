@@ -3,8 +3,9 @@
  *
  * The dashboard's ChatPage is the host whose turn toggle the issue contrasts
  * with the embed's group header. These frames show the ChatPage host rendering
- * the same pill as the app-sdk host (see capture-tool-group-affordance.mjs),
- * collapsed and then expanded, in dark and light.
+ * the same pill as the app-sdk host (see capture-tool-group-affordance.mjs) for
+ * BOTH of TurnBlock's folds -- the tool fold and the collapse-all step fold --
+ * collapsed and then expanded, in dark and light (8 frames).
  *
  * Runs the REAL built SPA (website/dist) behind the shared transcript harness
  * with every /api/** call answered from fixtures — no gateway, no token, no
@@ -91,6 +92,7 @@ async function main() {
     expanded: b.getAttribute('aria-expanded'),
     label: b.getAttribute('aria-label'),
     glyphRotated: !!b.querySelector('.rotate-90'),
+    lucideChevron: !!b.querySelector('svg.lucide-chevron-right'),
   }))
 
   async function shot(name) {
@@ -110,34 +112,47 @@ async function main() {
     console.log('wrote', `${OUT}/${name}.png`)
   }
 
-  for (const theme of ['dark', 'light']) {
+  /**
+   * Two folds, same pill. `tools`: "collapse all steps" OFF, so the turn folds
+   * only its tool calls (the issue's subject) -- "2 tool calls" / "Hide tool
+   * calls" with the wrench. `steps`: the default preference, where every working
+   * step folds -- "Worked through 2 steps" / "Hide reasoning" with the reasoning
+   * sparkle. Both are shot so the frame set shows every label the pill wears.
+   */
+  const FOLDS = {
+    tools: { collapseAllSteps: false, collapsed: '2 tool calls', expanded: 'Hide tool calls', icon: 'svg.lucide-wrench' },
+    steps: { collapseAllSteps: true, collapsed: 'Worked through 2 steps', expanded: 'Hide reasoning', icon: 'svg.lucide-sparkles' },
+  }
+
+  for (const [fold, want] of Object.entries(FOLDS)) for (const theme of ['dark', 'light']) {
     await load(theme, TOGGLE_WAIT)
-    // Pin the locale to English and turn "collapse all steps" OFF so the turn
-    // folds its TOOL CALLS (the issue's subject) rather than every working
-    // step; in default mode the same pill reads "Worked through 2 steps".
-    // Each `load` registers an init script that CLEARS localStorage, and init
-    // scripts run in registration order, so this one is registered AFTER every
-    // load — once per theme — to land after that theme's clear on the reload.
-    await page.addInitScript(() => {
+    // Pin the locale to English and set the fold preference. Each `load`
+    // registers an init script that CLEARS localStorage, and init scripts run
+    // in registration order, so this one is registered AFTER every load -- once
+    // per frame pair -- to land after that load's clear on the reload.
+    await page.addInitScript(cfg => {
       localStorage.setItem('mc-lang', 'en')
-      localStorage.setItem('mc-chat-config', JSON.stringify({ collapseAllSteps: false }))
-    })
+      localStorage.setItem('mc-chat-config', JSON.stringify(cfg))
+    }, { collapseAllSteps: want.collapseAllSteps })
     await page.reload({ waitUntil: 'domcontentloaded' })
     await page.waitForSelector(TOGGLE, { timeout: 20000 })
     await page.waitForTimeout(900)
 
+    const tag = `${fold}-${theme}`
     const count = await page.locator(TOGGLE).count()
-    console.log(`[${theme}] toggles:`, count)
-    if (count !== 1) { console.error(`FAIL [${theme}]: expected 1 toggle, saw ${count}`); failed++ }
+    console.log(`[${tag}] toggles:`, count)
+    if (count !== 1) { console.error(`FAIL [${tag}]: expected 1 toggle, saw ${count}`); failed++ }
 
     const collapsed = await probe()
-    console.log(`[${theme}] collapsed:`, JSON.stringify(collapsed))
-    if (!collapsed.text.includes('2 tool calls')) { console.error(`FAIL [${theme}]: label is not "2 tool calls"`); failed++ }
-    if (collapsed.expanded !== 'false' || collapsed.glyphRotated) { console.error(`FAIL [${theme}]: not in the collapsed state`); failed++ }
+    console.log(`[${tag}] collapsed:`, JSON.stringify(collapsed))
+    if (!collapsed.text.includes(want.collapsed)) { console.error(`FAIL [${tag}]: label is not "${want.collapsed}"`); failed++ }
+    if (collapsed.expanded !== 'false' || collapsed.glyphRotated) { console.error(`FAIL [${tag}]: not in the collapsed state`); failed++ }
     if (!/\bbg-card\b/.test(collapsed.className) || !/\bring-1\b/.test(collapsed.className)) {
-      console.error(`FAIL [${theme}]: toggle is not the pill (missing bg-card / ring-1)`); failed++
+      console.error(`FAIL [${tag}]: toggle is not the pill (missing bg-card / ring-1)`); failed++
     }
-    await shot(`${theme}-collapsed`)
+    if (!collapsed.lucideChevron || collapsed.text.includes('▶')) { console.error(`FAIL [${tag}]: disclosure indicator is not the Lucide chevron`); failed++ }
+    if (!(await page.locator(`${TOGGLE} ${want.icon}`).count())) { console.error(`FAIL [${tag}]: fold icon ${want.icon} missing`); failed++ }
+    await shot(`${tag}-collapsed`)
 
     // The transcript is virtualized and rows are absolutely positioned, so
     // dispatch the click on the node itself rather than through hit-testing.
@@ -145,14 +160,16 @@ async function main() {
     await page.waitForTimeout(700)
 
     const expanded = await probe()
-    console.log(`[${theme}] expanded:`, JSON.stringify(expanded))
-    if (expanded.expanded !== 'true' || !expanded.glyphRotated) { console.error(`FAIL [${theme}]: not in the expanded state`); failed++ }
-    if (expanded.label !== 'Collapse 2 tool calls') { console.error(`FAIL [${theme}]: accessible name is ${expanded.label}`); failed++ }
+    console.log(`[${tag}] expanded:`, JSON.stringify(expanded))
+    if (expanded.expanded !== 'true' || !expanded.glyphRotated) { console.error(`FAIL [${tag}]: not in the expanded state`); failed++ }
+    // The visible label IS the accessible name (no aria-label), so a speech-input
+    // user can say what they see; aria-expanded carries the state.
+    if (expanded.label !== null || !expanded.text.includes(want.expanded)) { console.error(`FAIL [${tag}]: accessible name shape wrong (aria-label=${expanded.label}, text=${expanded.text})`); failed++ }
     // The fold must reveal its two tool rows (ToolCallLine pills are buttons).
-    const rows = await page.locator('[data-testid="tool-call-line"], [data-display-index] button:not([data-testid="tool-group-toggle"])').count()
-    console.log(`[${theme}] revealed rows:`, rows)
-    if (rows < 2) { console.error(`FAIL [${theme}]: expanded fold shows ${rows} rows, expected >= 2`); failed++ }
-    await shot(`${theme}-expanded`)
+    const rows = await page.locator('[data-display-index] button:not([data-testid="tool-group-toggle"])').count()
+    console.log(`[${tag}] revealed rows:`, rows)
+    if (rows < 2) { console.error(`FAIL [${tag}]: expanded fold shows ${rows} rows, expected >= 2`); failed++ }
+    await shot(`${tag}-expanded`)
   }
 
   await close()

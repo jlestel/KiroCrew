@@ -8,7 +8,7 @@ import ErrorNotice from '../../components/ErrorNotice'
 import { ApiError } from '../../api/client'
 import { isTerminalApprovalRefusal } from '../../api/apiError'
 import { useRowDisclosure } from './rowDisclosure'
-import ToolGroupToggle from './ToolGroupToggle'
+import ToolGroupToggle from '../../components/ToolGroupToggle'
 
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'

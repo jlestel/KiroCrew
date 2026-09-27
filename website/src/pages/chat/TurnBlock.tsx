@@ -15,7 +15,7 @@ import { isDiffToolMessage } from './toolDiff'
 import { findOptionMarkers, stripOptionMarkers } from '../../app-sdk/protocol/optionMarker'
 import { hasKeepVisibleMarker } from '../../app-sdk/protocol/keepVisibleMarker'
 import { i18nT } from '../../i18n/t'
-import ToolGroupToggle from './ToolGroupToggle'
+import ToolGroupToggle from '../../components/ToolGroupToggle'
 
 // A workflow_run launch renders as its own always-visible inline card
 // (WorkflowRunCard), so it must never be folded into the collapsible tool-call
@@ -434,8 +434,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
     }
     const children: ReactNode[] = [
       <CollapseToggle key="toggle" expanded={expanded} onToggle={toggle} icon="steps"
-        label={expanded ? i18nT('pages.chat.thinkingBlock.hide_reasoning') : i18nT('pages.chat.turnBlock.worked_through_step', { count: stepCount })}
-        name={i18nT('pages.chat.turnBlock.worked_through_step', { count: stepCount })} />,
+        label={expanded ? i18nT('pages.chat.thinkingBlock.hide_reasoning') : i18nT('pages.chat.turnBlock.worked_through_step', { count: stepCount })} />,
     ]
     for (const seg of segs) {
       if (seg.type === 'visible') {
@@ -475,8 +474,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
 
     const children: ReactNode[] = [
       <CollapseToggle key="toggle" expanded={expanded} onToggle={toggle} icon="steps"
-        label={expanded ? i18nT('pages.chat.thinkingBlock.hide_reasoning') : i18nT('pages.chat.turnBlock.worked_through_step', { count: stepCount })}
-        name={i18nT('pages.chat.turnBlock.worked_through_step', { count: stepCount })} />,
+        label={expanded ? i18nT('pages.chat.thinkingBlock.hide_reasoning') : i18nT('pages.chat.turnBlock.worked_through_step', { count: stepCount })} />,
     ]
     for (const seg of segs) {
       if (seg.type === 'visible') {
@@ -529,8 +527,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
 
   const children: ReactNode[] = [
     <CollapseToggle key="toggle" expanded={expanded} onToggle={toggle} icon="tools"
-      label={expanded ? i18nT('pages.chat.turnBlock.hide_tool_calls') : i18nT('pages.chat.collapsibleToolGroup.tool_call', { count: toolCount })}
-      name={i18nT('pages.chat.collapsibleToolGroup.tool_call', { count: toolCount })} />,
+      label={expanded ? i18nT('pages.chat.turnBlock.hide_tool_calls') : i18nT('pages.chat.collapsibleToolGroup.tool_call', { count: toolCount })} />,
   ]
   for (const seg of segments) {
     if (seg.type === 'visible') {
@@ -552,23 +549,21 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
 
 /**
  * The turn's fold toggle, rendered through the SAME pill `CollapsibleToolGroup`
- * uses (see ToolGroupToggle) so the two hosts show one affordance for "N tool
+ * uses (see components/ToolGroupToggle) so the two hosts show one affordance for "N tool
  * calls are folded here" (#9699). This wrapper only adds what the turn-level
  * placement needs: the content-column width the folded rows below it share,
  * and the icon that says what kind of steps are folded — a wrench for tool
  * calls, the reasoning sparkle for the interim / collapse-all step folds.
- * `label` is what the pill shows, `name` what the accessible name says.
+ * No `labelText`: the visible label already states the action ("2 tool
+ * calls" folded, "Hide tool calls" open), so it IS the accessible name and a
+ * speech-input user can say what they see; `aria-expanded` carries the state.
  */
-function CollapseToggle({ expanded, onToggle, label, name, icon }: { expanded: boolean; onToggle: () => void; label: string; name: string; icon: 'tools' | 'steps' }) {
+function CollapseToggle({ expanded, onToggle, label, icon }: { expanded: boolean; onToggle: () => void; label: string; icon: 'tools' | 'steps' }) {
   return (
     <div className="px-4 py-1 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
       <ToolGroupToggle
         expanded={expanded}
         onToggle={onToggle}
-        // The visible label swaps to "Hide …" while open; the accessible name
-        // keeps the count in both states, so the pill reads "Collapse 2 tool
-        // calls", never "Collapse Hide tool calls".
-        labelText={name}
         label={<>{icon === 'tools' ? <Wrench className="lucide-inline" /> : <Sparkles className="lucide-inline" />} {label}</>}
       />
     </div>

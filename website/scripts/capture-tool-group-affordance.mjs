@@ -40,6 +40,12 @@ for (const theme of ['dark', 'light']) {
   const errors = []
   page.on('pageerror', e => errors.push(String(e)))
 
+  // MarkdownRenderer probes path-like inline code and unfurls links; neither
+  // endpoint exists on the capture server and a pending probe leaves a chip
+  // mid-load, so both are answered here.
+  await page.route('**/api/file-read**', route => route.fulfill({ status: 200, headers: { 'X-Path-Kind': 'file' }, body: '' }))
+  await page.route('**/api/link-meta**', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }))
+
   try {
     await page.goto(`${BASE}/capture/tool-group-affordance.html?theme=${theme}`, { waitUntil: 'networkidle' })
     await page.waitForSelector('[data-capture-root]', { timeout: 15000 })
@@ -55,6 +61,7 @@ for (const theme of ['dark', 'light']) {
         expanded: b.getAttribute('aria-expanded'),
         label: b.getAttribute('aria-label'),
         glyphRotated: !!b.querySelector('.rotate-90'),
+        lucideChevron: !!b.querySelector('svg.lucide-chevron-right'),
       }))
     }, TOGGLE)
 
@@ -68,6 +75,7 @@ for (const theme of ['dark', 'light']) {
       if (!t.text.includes('2 tool calls')) { console.error(`FAIL [${theme}] ${t.surface}: label is not "2 tool calls"`); failed++ }
       if (t.expanded !== 'false') { console.error(`FAIL [${theme}] ${t.surface}: aria-expanded should be false`); failed++ }
       if (t.glyphRotated) { console.error(`FAIL [${theme}] ${t.surface}: glyph rotated while collapsed`); failed++ }
+      if (!t.lucideChevron || t.text.includes('▶')) { console.error(`FAIL [${theme}] ${t.surface}: disclosure indicator is not the Lucide chevron`); failed++ }
     }
 
     await page.mouse.move(0, 0)
@@ -83,7 +91,10 @@ for (const theme of ['dark', 'light']) {
     for (const t of expanded) {
       if (t.expanded !== 'true') { console.error(`FAIL [${theme}] ${t.surface}: aria-expanded should be true`); failed++ }
       if (!t.glyphRotated) { console.error(`FAIL [${theme}] ${t.surface}: glyph not rotated while expanded`); failed++ }
-      if (!t.label?.startsWith('Collapse ')) { console.error(`FAIL [${theme}] ${t.surface}: name does not lead with Collapse`); failed++ }
+      // The group's stateless label gets a verb-led name; the turn's label
+      // states the action itself and is the name (no aria-label).
+      const nameOk = t.surface === 'group' ? t.label?.startsWith('Collapse ') : (t.label === null && t.text.includes('Hide tool calls'))
+      if (!nameOk) { console.error(`FAIL [${theme}] ${t.surface}: accessible name shape wrong (aria-label=${t.label})`); failed++ }
     }
     // The turn's fold reveals its two tool rows; the group reveals two
     // reasoning rows. Counted so an expansion that draws nothing cannot pass.
