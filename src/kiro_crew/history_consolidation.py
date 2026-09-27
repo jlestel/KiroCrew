@@ -33,7 +33,7 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.project_scope import scope_is_admissible
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance
+from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance, ClaimRefusal
 from kiro_crew.skills_dedupe import (
     VERDICT_DUP,
     VERDICT_NEW,
@@ -1796,13 +1796,27 @@ class HistoryConsolidator:
         )
         # _event_loop was captured by our caller (_consolidate) so the
         # thread-offloaded dedupe judge can marshal back onto the gateway loop.
+        refusal = ClaimRefusal()
         await asyncio.to_thread(
             self._process_auto_skills,
             result,
             key,
             guard_publication=True,
             commit_state=commit_state,
+            refusal=refusal,
         )
+        if refusal.retryable:
+            # A claim path refused because the slug claim lock was unavailable --
+            # a property of the moment, not of the candidate. The marker recorded
+            # above would otherwise skip this session until a further message
+            # changed the count or a restart cleared it, so a session that goes
+            # quiet right after the stall would lose the candidate. Retracting it
+            # makes the retry the lock helper documents actually happen on the
+            # next pass. The consolidation offset is deliberately NOT held back:
+            # history, semantic and lesson extraction share it, so rewinding it
+            # would re-summarize an already-consolidated tail into duplicates,
+            # which is why skill detection was decoupled from that offset.
+            self._last_skillgen_marker.pop(key, None)
 
     def _gated_lesson_scope(self, item: dict) -> tuple[str | None, bool]:
         """The lesson's ``repo_scope`` to forward, plus whether to DROP the lesson.
@@ -2357,6 +2371,7 @@ class HistoryConsolidator:
         scripts: "list[dict] | None" = None,
         guard_publication: bool = False,
         commit_state: _RunCommitState | None = None,
+        refusal: ClaimRefusal | None = None,
     ) -> None:
         """Stage a pending UPDATE candidate for an existing auto-skill.
 
@@ -2484,6 +2499,7 @@ class HistoryConsolidator:
                 kind="update",
                 target=target_key,
                 base_version=base_version,
+                refusal=refusal,
             )
             if name:
                 publication.mark_committed()
@@ -2523,6 +2539,7 @@ class HistoryConsolidator:
         *,
         guard_publication: bool = False,
         commit_state: _RunCommitState | None = None,
+        refusal: ClaimRefusal | None = None,
     ) -> None:
         """Extract + write auto-generated skills from the consolidation result.
 
@@ -2531,6 +2548,14 @@ class HistoryConsolidator:
         against existing skills (for new creation) before being written
         through ``SkillsLoader``.  Every successful write emits a SEL audit
         event via ``_facade_sel().log_tool_invocation``.
+
+        ``refusal``, when supplied, is filled in by whichever claim path was
+        refused because the slug claim lock was unavailable. That is the one
+        not-staged outcome worth another pass, and the caller uses it to retract
+        this session's detection marker; every other rejection is a property of
+        the candidate and stays final. It is an out-parameter, not a return value,
+        so a test that patches this method away cannot accidentally report a
+        refusal that never happened.
         """
         if self._skills_loader is None:
             return
@@ -2647,6 +2672,7 @@ class HistoryConsolidator:
                         scripts=valid_scripts or None,
                         guard_publication=guard_publication,
                         commit_state=commit_state,
+                        refusal=refusal,
                     )
                 else:
                     provenance = AutoSkillProvenance(
@@ -2692,6 +2718,7 @@ class HistoryConsolidator:
                                 procedure_md=procedure_md,
                                 provenance=provenance,
                                 scripts=valid_scripts or None,
+                                refusal=refusal,
                             )
                             if name:
                                 publication.mark_committed()
@@ -2729,6 +2756,7 @@ class HistoryConsolidator:
                                 triggers=triggers,
                                 procedure_md=procedure_md,
                                 provenance=provenance,
+                                refusal=refusal,
                             )
                             if name:
                                 publication.mark_committed()

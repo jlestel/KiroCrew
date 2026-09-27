@@ -4235,6 +4235,84 @@ class TestSkillDetectionFullWindow:
                 )
 
     @pytest.mark.asyncio
+    async def test_claim_lock_stall_reopens_detection_on_the_next_pass(self, tmp_path):
+        """A candidate refused by the slug claim lock must be re-judged immediately.
+
+        The length guard above is what makes the lock refusal lossy: the marker is
+        recorded before staging runs, so a pass that staged nothing because another
+        process held the claim lock would be skipped until a further message changed
+        the count or a restart cleared the marker. A session that goes quiet right
+        after the stall would drop the candidate. The claim path reports that one
+        refusal as retryable and the marker is retracted, so the next pass re-judges
+        the SAME unchanged session -- no new message and no rotation.
+        """
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        c = HistoryConsolidator(
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            approval_required=True,
+            auto_min_tool_calls=5,
+        )
+        key = "dashboard:chat-claim-stall"
+        for i in range(6):
+            conv_log.append(key, "assistant", f"step {i}", tools=["execute_bash"])
+        c._event_loop = _asyncio.get_running_loop()
+
+        stalled = True
+
+        def refuse_once(result, k, refusal=None, **_kwargs):
+            # Stand in for whichever claim path ran: the first pass loses the lock,
+            # the second acquires it and reaches a real decision. The parameter is
+            # accepted untyped on purpose -- the pin is that the detection pass
+            # OFFERS somewhere to report the refusal and acts on it, so a tree that
+            # never passes one fails the marker assertion below rather than failing
+            # to import a name. ``**_kwargs`` absorbs the publication-guard
+            # arguments the real caller also passes, so this double pins the
+            # refusal contract without freezing the rest of the signature.
+            if stalled and refusal is not None:
+                refusal.retryable = True
+
+        with patch.object(c, "_call_llm", return_value={"new_skill": {"slug": "x"}}) as m1:
+            with patch.object(c, "_process_auto_skills", side_effect=refuse_once):
+                await c._run_skill_detection(key)
+                assert m1.call_count == 1
+                assert key not in c._last_skillgen_marker, (
+                    "a claim-lock refusal must not leave a marker that suppresses "
+                    "the retry the lock helper documents"
+                )
+                await c._run_skill_detection(key)
+                assert m1.call_count == 2, (
+                    "the pass after a claim-lock stall must re-judge the same "
+                    "unchanged session, with no new message and no rotation"
+                )
+                # The control: once the lock is free the refusal is not reported, so
+                # the marker stands again and the guard resumes skipping.
+                stalled = False
+                await c._run_skill_detection(key)
+                assert m1.call_count == 3  # the pass that records a clean marker
+                await c._run_skill_detection(key)
+                assert m1.call_count == 3, (
+                    "a pass that was not refused by the lock must still record its "
+                    "marker, or every session would be re-judged forever"
+                )
+        assert conv_log.unconsolidated_count(key) == 6, (
+            "retracting the detection marker must not rewind the consolidation "
+            "offset that history, semantic and lesson extraction share"
+        )
+
+    @pytest.mark.asyncio
     async def test_rotation_forces_fresh_pass_despite_equal_count(self, tmp_path):
         """A transcript rotation (generation bump) must re-trigger detection
         even when the message count is unchanged (GPT 5.6 blocking finding)."""

@@ -64,6 +64,7 @@ class FakeLoader:
         base_version=None,
         scripts=None,
         source="consolidation",
+        refusal=None,
     ):
         self.staged.append(
             {
