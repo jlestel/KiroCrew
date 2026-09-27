@@ -221,6 +221,7 @@ from kiro_crew.dashboard.state import (
     parse_hook_continuations,
     should_queue_hook_continuation,
     should_queue_refusal_recovery,
+    spawn_project_identity_repinned,
     stage_boundary_for,
 )
 from kiro_crew.dashboard.steer_settle import settle_consumed_steers
@@ -7290,6 +7291,7 @@ async def _spawn_admitted_prefetch(
             crew_agent=crew_alias,
             model=_requested_model or None,
             cwd=slot.project or None,
+            cwd_identity=await spawn_project_identity_repinned(slot),
             speculative=True,
             speculative_resume=allow_resume,
             reasoning_effort_override=slot.reasoning_effort or None,
@@ -11156,6 +11158,7 @@ async def _run_chat(
             crew_agent=crew_alias,
             model=_requested_model or None,
             cwd=slot.project or None,
+            cwd_identity=await spawn_project_identity_repinned(slot),
             # The persisted channel stays separate from the dashboard-owned key
             # so provider startup can distinguish a linked dispatcher from a
             # direct dashboard turn.

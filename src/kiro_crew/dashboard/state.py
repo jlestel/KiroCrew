@@ -2474,6 +2474,7 @@ class _ChatSlot:
         "memory_store",
         "_memory_assignment_from_history",
         "project",
+        "project_identity",
         "created_at",
         "messages",
         "total_messages",
@@ -2784,6 +2785,20 @@ class _ChatSlot:
         # that admission boundary; this marker is not persisted in the transcript.
         self._memory_assignment_from_history = False
         self.project: str = ""
+        # ``(spelling, st_dev, st_ino)`` of the directory this session was BOUND
+        # to, for THIS gateway process's lifetime: recorded in memory when the
+        # binding is made -- the fenced resolve's held directory for an agent's
+        # ``set_project`` / slot-project request, the pinned open for the
+        # person's own choice, a folder's inherited binding at creation, a
+        # fork's copy, the agent-switch route's folder project -- or, for a
+        # project that carries no record in this process (every slot after a
+        # gateway restart), re-pinned from the bound path at its first spawn
+        # (``spawn_project_identity_repinned``). NEVER persisted: ``st_dev`` is
+        # reassigned across mounts and the transcript store is agent-writable,
+        # so a stored record would refuse unchanged directories after a reboot
+        # and accept a forged one. The spawn verifies the working directory
+        # against it (``sandbox.verify_agent_workspace_for_spawn``).
+        self.project_identity: tuple[str, int, int] | None = None
         # Remote-execution binding. ``executor`` is "local" for every ordinary
         # slot; "remote" means the turn is dispatched over an instance tunnel to
         # ``instance_id`` and run by the peer's slot ``remote_slot``. The local
@@ -4839,6 +4854,82 @@ class _ChatSlot:
                 )
             ),
         )
+
+
+def spawn_project_identity(slot: "_ChatSlot") -> tuple[int, int] | None:
+    """The ``(st_dev, st_ino)`` recorded in THIS process for ``slot.project``, or ``None``.
+
+    The recorded identity applies only while its spelling is the slot's current
+    project: a writer that re-points ``project`` without recording an identity
+    (a member's default, a configured default) leaves a stale record behind, and
+    a stale record must never refuse the new directory. ``None`` -- no record in
+    this process -- is what :func:`spawn_project_identity_repinned` re-pins.
+    """
+    recorded = slot.project_identity
+    if recorded is None or not slot.project or recorded[0] != slot.project:
+        return None
+    return (recorded[1], recorded[2])
+
+
+async def spawn_project_identity_repinned(slot: "_ChatSlot") -> tuple[int, int] | None:
+    """The identity the spawn verifies ``slot.project`` against, re-pinned when this process has none.
+
+    The identity lives for the gateway PROCESS's lifetime -- the threat it
+    answers is a swap of the bound directory between the binding's validation and
+    a deferred spawn within that lifetime -- and nothing identity-bearing is
+    persisted (review-caught: ``st_dev`` is reassigned at every mount on
+    anonymous-device filesystems, so a stored pair would refuse every spawn of an
+    UNCHANGED directory after a reboot, and the transcript store is an
+    agent-writable leaf, so a stored pair could be forged to pass the swap
+    check). So a project that carries no record in this process -- every slot
+    after a gateway restart, a default a non-recording writer pointed the slot at
+    -- is RE-PINNED here, at its first spawn, by the same fenced pin the bind
+    uses (``sandbox.directory_identity_pinned``, off the loop): the identity read
+    off the descriptor that opened the directory with no link followed, recorded
+    on the slot, and compared at every later spawn in this process. A swap while
+    the gateway was down is outside the threat: the directory standing at the
+    name is what gets pinned. A directory the re-pin cannot open (a link, missing,
+    unopenable) records nothing and the spawn enters the name as it always did
+    -- the spawn site's own open is what answers a missing or unusable
+    directory -- with a warning; the next spawn re-pins again.
+    """
+    recorded = spawn_project_identity(slot)
+    if recorded is not None or not slot.project:
+        return recorded
+    from kiro_crew.sandbox import WorkspacePinFailed, directory_identity_pinned
+
+    project = slot.project
+    try:
+        identity = await asyncio.to_thread(directory_identity_pinned, project)
+    except WorkspacePinFailed as exc:
+        logger.warning("Slot %s project %r not re-pinned at spawn: %s", slot.key, project, exc)
+        return None
+    if slot.project != project:
+        # Re-pointed while the pin ran: the record would name the old spelling.
+        return spawn_project_identity(slot)
+    record_project_identity(slot, identity)
+    return spawn_project_identity(slot)
+
+
+def record_project_identity(slot: "_ChatSlot", identity: tuple[int, int] | None) -> None:
+    """Record *identity* for the slot's CURRENT project.
+
+    A BINDING always records an identity: the arms read it off the descriptor
+    that opened the directory (``sandbox.directory_identity_pinned``, the
+    fenced resolve's ``identity_out``), which answers a real ``(st_dev,
+    st_ino)`` or ``sandbox.IDENTITY_UNAVAILABLE`` (a volume that reports none:
+    SMB shares, FAT on Windows -- recorded as that state, opened but not
+    compared at spawn) and RAISES for a directory it could not pin, so the bind
+    is refused rather than stored without a record. ``None`` means "no record
+    in this process" -- a cleared project, a default a non-recording writer
+    pointed the slot at, or any project after a gateway restart -- which the
+    first spawn re-pins (:func:`spawn_project_identity_repinned`). The record
+    is in-memory only; nothing identity-bearing is persisted.
+    """
+    if identity is None or not slot.project:
+        slot.project_identity = None
+    else:
+        slot.project_identity = (slot.project, int(identity[0]), int(identity[1]))
 
 
 class DashboardState:

@@ -230,7 +230,12 @@ verifies the saved materialization off-loop before provider construction. It
 passes the immutable template explicitly while preserving the canonical member,
 member memory binding, history key, caller model and approval policy. An explicit
 or resumed cwd wins; otherwise the member's configured workspace is used. A cwd
-that disagrees with the saved Parent identity refuses startup.
+that disagrees with the saved Parent identity refuses startup. Beside `cwd`,
+`cwd_identity` (the slot's recorded `(st_dev, st_ino)` of the bound directory,
+`state.spawn_project_identity`) rides the same factory kwargs into
+`AcpProvider(work_dir_identity=...)` and on to the client and runtime, where
+the spawn re-verifies the working directory against it
+(`sandbox.verify_agent_workspace_for_spawn`; `None` means not examined).
 When no caller model is supplied, allocation resolves the member's model pin by
 its canonical alias, including members that have not enrolled capabilities. The id
 it hands the provider is stamped on the registered session, because the allocation
