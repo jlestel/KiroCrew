@@ -13,6 +13,16 @@ from .._sqlite_compat import fts5_cjk_match_groups, is_cjk_char, sqlite3
 from .embedder import embedder_signature
 from .store import KnowledgeStore
 
+# Optional dep, same guard shape as ``vector_memory.py``: numpy is declared in
+# setup.cfg but the pure-Python path below stays the reference implementation.
+try:
+    import numpy as np
+
+    _HAS_NUMPY = True
+except ImportError:
+    np = None  # type: ignore[assignment]
+    _HAS_NUMPY = False
+
 logger = logging.getLogger(__name__)
 
 # Entity-name candidates drawn from one spaceless CJK run. Each candidate costs a
@@ -519,6 +529,14 @@ class HybridRetriever:
         parameterized WHERE clause (never string interpolation). ``namespace``
         narrows to items carrying that ``items.namespace`` label the same way;
         both compose when given together.
+
+        Scoring runs as one matrix-vector product when numpy is importable and
+        as a per-row Python loop otherwise (:meth:`_score_rows_numpy` /
+        :meth:`_score_rows_python`). Both share the same admission rules — a blob
+        that decodes to nothing is skipped silently, a blob of another
+        dimensionality is counted and skipped, a zero-norm vector scores 0.0 and
+        so never ranks — and produce the same ranking; the Python loop is the
+        reference the numpy path is held to.
         """
         if self.embedder is None:
             return None
@@ -544,23 +562,10 @@ class HybridRetriever:
             params.append(namespace)
         rows = self.store.db.execute(sql, params).fetchall()
 
-        scored = []
-        mismatched = 0
-        q_len = len(query_vec)
-        for row in rows:
-            item_vec = _bytes_to_floats(row["embedding"])
-            if not item_vec:
-                continue
-            if len(item_vec) != q_len:
-                # Incomparable dims (embedding model/dimension changed between
-                # ingestion and query). _cosine_similarity would return 0.0; skip
-                # the item entirely so all-zero "ghost" results can't fill the
-                # top-K when vector search is the only signal.
-                mismatched += 1
-                continue
-            sim = self._cosine_similarity(query_vec, item_vec)
-            if sim > 0.0:
-                scored.append((row["id"], sim))
+        if _HAS_NUMPY:
+            scored, mismatched = self._score_rows_numpy(rows, query_vec)
+        else:
+            scored, mismatched = self._score_rows_python(rows, query_vec)
 
         if mismatched:
             # One log line per search (not per item) — gives operators a signal
@@ -571,11 +576,124 @@ class HybridRetriever:
                 "embedding dimension (query=%d) — search may be degraded; re-index needed",
                 mismatched,
                 len(rows),
-                q_len,
+                len(query_vec),
             )
 
         scored.sort(key=lambda x: x[1], reverse=True)
         return [(item_id, rank + 1) for rank, (item_id, _) in enumerate(scored[:limit])]
+
+    @staticmethod
+    def _score_rows_python(
+        rows: list, query_vec: list[float]
+    ) -> tuple[list[tuple[str, float]], int]:
+        """Cosine-score ``rows`` against ``query_vec`` one row at a time (stdlib only).
+
+        The reference scorer: the query norm is derived once per search (it is
+        the same for every row — recomputing it per row was the #3109 defect on
+        the lesson path) and each row costs one blob decode, one dot product and
+        one norm. Returns ``(scored, mismatched)`` where ``scored`` holds
+        ``(item_id, similarity)`` for every row with a positive similarity, in
+        row order, and ``mismatched`` counts rows skipped for having another
+        dimensionality than the query.
+        """
+        scored: list[tuple[str, float]] = []
+        mismatched = 0
+        q_len = len(query_vec)
+        q_norm = _l2_norm(query_vec)
+        for row in rows:
+            item_vec = _bytes_to_floats(row["embedding"])
+            if not item_vec:
+                continue
+            if len(item_vec) != q_len:
+                # Incomparable dims (embedding model/dimension changed between
+                # ingestion and query). Skip the item entirely so all-zero
+                # "ghost" results can't fill the top-K when vector search is the
+                # only signal.
+                mismatched += 1
+                continue
+            if q_norm == 0.0:
+                continue
+            item_norm = _l2_norm(item_vec)
+            if item_norm == 0.0:
+                continue
+            sim = sum(x * y for x, y in zip(query_vec, item_vec)) / (q_norm * item_norm)
+            if sim > 0.0:
+                scored.append((row["id"], sim))
+        return scored, mismatched
+
+    @staticmethod
+    def _score_rows_numpy(
+        rows: list, query_vec: list[float]
+    ) -> tuple[list[tuple[str, float]], int]:
+        """Cosine-score ``rows`` against ``query_vec`` as one matrix-vector product.
+
+        Same admission rules and return shape as :meth:`_score_rows_python`. The
+        struct-packed blobs of the query's byte width — the whole corpus, in
+        practice — are joined and viewed as one float32 matrix in a single
+        ``np.frombuffer`` (no per-row ``struct.unpack`` → ``list`` round trip);
+        anything else — a legacy JSON blob, an odd length — goes through
+        :func:`_bytes_to_floats` exactly as the Python path does, so both paths
+        admit and reject the same rows, and each decoded row is written back at
+        its own position so row order (the tie-break of the final sort) is the
+        Python path's. Arithmetic is float64 like the Python path (the stored
+        dtype is float32, but the reference sums in Python floats), which keeps
+        the two rankings aligned rather than merely close.
+        """
+        q_len = len(query_vec)
+        q_bytes = q_len * 4
+        survivors: list[str] = []
+        packed: list[bytes] = []
+        packed_at: list[int] = []
+        decoded: list[list[float]] = []
+        decoded_at: list[int] = []
+        mismatched = 0
+        for row in rows:
+            blob = row["embedding"]
+            if (
+                isinstance(blob, bytes)
+                and len(blob) == q_bytes
+                and len(blob) >= _BINARY_BLOB_MIN_BYTES
+                and not _looks_like_json(blob)
+            ):
+                packed.append(blob)
+                packed_at.append(len(survivors))
+                survivors.append(row["id"])
+                continue
+            item_vec = _bytes_to_floats(blob)
+            if not item_vec:
+                continue
+            if len(item_vec) != q_len:
+                mismatched += 1
+                continue
+            decoded.append(item_vec)
+            decoded_at.append(len(survivors))
+            survivors.append(row["id"])
+        if not survivors:
+            return [], mismatched
+        q = np.asarray(query_vec, dtype=np.float64)
+        q_norm = math.sqrt(float(np.einsum("i,i->", q, q)))
+        if q_norm == 0.0:
+            return [], mismatched
+        mat = np.empty((len(survivors), q_len), dtype=np.float64)
+        if packed:
+            mat[packed_at] = np.frombuffer(b"".join(packed), dtype=np.float32).reshape(
+                len(packed), q_len
+            )
+        if decoded:
+            mat[decoded_at] = np.asarray(decoded, dtype=np.float64)
+        # einsum, not ``mat @ q``: the matvec is a few hundred rows by ~1k dims,
+        # and BLAS hands one that size to its thread pool, whose wake-up on a busy
+        # host costs more than the arithmetic (measured 20 ms vs 0.1 ms for
+        # 500x1024). einsum stays single-threaded and deterministic here.
+        norms = np.sqrt(np.einsum("ij,ij->i", mat, mat))
+        dots = np.einsum("ij,j->i", mat, q)
+        # A zero-norm row is 0.0 by contract (never divides by zero), and 0.0 is
+        # below the positive-similarity admission bar, so it drops out here too.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sims = np.where(norms > 0.0, dots / (norms * q_norm), 0.0)
+        return [
+            (item_id, float(sim)) for item_id, sim in zip(survivors, sims) if sim > 0.0
+        ], mismatched
 
     @staticmethod
     def _rrf_fuse(*ranked_lists, k: int = 60, weights=None) -> list[tuple[str, float]]:
@@ -606,30 +724,71 @@ class HybridRetriever:
         would otherwise let ``zip`` silently truncate the dot product (while the
         norms use the full vectors), yielding a meaningless similarity. This
         mirrors the length guard already enforced in ``vector_memory.py``.
+
+        One-off helper for callers holding two vectors; the search loop itself
+        goes through :meth:`_score_rows_python` / :meth:`_score_rows_numpy`,
+        which hoist the query-side work out of the per-row loop.
         """
         if len(a) != len(b):
             return 0.0
         dot = sum(x * y for x, y in zip(a, b))
-        norm_a = math.sqrt(sum(x * x for x in a))
-        norm_b = math.sqrt(sum(x * x for x in b))
+        norm_a = _l2_norm(a)
+        norm_b = _l2_norm(b)
         if norm_a == 0.0 or norm_b == 0.0:
             return 0.0
         return dot / (norm_a * norm_b)
 
 
-def _bytes_to_floats(blob: bytes) -> list[float]:
-    """Decode embedding blob (binary struct or JSON-encoded list of floats)."""
+def _l2_norm(vec: list[float]) -> float:
+    """Euclidean norm of ``vec`` in Python floats (the reference arithmetic)."""
+    return math.sqrt(sum(x * x for x in vec))
+
+
+# A struct-packed blob must be at least this long to be admitted as binary;
+# shorter byte strings are too easily something else (the guard predates the
+# JSON sniff below and is kept as-is so admission does not widen).
+_BINARY_BLOB_MIN_BYTES = 16
+
+# The bytes JSON allows before a value: the four whitespace characters of RFC
+# 8259. A JSON-encoded embedding is a list, so after skipping these the first
+# byte of a legacy blob is ``[``; a struct-packed float32 blob has no such
+# structure and only ever begins with ``[`` by coincidence.
+_JSON_WHITESPACE = b" \t\n\r"
+
+
+def _looks_like_json(blob: bytes) -> bool:
+    """Whether ``blob`` can possibly be a legacy JSON-encoded embedding list.
+
+    A cheap sniff run BEFORE ``json.loads``: a struct-packed float32 blob almost
+    never starts with ``[``, so for the common binary row the failed parse (and
+    the exception it raises) is skipped entirely. Sniffing is admission-only —
+    a blob that passes still has to parse, and one that happens to start with
+    ``[`` yet fails to parse falls through to the binary decoder exactly as it
+    always did, so the decoded value is the same as before for every input.
+    """
+    first = blob.lstrip(_JSON_WHITESPACE)[:1]
+    return first == b"["
+
+
+def _bytes_to_floats(blob: bytes | str | None) -> list[float]:
+    """Decode embedding blob (binary struct or JSON-encoded list of floats).
+
+    ``str`` is a legacy JSON embedding stored as TEXT; ``None`` and ``b""`` are
+    an unset column and decode to ``[]``.
+    """
     if not blob:
         return []
-    try:
-        # Try JSON format first (legacy)
-        result = json.loads(blob)
-        if isinstance(result, list):
-            return result
-    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-        pass
+    # Legacy JSON format: a ``str`` column value, or bytes that start like a JSON
+    # list. Only then is a parse attempted — see _looks_like_json.
+    if not isinstance(blob, bytes) or _looks_like_json(blob):
+        try:
+            result = json.loads(blob)
+            if isinstance(result, list):
+                return result
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            pass
     # Try binary format (struct packed floats, must be >8 bytes to avoid false positives)
-    if isinstance(blob, bytes) and len(blob) >= 16 and len(blob) % 4 == 0:
+    if isinstance(blob, bytes) and len(blob) >= _BINARY_BLOB_MIN_BYTES and len(blob) % 4 == 0:
         try:
             n = len(blob) // 4
             return list(struct.unpack(f"{n}f", blob))
