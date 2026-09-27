@@ -11095,6 +11095,7 @@
       "on_instance": "在 {{name}} 上",
       "opening_session_locally": "正在此处打开该会话…",
       "opens_here_runs_on_instance": "在此处打开该会话——它的执行仍在 {{name}} 上进行",
+      "opens_on_members_page": "这是一位队员自己的会话——在“成员”页面打开",
       "opens_on_crew_switches_there": "在 {{name}} 上打开 —— 切换到该 Crew，而不是在此处",
       "remote_instances_list_unavailable": "无法列出远程 Crew，因此不显示其会话。",
       "model_list_failed": "无法加载模型列表。当前显示的内容可能不完整或已过期。",

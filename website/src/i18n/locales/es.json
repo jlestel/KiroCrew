@@ -11431,6 +11431,7 @@
       "on_instance": "En {{name}}",
       "opening_session_locally": "Abriendo esta sesión aquí…",
       "opens_here_runs_on_instance": "Abre esta sesión aquí — su ejecución sigue en {{name}}",
+      "opens_on_members_page": "El hilo propio de un miembro de la tripulación: se abre en la página Miembros",
       "opens_on_crew_switches_there": "Se abre en {{name}} — cambia a ese Crew, no aquí",
       "remote_instances_list_unavailable": "No se pudieron enumerar los crews remotos, por lo que sus sesiones no se muestran.",
       "model_list_failed": "No se pudo cargar la lista de modelos. Lo que se muestra puede estar incompleto o desactualizado.",

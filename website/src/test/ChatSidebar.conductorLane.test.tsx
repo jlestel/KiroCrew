@@ -71,7 +71,15 @@ vi.mock('../pages/chat/ChatSettings', () => ({
 // `chatSlots` is a STABLE spy, unlike the proxy's per-access `vi.fn()`: the
 // provisional-lineage test asserts on whether the sidebar came back for a second
 // read, which a fresh mock per property access cannot record.
-const mocks = vi.hoisted(() => ({ folders: [] as unknown[], chatSlots: vi.fn() }))
+const mocks = vi.hoisted(() => ({ folders: [] as unknown[], chatSlots: vi.fn(), navigate: vi.fn() }))
+
+// The router is real (MemoryRouter below); only `useNavigate` is a spy, so a row that
+// leaves the chat page can be asked WHERE it went rather than inferred from a route
+// that this harness does not mount.
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom')
+  return { ...actual, useNavigate: () => mocks.navigate }
+})
 
 vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
@@ -120,11 +128,16 @@ function renderSidebar(
   revealRequest: { kind: string; target: string } | null = null,
   chatExtra: Record<string, unknown> = {},
   unreadSlots: string[] = [],
+  /** What the STORE holds, when it is wider than what the sidebar is handed. `ChatPage`
+   *  filters `dashboard.slots` by surface before passing it down, so a member's own DM
+   *  thread is in the store and absent from the prop -- the split the creator-anchor
+   *  tests need. Defaults to `slots`, the everyday case where the two agree. */
+  storeSlots: TestSlot[] = slots,
 ) {
   mocks.folders = folders
   const store = createTestStore({
     dashboard: {
-      status: {}, connected: true, slots, approvalMode: 'normal',
+      status: {}, connected: true, slots: storeSlots, approvalMode: 'normal',
       channelTrusted: false, refreshTrigger: 0, unreadSlots, updateProgress: null,
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
@@ -167,6 +180,7 @@ beforeEach(() => {
   // A default, so a test that sets its own resolved value cannot leak it into the next.
   mocks.chatSlots.mockReset()
   mocks.chatSlots.mockResolvedValue([])
+  mocks.navigate.mockReset()
 })
 afterEach(() => {
   vi.clearAllMocks()
@@ -892,5 +906,113 @@ describe('chat sidebar — conductor lane', () => {
     // while the lane is flattened, and one tooltip for both facts would be a lie.
     expect(marker.getAttribute('title') ?? '').not.toMatch(/closed/i)
     expect(queryByTestId('conductor-orphan-k-kid')).toBeNull()
+  })
+
+  describe('a creator this page does not list (a crew member\u2019s own thread)', () => {
+    /* The gateway ran a member-driven crew: the pipeline conductor is a crew MEMBER,
+       its session is the member's own DM thread (`surface: 'member'`), and every
+       worker it opened cites that slot. The backend resolved each citation to a live
+       `parent.key`, and the System page nested all of them. `ChatPage`, though, hands
+       this sidebar only chat-surface rows, so the member's row never reached the lane:
+       every worker resolved no parent, rendered at the top level, and wore the glyph
+       that says its creator CLOSED -- about a session that was open and dispatching. */
+    const MEMBER: TestSlot = {
+      key: 'member-pipeline', title: 'Pipeline Work Focus On Issues', messages: 40, running: true,
+      modified: 5000, mode: 'member', surface: 'member', agent: 'kirocrew-pipeline-conductor',
+    }
+    const WORKERS: TestSlot[] = [
+      { key: 'k-fix-1', title: 'issue-fix: #1', messages: 1, running: true, modified: 4000, parent: { slot: 'member-pipeline', key: 'member-pipeline' } },
+      { key: 'k-fix-2', title: 'issue-fix: #2', messages: 1, running: false, modified: 3000, parent: { slot: 'member-pipeline', key: 'member-pipeline' } },
+      { key: 'k-solo', title: 'Unrelated chat', messages: 1, running: false, modified: 2000 },
+    ]
+    /** What ChatPage passes (chat surfaces only) vs. what the store holds (everything). */
+    const listed = WORKERS
+    const inStore = [MEMBER, ...WORKERS]
+
+    it('draws the member as an anchor and nests its workers under it', () => {
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId, queryByTestId } = renderSidebar(listed, [], null, {}, [], inStore)
+      const lane = getByTestId('conductor-view-lane')
+      expect(laneRows(lane)).toEqual(['member-pipeline', 'k-fix-1', 'k-fix-2', 'k-solo'])
+      for (const key of ['k-fix-1', 'k-fix-2']) {
+        const row = lane.querySelector(`[data-slot-key="${key}"]`)!.closest('[data-conductor-depth]')
+        expect(row?.getAttribute('data-conductor-depth')).toBe('1')
+        // Nested, so neither citation glyph: the indent already says who opened it, and
+        // the orphan copy in particular would be false about a live creator.
+        expect(queryByTestId(`conductor-orphan-${key}`)).toBeNull()
+        expect(queryByTestId(`conductor-cites-parent-${key}`)).toBeNull()
+      }
+      // Context, not a match: the filter this page applies never admitted the row.
+      const anchor = lane.querySelector('[data-slot-key="member-pipeline"]')!.closest('[data-conductor-depth]')
+      expect(anchor?.getAttribute('data-conductor-anchor')).toBe('true')
+      expect(anchor?.getAttribute('data-conductor-depth')).toBe('0')
+    })
+
+    it('the anchor is drawn only while a worker of it is on screen', () => {
+      // No listed row cites the member: nothing to hang, so nothing borrowed from the
+      // store. The lane must not become a second Members page. (An unrelated chat
+      // conductor supplies the one edge the lane needs to be offered at all.)
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId } = renderSidebar(NESTED, [], null, {}, [], [MEMBER, ...NESTED])
+      expect(laneRows(getByTestId('conductor-view-lane')))
+        .toEqual(['k-conductor', 'k-worker-a', 'k-deep', 'k-worker-b'])
+    })
+
+    it('follows a chain of unlisted creators, not just one level', () => {
+      // member -> lead (a chat session, listed) -> worker (listed). The member is the
+      // only unlisted row, but it is reached THROUGH the lead's citation, so the walk
+      // must continue from every admitted row rather than stop at the listed set.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const lead: TestSlot = { key: 'k-lead', title: 'Lead', messages: 1, running: true, modified: 4500, parent: { slot: 'member-pipeline', key: 'member-pipeline' } }
+      const worker: TestSlot = { key: 'k-w', title: 'Worker', messages: 1, running: false, modified: 4400, parent: { slot: 'k-lead', key: 'k-lead' } }
+      const { getByTestId } = renderSidebar([lead, worker], [], null, {}, [], [MEMBER, lead, worker])
+      const lane = getByTestId('conductor-view-lane')
+      expect(laneRows(lane)).toEqual(['member-pipeline', 'k-lead', 'k-w'])
+      expect(lane.querySelector('[data-slot-key="k-w"]')!.closest('[data-conductor-depth]')?.getAttribute('data-conductor-depth')).toBe('2')
+    })
+
+    it('clicking the anchor goes to the member on the Members page, not to the chat pane', () => {
+      // The chat pane cannot show a member's thread (the page's own surface filter
+      // says so), so `switchSlot` would strand the user on the previous transcript.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId, store } = renderSidebar(listed, [], null, {}, [], inStore)
+      const row = getByTestId('conductor-view-lane').querySelector('[data-session-row="member-pipeline"]') as HTMLElement
+      fireEvent.click(row)
+      expect(mocks.navigate).toHaveBeenCalledWith('/members?member=kirocrew-pipeline-conductor')
+      expect(store.getState().chat.activeSlot).toBeNull()
+      // Enter does the same as click, per WCAG 2.1.1.
+      mocks.navigate.mockReset()
+      fireEvent.keyDown(row, { key: 'Enter' })
+      expect(mocks.navigate).toHaveBeenCalledWith('/members?member=kirocrew-pipeline-conductor')
+    })
+
+    it('withholds the local-only affordances from the anchor, as it does for a peer row', () => {
+      // Rename, close, fork, drag: the slot's lifecycle belongs to the Members page. A
+      // control that looks live and does nothing (or worse, closes a member's thread
+      // from a list that does not otherwise show it) is not offered.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId } = renderSidebar(listed, [], null, {}, [], inStore)
+      const lane = getByTestId('conductor-view-lane')
+      const anchor = lane.querySelector('[data-session-row="member-pipeline"]') as HTMLElement
+      expect(anchor.getAttribute('data-draggable')).toBe('false')
+      expect(anchor.getAttribute('title') ?? '').toMatch(/Members page/)
+      expect(anchor.querySelector('[data-close]')).toBeNull()
+      expect(anchor.querySelector('[data-fork]')).toBeNull()
+      // A listed worker beside it keeps everything.
+      const worker = lane.querySelector('[data-session-row="k-fix-1"]') as HTMLElement
+      expect(worker.getAttribute('data-draggable')).toBe('true')
+    })
+
+    it('a creator that is genuinely gone still reads as an orphan', () => {
+      // The store has no such slot, so nothing is borrowed and the glyph's "closed"
+      // reading stays true. This is the case the anchor must not swallow.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const rows: TestSlot[] = [
+        { key: 'k-left', title: 'Left behind', messages: 1, running: false, modified: 1000, parent: { slot: 'member-gone', key: null } },
+      ]
+      const { getByTestId } = renderSidebar(rows, [], null, {}, [], rows)
+      expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-left'])
+      expect(getByTestId('conductor-orphan-k-left').getAttribute('data-orphan-of')).toBe('member-gone')
+    })
   })
 })

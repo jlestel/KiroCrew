@@ -36,7 +36,7 @@ import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
 import { highlightText } from '../utils/highlightText'
 import { boardCollapseKey, boardColumnFromDroppableId, loadBoardFolderCollapse, persistBoardOverride, persistClearFolderOverrides, clearFolderOverrides } from '../utils/boardFolderCollapse'
-import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
+import { isChatPageSurface, slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
 import { toolStatusLabel, type ToolStatusDetail } from '../utils/toolStatusLabel'
 import { sessionRefBlockReason, type SessionRefBlockReason } from '../utils/sessionRefs'
 import { SearchInput, Input, Btn, IconButton, IconButtonGroup } from '../components/ui'
@@ -860,6 +860,11 @@ interface Slot {
   orchestrating?: boolean
   queue_depth?: number
   mode?: string
+  /** Which page renders this session; the backend mirrors `mode` into it. The chat
+   *  page admits only the surfaces `isChatPageSurface` names, so a row carrying any
+   *  other value reached this component through the conductor lane's creator anchors
+   *  and opens elsewhere. */
+  surface?: string
   agent?: string
   // The agent that will actually answer, when it is NOT `agent`. The backend
   // stores `agent` verbatim — it is the user's intent, and rewriting it on disk
@@ -1738,6 +1743,15 @@ interface SessionRowProps {
   onCloseSession: (key: string) => void
   onMenuCloseAutoFocus: (e: Event) => void
   onSelectSlot?: (key: string) => void
+  /** This row's session is LIVE and LOCAL but belongs to another page (a crew
+   *  member's own DM thread, `surface: 'member'`), and the chat pane cannot show
+   *  it. Set, it replaces activation: click / Enter go HERE instead of
+   *  `switchSlot`, and every local-only affordance (rename, close, fork, drag,
+   *  the row menu) is withheld exactly as it is for a peer row, because the
+   *  slot's lifecycle is owned elsewhere. The conductor lane sets it on a
+   *  creator it admits only as an ANCHOR, so the workers that creator opened
+   *  have something to hang from. */
+  onOpenElsewhere?: () => void
   /** ADOPT a row whose session lives on a remote instance: create a local slot
    *  bound to that peer session and switch to it. Distinct from `onSelectSlot`
    *  because there is no local slot to switch to YET — this is what makes one. */
@@ -1894,6 +1908,7 @@ const SessionRow = memo(function SessionRow({
   defaultAgent, mode, isMobile, colorMode, installedAgents, tagById, paletteColors, boost, boostFor,
   renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
   onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onAdoptPeerSession, adoptPending, adoptError,
+  onOpenElsewhere,
 }: SessionRowProps) {
   sessionRowRenderProbe.current?.(s.key)
   // Peer ownership, present only on a row sourced from a connected remote
@@ -1906,6 +1921,11 @@ const SessionRow = memo(function SessionRow({
   // sit in one scope and mean opposite things. This one says the session is not
   // ours; that one says the session IS ours and dispatches elsewhere.
   const peerId = s.peer_id
+  // The affordance gate proper. A peer row and a row that opens elsewhere are
+  // withheld the SAME set -- rename, close, fork, drag, the row menu -- for the
+  // same reason: this sidebar does not own the slot's lifecycle. They differ only
+  // in what a click does (adopt vs. navigate), which the handlers below decide.
+  const foreignRow = !!peerId || onOpenElsewhere != null
   const peerName = s.peer_name || s.peer_id
   const rowIdentity = sessionRowIdentity(s)
   // Remote and local gateways do not share a slot-key namespace. Deterministic
@@ -2046,7 +2066,7 @@ const SessionRow = memo(function SessionRow({
     // with a local one — to the WRONG session. Excluded by construction rather
     // than handled per drop target. A remote-EXECUTED local slot is not excluded:
     // its slot is right here, and reordering it is as meaningful as any other.
-    const dndRow = (scope === 'list' || scope === 'flat') && !peerId
+    const dndRow = (scope === 'list' || scope === 'flat') && !foreignRow
     const reorderContainer = scope === 'flat' ? 'flat' : (s.folder_id || 'root')
     const agentName = s.agent || defaultAgent || ''
     // What the row SHOWS, kept separate from `agentName` on purpose. That value
@@ -2642,14 +2662,15 @@ const SessionRow = memo(function SessionRow({
         <ContextMenu>
           <ContextMenuTrigger asChild>
         <div ref={dndRow ? setNodeRef : undefined} {...(dndRow ? listeners : {})}
-          data-draggable={(!isRenaming && !peerId).toString()}
+          data-draggable={(!isRenaming && !foreignRow).toString()}
           className={`session-row group relative flex items-start ${ROW_BOX_CLS} text-sm transition-all select-none ${isActive ? !connected ? `session-active ${ROW_ACTIVE_CLS} cursor-not-allowed` : `session-active ${ROW_ACTIVE_CLS} cursor-pointer` : !connected ? 'text-muted opacity-50 cursor-not-allowed' : `${ROW_IDLE_CLS} cursor-pointer`} ${goalLoopStalled ? 'session-loop-stalled' : ''} ${rowColor ? 'session-colored' : ''} ${rowColor && colorMode === 'gradient' ? 'session-gradient' : ''} ${isDragging ? 'opacity-40' : ''} ${revealFlash ? `session-reveal-flash${revealFlash === 'fade' ? ' session-reveal-flash-fade' : ''}` : ''}`}
           style={boostStyle as React.CSSProperties}
           draggable={
-            // Both drag paths are off for a peer-owned row. Note the polarity:
-            // native HTML5 drag is enabled precisely when dnd-kit is NOT, so
-            // gating `dndRow` alone would have SWITCHED THIS ON rather than off.
-            (!dndRow && !isRenaming && !peerId) && (connected || isActive)
+            // Both drag paths are off for a peer-owned row and for a row that
+            // opens elsewhere. Note the polarity: native HTML5 drag is enabled
+            // precisely when dnd-kit is NOT, so gating `dndRow` alone would have
+            // SWITCHED THIS ON rather than off.
+            (!dndRow && !isRenaming && !foreignRow) && (connected || isActive)
           }
           title={
             // A peer-owned row OPENS THE SESSION, here, in the local pane: the
@@ -2660,9 +2681,14 @@ const SessionRow = memo(function SessionRow({
             // name carries the same fact as visible text, so nothing meaningful is
             // hover-only. Declared ahead of `offlineProps` so the gateway-offline
             // tooltip still wins while disconnected (last prop wins).
+            //
+            // A row that opens elsewhere makes a DIFFERENT promise -- the click
+            // leaves this page -- and says so, since nothing else on the row does.
             peerId
               ? i18nT('pages.chatSidebar.opens_here_runs_on_instance', { name: peerName })
-              : undefined
+              : onOpenElsewhere
+                ? i18nT('pages.chatSidebar.opens_on_members_page')
+                : undefined
           }
           {...offlineProps(connected, 'switch sessions')}
           role="button"
@@ -2721,6 +2747,7 @@ const SessionRow = memo(function SessionRow({
             e.preventDefault()
             if (!connected) return
             if (peerId) { onAdoptPeerSession?.(peerId, s.key, rowIdentity); return }
+            if (onOpenElsewhere) { onOpenElsewhere(); return }
             dispatch(switchSlot({ key: s.key, announceOnMissing: true }))
             onSelectSlot?.(s.key)
           }}
@@ -2740,7 +2767,7 @@ const SessionRow = memo(function SessionRow({
           onAuxClick={onOpenSlotInNewTab ? (e => {
             if (e.button !== 1 || !connected) return
             e.preventDefault()
-            if (peerId) return
+            if (foreignRow) return
             onOpenSlotInNewTab(s.key, { background: true })
           }) : undefined}
           onClick={e => {
@@ -2771,6 +2798,10 @@ const SessionRow = memo(function SessionRow({
             // no live peer slot to bind.) A remote-EXECUTED local slot falls
             // through to `switchSlot` below, because its transcript IS here.
             if (peerId) { onAdoptPeerSession?.(peerId, s.key, rowIdentity); return }
+            // A row whose session belongs to another page: the pane cannot show
+            // it, so `switchSlot` would land on a transcript the surface filter
+            // hides and leave the user on the previous one. Go where it lives.
+            if (onOpenElsewhere) { onOpenElsewhere(); return }
             // Modifier-click = open as a background tab, matching the
             // editor/browser convention. Platform split lives in the predicate.
             if (onOpenSlotInNewTab && isOpenInTabModifierClick(e)) {
@@ -2782,7 +2813,7 @@ const SessionRow = memo(function SessionRow({
             onSelectSlot?.(s.key)
           }}
           onDoubleClick={e => {
-            if (peerId) return
+            if (foreignRow) return
             if (!(e.target as HTMLElement).closest?.('[data-session-title]')) return
             if (renamingHere) return
             e.preventDefault()
@@ -3102,7 +3133,7 @@ const SessionRow = memo(function SessionRow({
            *  Omitting beats disabling — the same call `historyRow` makes for its
            *  delete button. A remote-EXECUTED local slot keeps the whole group:
            *  its slot is local, so every one of those operations still applies. */}
-          {!renamingHere && !peerId && (isMobile ? (
+          {!renamingHere && !foreignRow && (isMobile ? (
             <div className="absolute top-1/2 -translate-y-1/2 right-1.5 flex items-center gap-0.5">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -3129,7 +3160,7 @@ const SessionRow = memo(function SessionRow({
           ))}
         </div>
           </ContextMenuTrigger>
-          {!peerId && <ContextMenuContent className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
+          {!foreignRow && <ContextMenuContent className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
             <SessionActionsMenu variant="context" {...rowMenuProps} />
           </ContextMenuContent>}
         </ContextMenu>
@@ -3651,6 +3682,11 @@ function ChatSidebar({
     },
     [localSlots, instanceSessions.rows],
   )
+  // The UNFILTERED live slot list, every surface. `localSlots` is what the chat page
+  // shows; this is what the gateway has. Read for one purpose -- `creatorAnchors`,
+  // the conductor lane's missing creators -- and nowhere else: anything describing
+  // what is ON SCREEN reads `allRows`.
+  const allLiveSlots = useAppSelector(st => st.dashboard.slots)
   // `selectInstance` stays for the FEDERATED OLDER-SESSIONS rows further down,
   // which genuinely have nowhere local to go: a history row names a closed
   // session on the peer, with no live peer slot to bind, so switching to that
@@ -5994,6 +6030,66 @@ function ChatSidebar({
   )
 
   /**
+   * Live LOCAL sessions this page does not list, admitted to the conductor lane only
+   * because a listed row cites one of them as its creator.
+   *
+   * `localSlots` is the CHAT PAGE's population: `ChatPage` filters the slot list by
+   * surface before it reaches this component, and a crew member's own DM thread
+   * (`surface: 'member'`) is not a chat-page session -- it lives on the Members page.
+   * A member that dispatches workers through `session_create` is nonetheless the
+   * creator every one of those workers cites, and the backend resolves that citation
+   * to a live `parent.key` because the member's slot IS running. So the tree the
+   * System page draws and the tree this lane drew came apart on exactly one kind of
+   * creator: the lane never had the member's row, `nestsUnder` found no row for the
+   * key, and every worker of a member-driven crew rendered at the top level wearing
+   * the orphan glyph -- a glyph that says "opened by a closed session" about a
+   * session that was open and working.
+   *
+   * The fix is to give the tree the row it is missing, and ONLY that row. Walked
+   * transitively (a member's lead's workers still need the member), from the full
+   * `dashboard.slots`, local rows only: a peer row's `parent.key` is in its own
+   * gateway's key space and is resolved against the peer population already. These
+   * rows are never MATCHES -- `conductorMatching` is built from `flatSlots`, which
+   * cannot contain them -- so each renders as a dimmed anchor with its chevron, exactly
+   * like a filtered-out conductor, and only while a descendant is on screen. Its click
+   * goes to the Members page (see `renderSessionRow`), because the chat pane cannot
+   * show it.
+   */
+  const creatorAnchors = useMemo((): Slot[] => {
+    if (!conductorLaneActive) return []
+    const listed = new Set<string>()
+    for (const s of allRows) if (!isPeerRow(s)) listed.add(s.key)
+    const live = new Map<string, Slot>()
+    for (const s of allLiveSlots as unknown as Slot[]) if (!isPeerRow(s) && s.key) live.set(s.key, s)
+    const out: Slot[] = []
+    const added = new Set<string>()
+    // Frontier: every listed local row, then each anchor as it is admitted, so a
+    // chain of unlisted creators is followed to its end. Bounded by the live
+    // population: a key is admitted once and a cycle re-visits nothing.
+    const frontier: Slot[] = allRows.filter(s => !isPeerRow(s))
+    while (frontier.length > 0) {
+      const row = frontier.pop()!
+      const cited = row.parent?.key
+      if (cited == null || listed.has(cited) || added.has(cited)) continue
+      const creator = live.get(cited)
+      if (creator === undefined) continue
+      added.add(cited)
+      out.push(creator)
+      frontier.push(creator)
+    }
+    return out
+  }, [conductorLaneActive, allRows, allLiveSlots])
+
+  /**
+   * The conductor lane's whole population: what this page lists, plus the creators
+   * it does not list but must draw for their workers to hang from.
+   */
+  const lanePopulation = useMemo(
+    () => (creatorAnchors.length === 0 ? allRows : [...allRows, ...creatorAnchors]),
+    [allRows, creatorAnchors],
+  )
+
+  /**
    * Which cited creators exist at all, as `origin -> set of slot keys` over the
    * UNFILTERED population.
    *
@@ -6007,7 +6103,7 @@ function ChatSidebar({
    */
   const citedCreatorExists = useMemo(() => {
     const byOrigin = new Map<string | undefined, Set<string>>()
-    for (const s of allRows) {
+    for (const s of lanePopulation) {
       let inOrigin = byOrigin.get(s.peer_id)
       if (inOrigin === undefined) {
         inOrigin = new Set<string>()
@@ -6016,7 +6112,7 @@ function ChatSidebar({
       inOrigin.add(s.key)
     }
     return byOrigin
-  }, [allRows])
+  }, [lanePopulation])
 
   // ── conductor lane ───────────────────────────────────────────────────────
   //
@@ -6032,7 +6128,8 @@ function ChatSidebar({
    * conductor the filter did not admit was simply absent, so every worker it opened
    * resolved no parent and popped to the top level as an orphan: switching on Unread
    * scattered a conductor's workers across the lane, and the System page nested all of
-   * them at the same moment.
+   * them at the same moment. `lanePopulation` widens that once more, to the creators
+   * this PAGE never lists (see `creatorAnchors`), for the same reason.
    *
    * Order is `laneOrder`, the comparator `filteredSlots` itself sorts by, so root and
    * sibling order still match the flat lane.
@@ -6049,8 +6146,8 @@ function ChatSidebar({
    */
   const conductorRows = useMemo(() => {
     if (!conductorLaneActive) return []
-    return [...allRows].filter(s => !isRowFolderHidden(s)).sort(laneOrder)
-  }, [conductorLaneActive, allRows, laneOrder, isRowFolderHidden])
+    return [...lanePopulation].filter(s => !isRowFolderHidden(s)).sort(laneOrder)
+  }, [conductorLaneActive, lanePopulation, laneOrder, isRowFolderHidden])
 
   /**
    * Row identities the active filter ADMITS, as the flat lane computed them.
@@ -6209,7 +6306,7 @@ function ChatSidebar({
     const previous = citedCreatorRef.current
     const current = new Map<string, string | null>(previous)
     const moved: string[] = []
-    for (const slot of allRows) {
+    for (const slot of lanePopulation) {
       const identity = sessionRowIdentity(slot)
       const cited = slot.parent?.slot ?? null
       current.set(identity, cited)
@@ -6223,7 +6320,7 @@ function ChatSidebar({
     // able to tell a move from a creation.
     if (!conductorLaneActive || lineage == null) return
     for (const identity of moved) expandConductorAncestors(identity)
-  }, [conductorLaneActive, lineage, allRows, expandConductorAncestors])
+  }, [conductorLaneActive, lineage, lanePopulation, expandConductorAncestors])
 
   /**
    * The lanes that can actually render something, in cycle order.
@@ -7761,6 +7858,17 @@ function ChatSidebar({
     const isPeer = isPeerRow(s)
     const rowIdentity = sessionRowIdentity(s)
     const renamingHere = !isPeer && renamingSlot === s.key && renameScope === scope
+    // A LOCAL row whose surface this page does not render -- today a crew member's
+    // own DM thread, admitted to the conductor lane as a creator anchor (see
+    // `creatorAnchors`). `ChatPage` filters these out of `localSlots`, so the only
+    // way one reaches this renderer is through that lane, and the only place its
+    // conversation can be opened is the Members page. Same predicate the page
+    // filters by, so the two cannot disagree about which rows belong here.
+    const openElsewhere = !isPeer && !isChatPageSurface(s.surface ?? s.mode)
+      ? () => navigate(s.mode === 'member' && s.agent
+        ? `/members?member=${encodeURIComponent(s.agent)}`
+        : '/members')
+      : undefined
     // Clamped, not raw: rows past the window share a stamp and bail out of a
     // displacement above them (see SIDEBAR_DISPLACEMENT_WINDOW).
     const orderStamp = Math.min(sessionRowOrderStamp++, SIDEBAR_DISPLACEMENT_WINDOW)
@@ -7805,6 +7913,7 @@ function ChatSidebar({
         onRenameCommit={onRenameCommit} onRenameCancel={onRenameCancel}
         onDuplicate={sessionActions.duplicate} onCloseSession={sessionActions.close}
         onMenuCloseAutoFocus={onMenuCloseAutoFocus} onSelectSlot={onSelectSlot}
+        onOpenElsewhere={openElsewhere}
         onOpenSlotInNewTab={onOpenSlotInNewTab} onOpenSource={onOpenSource}
       />
     )

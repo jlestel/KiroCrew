@@ -11263,6 +11263,7 @@
       "on_instance": "Auf {{name}}",
       "opening_session_locally": "Diese Sitzung wird hier geöffnet…",
       "opens_here_runs_on_instance": "Öffnet diese Sitzung hier — ihre Ausführung läuft weiter auf {{name}}",
+      "opens_on_members_page": "Der eigene Thread eines Crewmitglieds – wird auf der Mitglieder-Seite geöffnet",
       "opens_on_crew_switches_there": "Öffnet auf {{name}} — wechselt zu dieser Crew, nicht hier",
       "remote_instances_list_unavailable": "Remote-Crews konnten nicht aufgelistet werden, daher werden ihre Sitzungen nicht angezeigt.",
       "model_list_failed": "Die Modellliste konnte nicht geladen werden. Die Anzeige ist möglicherweise unvollständig oder veraltet.",
