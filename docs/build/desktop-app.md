@@ -15,6 +15,7 @@ build is driven by [`packaging/build-desktop.sh`](../../packaging/build-desktop.
 ```bash
 make desktop               # macOS: universal DMG + update ZIP · Linux: AppImage + deb + rpm
 UNIVERSAL=0 make desktop   # macOS: faster host-arch-only DMG + ZIP (local iteration)
+UNIVERSAL=0 TARGET_ARCH=x86_64 make desktop   # macOS: single-arch DMG for a NAMED arch (arm64 | x86_64)
 ```
 
 Output lands in **`website/electron/dist/`**:
@@ -23,6 +24,7 @@ Output lands in **`website/electron/dist/`**:
 |---------|----------|----------|
 | `make desktop` | macOS | `KiroCrew-<version>-universal.dmg` plus `KiroCrew-<version>-universal-mac.zip` |
 | `UNIVERSAL=0 make desktop` | macOS | Host-arch DMG plus the matching `*-mac.zip` update archive |
+| `UNIVERSAL=0 TARGET_ARCH=<arch> make desktop` | macOS | `KiroCrew-<version>-arm64.dmg` / `KiroCrew-<version>-x64.dmg` plus `KiroCrew-<version>-<arch>-mac.zip` — the arch is always spelled, x64 included |
 | `make desktop` | Linux | `KiroCrew-*.AppImage`, `*.deb`, `*.rpm` (host arch) |
 
 The electron-builder configuration lives in
@@ -191,9 +193,24 @@ an Intel Mac where the universal build cannot run. Per-arch targets:
 | Target | Build host | Produces |
 |--------|-----------|----------|
 | macOS arm64 (Apple Silicon) | Apple Silicon Mac (`UNIVERSAL=0`) | arm64 `.dmg` + matching `*-mac.zip` |
-| macOS x86_64 (Intel) | Intel Mac | x86_64 `.dmg` + matching `*-mac.zip` |
+| macOS x86_64 (Intel) | Intel Mac, **or** an Apple Silicon Mac with Rosetta 2 (`UNIVERSAL=0 TARGET_ARCH=x86_64`) | x86_64 `.dmg` + matching `*-mac.zip` |
 | Linux x86_64 | x86_64 Linux | x86_64 `.AppImage`, `.deb`, `.rpm` |
 | Linux aarch64 (Graviton/ARM) | aarch64 Linux | aarch64 `.AppImage`, `.deb`, `.rpm` |
+
+**Naming an arch instead of taking the host's.** `TARGET_ARCH=arm64|x86_64`
+(macOS, `UNIVERSAL=0` only) makes a single-arch build *for* that arch: the
+script provisions that arch's python-build-standalone interpreter (x86_64
+runs under Rosetta 2 on Apple Silicon, exactly as the universal build's
+x86_64 half does), arch-gates the bundled backend with `file`, passes
+`--arm64` / `--x64` to electron-builder, and post-gates the shell binary with
+`lipo -archs` so a host-arch shell can never land in an x86_64-labelled DMG.
+The artifact always spells its arch (`-arm64` / `-x64`), including for x64,
+where electron-builder's default pattern would otherwise drop it; the ZIP
+keeps electron-builder's `-mac.zip` suffix. `scripts/emit-symbols-manifest.mjs`
+reads the same variable so the symbols pin records the arch actually built.
+`TARGET_ARCH=arm64` needs an Apple Silicon host (an Intel Mac cannot run the
+arm64 backend it would have to gate); any other value, any use outside
+macOS, or setting it while `UNIVERSAL=1` is in effect, is refused.
 
 **Both Linux architectures ship.** `build-desktop.yml` builds them on
 `ubuntu-22.04` and `ubuntu-22.04-arm`, and `publish-linux.yml` runs once per
@@ -240,6 +257,22 @@ it builds the full matrix and uploads artifacts, with no publish lane attached.
 
 Anything you **distribute** for macOS should be the universal DMG — the
 host-arch build is a local-machine artifact.
+
+**Single-arch macOS DMGs in CI (opt-in, build-only).** `build-desktop.yml` has
+a second macOS job, `build-desktop-mac-single-arch`, behind the boolean input
+`mac_single_arch` (default `false`; `nightly.yml` passes `true`, `release.yml`
+keeps the default). When on, it runs the script twice on `macos-15` —
+`UNIVERSAL=0 TARGET_ARCH=arm64` and
+`UNIVERSAL=0 TARGET_ARCH=x86_64` — and uploads `unsigned-build-darwin-arm64`
+and `unsigned-build-darwin-x64` beside `unsigned-build-darwin-universal`.
+Nothing downstream consumes them: `sign-and-notarize.yml` excludes those two
+artifact names when it flattens the run's artifacts, so its "first `*-mac.zip`"
+pick and exactly-one-DMG assertion still see only the universal build, and the
+feed still has one `latest-mac.yml`. The job is `continue-on-error`, because
+build-only artifacts must never hold the universal signing or the Linux
+publishers. Per-arch signing and feeds are a separate, future lane. To get the
+two DMGs from any ref, dispatch `build-desktop.yml` manually with the box
+ticked, or pick them up from the nightly run.
 
 Prerequisite: **Rosetta 2** on the build machine
 (`softwareupdate --install-rosetta --agree-to-license`) — the x86_64 PBS
@@ -415,6 +448,7 @@ The script honors these environment flags:
 | Flag | Effect |
 |------|--------|
 | `UNIVERSAL=0` | macOS: opt out of the universal default — host-arch-only build (faster local iteration; the only option on an Intel Mac). Universal (`UNIVERSAL=1`) is the macOS default; Linux is always host-arch |
+| `TARGET_ARCH=arm64` / `TARGET_ARCH=x86_64` | macOS, with `UNIVERSAL=0`: build the single-arch app for the NAMED arch rather than the host's (x86_64 on Apple Silicon runs under Rosetta 2). Arch-gates the backend and the shell; the artifact always carries `-arm64` / `-x64`. Refused outside macOS or with any other value |
 | `SKIP_FRONTEND=1` | Reuse an already-built `website/dist` |
 | `SKIP_ELECTRON=1` | Stop after the bundled backend (no electron-builder) |
 

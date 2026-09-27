@@ -27,9 +27,15 @@
 # (AppImage). UNIVERSAL=0 forces a host-arch-only macOS build (faster local
 # iteration, or the only option on an Intel Mac).
 #
+# TARGET_ARCH=arm64|x86_64 (macOS, UNIVERSAL=0 only) names the ONE arch a
+# single-arch build is for, instead of taking the host's. x86_64 on an
+# Apple-Silicon host builds under Rosetta 2, exactly as the universal build's
+# x86_64 half does. The artifact carries the arch in its name either way.
+#
 # Usage:
 #   bash packaging/build-desktop.sh            # macOS: universal DMG · Linux: host arch
 #   UNIVERSAL=0 bash packaging/...             # macOS: host-arch-only DMG
+#   UNIVERSAL=0 TARGET_ARCH=x86_64 bash ...    # macOS: single-arch DMG for a named arch
 #   SKIP_FRONTEND=1 bash packaging/...         # reuse an already-staged dist
 #   SKIP_ELECTRON=1 bash packaging/...         # stop after the backend binary
 #   BUNDLE_KIRO_CLI=0 bash packaging/...       # ship without the bundled kiro-cli
@@ -79,6 +85,14 @@ if [ "$UNIVERSAL" = "1" ]; then
     echo "       Mach-O shell + dual macOS backends). Build Linux per-arch instead." >&2
     exit 1
   fi
+  if [ -n "${TARGET_ARCH:-}" ]; then
+    # A named arch and a universal build contradict each other; silently
+    # building universal would hand a caller who asked for x86_64 a DMG that
+    # is not what its command line said.
+    echo "ERROR: TARGET_ARCH=${TARGET_ARCH} needs UNIVERSAL=0 (a universal build" >&2
+    echo "       always carries both arches). Run: UNIVERSAL=0 TARGET_ARCH=${TARGET_ARCH} ..." >&2
+    exit 1
+  fi
   if [ "$HOST_ARCH" != "arm64" ]; then
     echo "ERROR: the universal build requires an Apple-Silicon host — the arm64" >&2
     echo "       backend cannot be built on Intel (no x86_64->arm64 Rosetta)." >&2
@@ -94,9 +108,46 @@ if [ "$UNIVERSAL" = "1" ]; then
   fi
   printf '\n\033[1;33m▶ Building UNIVERSAL macOS app: arm64 + x86_64.\033[0m\n'
 else
-  printf '\n\033[1;33m▶ Building for host arch only: %s/%s.\033[0m\n' \
-    "$(uname -s)" "$HOST_ARCH"
+  if [ -n "${TARGET_ARCH:-}" ]; then
+    if [ "$OS" != "darwin" ]; then
+      echo "ERROR: TARGET_ARCH is a macOS-only knob (Linux/Windows build the host arch)." >&2
+      exit 1
+    fi
+    case "$TARGET_ARCH" in
+      arm64|x86_64) ;;
+      *)
+        echo "ERROR: TARGET_ARCH must be arm64 or x86_64 (got '$TARGET_ARCH')." >&2
+        exit 1 ;;
+    esac
+    if [ "$TARGET_ARCH" = "arm64" ] && [ "$HOST_ARCH" != "arm64" ]; then
+      echo "ERROR: TARGET_ARCH=arm64 needs an Apple-Silicon host — an Intel Mac" >&2
+      echo "       cannot execute the arm64 backend it would have to gate." >&2
+      exit 1
+    fi
+    if [ "$TARGET_ARCH" = "x86_64" ] && [ "$HOST_ARCH" = "arm64" ] \
+        && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+      echo "ERROR: Rosetta 2 is required to build the x86_64 backend on this host:" >&2
+      echo "       softwareupdate --install-rosetta --agree-to-license" >&2
+      exit 1
+    fi
+    printf '\n\033[1;33m▶ Building SINGLE-ARCH macOS app: %s.\033[0m\n' "$TARGET_ARCH"
+  else
+    printf '\n\033[1;33m▶ Building for host arch only: %s/%s.\033[0m\n' \
+      "$(uname -s)" "$HOST_ARCH"
+  fi
 fi
+
+# The one arch a non-universal build produces: the named target, else the
+# host. Universal ignores it (it always builds both). uname spelling
+# (arm64 / x86_64), which is also what `file` prints for the Mach-O gate.
+BUILD_ARCH="${TARGET_ARCH:-$HOST_ARCH}"
+# electron-builder's spelling of the same arch (its CLI flag and ${arch}
+# artifact macro).
+case "$BUILD_ARCH" in
+  arm64)          EB_ARCH="arm64" ;;
+  x86_64|amd64)   EB_ARCH="x64" ;;
+  *)              EB_ARCH="$BUILD_ARCH" ;;
+esac
 
 ELECTRON_DIR="$ROOT/website/electron"
 
@@ -804,7 +855,10 @@ if [ "$UNIVERSAL" = "1" ]; then
 else
   log "Provisioning python-build-standalone interpreter (uv)…"
   # Pin to CPython 3.12 (latest stable, matches CI python-version).
-  ARCH="$HOST_ARCH"
+  # BUILD_ARCH, not HOST_ARCH: a TARGET_ARCH=x86_64 build on an Apple-Silicon
+  # host provisions the x86_64 interpreter and runs it under Rosetta, the same
+  # way the universal build's x86_64 half does.
+  ARCH="$BUILD_ARCH"
   [ "$ARCH" = "arm64" ] && ARCH="aarch64"
   if [ "$OS" = "darwin" ]; then
     PBS_PATTERN="cpython-3.12*-macos-${ARCH}-none"
@@ -813,14 +867,27 @@ else
   else
     PBS_PATTERN="cpython-3.12*-linux-${ARCH}-gnu"
   fi
-  PBS_DIR="$(provision_pbs "cpython-3.12" "$PBS_PATTERN")"
+  # The bare "cpython-3.12" key asks uv for the HOST's build, so a named
+  # TARGET_ARCH must spell the arch out — otherwise an x86_64 build on an
+  # Apple-Silicon runner installs the aarch64 interpreter and then finds no
+  # x86_64 tree to match PBS_PATTERN. Same fully-qualified key shape the
+  # universal branch uses for its two halves.
+  PBS_KEY="cpython-3.12"
+  if [ -n "${TARGET_ARCH:-}" ]; then
+    PBS_KEY="cpython-3.12-macos-${ARCH}-none"
+  fi
+  PBS_DIR="$(provision_pbs "$PBS_KEY" "$PBS_PATTERN")"
   echo "    PBS interpreter: $PBS_DIR"
 
   if [ "$OS" = "windows" ]; then
     build_backend_windows "$PBS_DIR" "$ELECTRON_DIR/backend-dist/kirocrew-backend"
     resolver_gate "$ELECTRON_DIR/backend-dist/kirocrew-backend/bin/kirocrew.cmd" ""
   else
-    build_backend "$PBS_DIR" "$ELECTRON_DIR/backend-dist/kirocrew-backend" ""
+    # Arch-gate the tree only when an arch was NAMED: that is the one case
+    # where the interpreter uv handed back can differ from the host, and the
+    # gate is what turns a wrong wheel into a build failure instead of an app
+    # whose backend crashes at launch. Host-arch builds keep the ungated path.
+    build_backend "$PBS_DIR" "$ELECTRON_DIR/backend-dist/kirocrew-backend" "${TARGET_ARCH:-}"
     resolver_gate "$ELECTRON_DIR/backend-dist/kirocrew-backend/bin/kirocrew" ""
   fi
 fi
@@ -1365,7 +1432,25 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
   # the former.
   if [ "$OS" = "darwin" ]; then
     EB_ARGS+=( --mac )
-    [ "$UNIVERSAL" = "1" ] && EB_ARGS+=( --universal )
+    if [ "$UNIVERSAL" = "1" ]; then
+      EB_ARGS+=( --universal )
+    elif [ -n "${TARGET_ARCH:-}" ]; then
+      # Named single arch. The explicit artifactName patterns exist for x64:
+      # electron-builder's DEFAULT pattern drops "-${arch}" for x64 (an Intel
+      # build would land as "KiroCrew-1.2.3.dmg", indistinguishable from nothing
+      # in particular), and these two builds ship NEXT TO the universal DMG,
+      # so every mac artifact must spell its arch. arm64 already does by
+      # default; spelling the pattern out keeps both legs on one rule.
+      # dmg.artifactName (target-specific) outranks mac.artifactName
+      # (platform-wide), so the DMG drops the "-mac" that the zip keeps --
+      # the zip suffix is what sign-and-notarize.yml's "*-mac.zip" match and
+      # electron-updater's per-arch feed lookup both key on.
+      EB_ARGS+=(
+        "--${EB_ARCH}"
+        '-c.mac.artifactName=${productName}-${version}-${arch}-mac.${ext}'
+        '-c.dmg.artifactName=${productName}-${version}-${arch}.${ext}'
+      )
+    fi
     run_electron_builder_with_retry "${EB_ARGS[@]}"
   elif [ "$OS" = "windows" ]; then
     EB_ARGS+=( --win )
@@ -1385,9 +1470,11 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
   fi
 )
 
-# Universal post-gate: the staged shell binary must carry BOTH arch slices.
-if [ "$UNIVERSAL" = "1" ]; then
-  log "Verifying the shell binary is universal (lipo)…"
+# macOS shell-arch post-gate. Universal: the staged shell binary must carry
+# BOTH arch slices. Named single arch: it must carry exactly THAT one (a
+# host-arch shell in an x86_64-labelled DMG is the mislabel this catches).
+if [ "$OS" = "darwin" ] && { [ "$UNIVERSAL" = "1" ] || [ -n "${TARGET_ARCH:-}" ]; }; then
+  log "Verifying the shell binary's arch slices (lipo)…"
   APP_BIN="$(find "$ELECTRON_DIR/dist" -maxdepth 5 \
     -path "*/${PRODUCT_NAME}.app/Contents/MacOS/${PRODUCT_NAME}" -print -quit 2>/dev/null)"
   if [ -z "$APP_BIN" ]; then
@@ -1395,13 +1482,20 @@ if [ "$UNIVERSAL" = "1" ]; then
     exit 1
   fi
   LIPO_ARCHS="$(lipo -archs "$APP_BIN")"
-  case "$LIPO_ARCHS" in
-    *x86_64*arm64*|*arm64*x86_64*)
-      echo "    $APP_BIN: $LIPO_ARCHS" ;;
-    *)
-      echo "ERROR: shell binary is not universal (lipo -archs: $LIPO_ARCHS)" >&2
-      exit 1 ;;
-  esac
+  if [ "$UNIVERSAL" = "1" ]; then
+    case "$LIPO_ARCHS" in
+      *x86_64*arm64*|*arm64*x86_64*)
+        echo "    $APP_BIN: $LIPO_ARCHS" ;;
+      *)
+        echo "ERROR: shell binary is not universal (lipo -archs: $LIPO_ARCHS)" >&2
+        exit 1 ;;
+    esac
+  elif [ "$LIPO_ARCHS" = "$TARGET_ARCH" ]; then
+    echo "    $APP_BIN: $LIPO_ARCHS"
+  else
+    echo "ERROR: shell binary is not ${TARGET_ARCH}-only (lipo -archs: $LIPO_ARCHS)" >&2
+    exit 1
+  fi
 fi
 
 log "Done. Installer(s) are in $ELECTRON_DIR/dist/"

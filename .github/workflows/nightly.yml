@@ -386,6 +386,12 @@ jobs:
       # reads "this version has both arches". release.yml does record that
       # claim and therefore keeps the default (false).
       soft_fail_arm64: true
+      # Also build the arm64-only and x86_64-only macOS DMGs, as build-only
+      # artifacts on the run (unsigned-build-darwin-arm64 / -x64). Nothing
+      # here publishes them: sign-and-notarize.yml excludes those two artifact
+      # names, so the universal DMG is still the only mac bytes that lane sees.
+      # release.yml keeps the default (false).
+      mac_single_arch: true
 
   # Windows builds in its own workflow because it Authenticode-signs during the
   # build (the Squirrel installer embeds already-signed executables), so unlike
