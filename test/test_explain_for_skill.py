@@ -59,7 +59,7 @@ def _case_id(case: dict) -> str:
 
 
 @pytest.fixture
-def loader(tmp_path: Path) -> SkillsLoader:
+def loader(tmp_path: Path, opened) -> SkillsLoader:
     """A loader over a skills tree holding only explain-for.
 
     Two things are pinned deliberately, and neither is incidental.
@@ -96,18 +96,25 @@ def loader(tmp_path: Path) -> SkillsLoader:
     walk and then serves ``[]`` with the scope marked ``"building"`` — by design,
     so a live turn never stalls on discovery. A test is not a live turn: an empty
     catalog there fails exactly the ``expect_trigger`` cases while the control
-    cases pass trivially, which is the flake in #14296 (different parameter ids
-    on unrelated heads, green on rerun, Windows shard under load). Polling the
+    cases pass trivially: the failing parameter id is whichever triggering case
+    the losing shard is handed, and a rerun is green. Polling the
     public ``catalog_status`` to ``"complete"`` here turns a lost race into an
     honest wait for every test in the class, not just the one seen to fail.
+
+    **The loader is closed at teardown.** Construction opens the skill search
+    index (a SQLite connection) and the first discovery starts the catalog
+    worker; ``opened`` releases both through ``SkillsLoader.close()`` so no test
+    leaks descriptors or a thread (``no-test-side-effects``).
     """
     dest = tmp_path / "skills" / "explain-for"
     dest.mkdir(parents=True)
     (dest / "SKILL.md").write_text(SKILL_FILE.read_text(encoding="utf-8"), encoding="utf-8")
-    loader = SkillsLoader(
-        skills_path=tmp_path / "skills",
-        install_builtins=False,
-        config=KiroCrewConfig(skills=SkillsConfig(max_triggered=1)),
+    loader = opened(
+        SkillsLoader(
+            skills_path=tmp_path / "skills",
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=1)),
+        )
     )
     _settle_catalog(loader)
     return loader
@@ -141,7 +148,7 @@ def _settle_catalog(loader: SkillsLoader) -> None:
 def lost_cold_race(monkeypatch: pytest.MonkeyPatch) -> None:
     """Expire the loader's cold-start budget instantly.
 
-    This is the race a loaded Windows shard loses (#14296), made deterministic:
+    This is the race a loaded Windows shard loses, made deterministic:
     the first enumeration of a fresh root is guaranteed to come back partial.
     Request it BEFORE ``loader`` so the fixture builds under the shrunken budget.
     """
