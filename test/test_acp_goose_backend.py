@@ -1608,3 +1608,22 @@ def test_the_goose_phrase_does_not_classify_another_harness() -> None:
         asyncio.run(client.ensure_ready())
     assert not isinstance(info.value, AcpAuthRequired)
     assert spawns == [1, 1]
+
+
+def test_a_keyring_only_goose_is_told_how_to_store_its_key_where_it_can_read_it() -> None:
+    """The one goose sign-in that ``goose configure`` alone cannot fix.
+
+    goose keeps keys in the OS keyring by default, which the sandboxed child
+    cannot reach. goose 1.52.0, run live with a provider configured and its key
+    only in the keyring, opens the session and answers the first
+    ``session/prompt`` with this frame. The message must name the file-storage
+    switch: telling that operator to run ``goose configure`` again only puts the
+    key back in the keyring.
+    """
+    from kiro_crew.acp.client import _format_acp_error
+
+    text = _format_acp_error({"code": -32000, "message": "Authentication required"}, backend=GOOSE)
+
+    assert "GOOSE_DISABLE_KEYRING=true goose configure" in text
+    assert "keyring" in text
+    assert "secrets.yaml" in text
