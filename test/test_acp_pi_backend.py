@@ -2448,3 +2448,43 @@ class TestThePushNeverNeedsARefusal:
         assert "EFFORT_LEVELS[: start + 1]" in body
         assert "_is_config_value_rejection(exc, effort_option)" in body
         assert "effort_config_option_value(self._client.backend, level)" in body
+
+
+def test_a_cancel_answers_the_open_gate_dialog_as_cancelled(tmp_path):
+    """ACP: after ``session/cancel`` the client answers every open permission request.
+
+    pi-acp keeps a cancelled turn open while the gate extension's dialog is unanswered,
+    so a Stop from a surface that did not reject the open approval first waited out the
+    whole ack budget and hard-killed the process. The frame is the live capture's own.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    path = ROOT / "test" / "fixtures" / "acp_frames" / "pi" / "permission-request-live.jsonl"
+    frame = next(
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if '"session/request_permission"' in line
+    )
+    client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_PI)
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdin.drain = AsyncMock()
+    client._process = proc
+    client._session_id = frame["params"]["sessionId"]
+    client._build_permission_event(
+        JsonRpcMessage(id=frame["id"], method=frame["method"], params=frame["params"])
+    )
+
+    asyncio.run(client.cancel_session())
+
+    written = [
+        json.loads(line)
+        for call in proc.stdin.write.call_args_list
+        for line in call.args[0].decode().splitlines()
+    ]
+    assert [w.get("method") for w in written] == ["session/cancel", None]
+    assert written[1] == {
+        "jsonrpc": "2.0",
+        "id": frame["id"],
+        "result": {"outcome": {"outcome": "cancelled"}},
+    }

@@ -1525,3 +1525,69 @@ def test_the_drift_refusals_run_on_both_answering_sites() -> None:
     stream = inspect.getsource(AcpClient.send_message_stream)
     assert "if self._judges_permission_requests:" in stream
     assert "self._extract_tool_event(msg)" in stream
+
+
+def test_a_cancel_answers_the_open_permission_request_as_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACP: after ``session/cancel`` the client answers every open permission request.
+
+    goose holds a cancelled turn open until its permission request is answered, so a
+    Stop from a surface that did not reject the open approval first waited out the
+    whole ack budget and hard-killed the process. The frame is the live capture's own.
+    """
+    import asyncio
+    import threading
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.acp.types import JsonRpcMessage
+
+    frame = next(
+        json.loads(line)
+        for line in (CORPUS / "turn-live.jsonl").read_text(encoding="utf-8").splitlines()
+        if '"session/request_permission"' in line
+    )
+    audited: list[dict] = []
+    recorder = MagicMock()
+    recorder.log_tool_invocation = lambda **kw: audited.append(kw)
+    resolved_on: list[object] = []
+
+    def _sel() -> MagicMock:
+        # An unwarmed sel() initialises on the calling thread, so it must be
+        # resolved inside the off-loop hop, never on the event loop.
+        resolved_on.append(threading.current_thread())
+        return recorder
+
+    monkeypatch.setattr(acp_client.sel_module, "sel", _sel)
+    client = AcpClient(work_dir=tmp_path, acp_backend=GOOSE)
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdin.drain = AsyncMock()
+    client._process = proc
+    client._session_id = frame["params"]["sessionId"]
+    client._build_permission_event(
+        JsonRpcMessage(id=frame["id"], method=frame["method"], params=frame["params"])
+    )
+
+    asyncio.run(client.cancel_session())
+
+    # The cancelled approval is a denial Crew made, so it is audited like one.
+    assert [(a["outcome"], a["request_id"]) for a in audited] == [
+        ("rejected_on_cancel", frame["id"])
+    ]
+    assert resolved_on and threading.main_thread() not in resolved_on
+
+    written = [
+        json.loads(line)
+        for call in proc.stdin.write.call_args_list
+        for line in call.args[0].decode().splitlines()
+    ]
+    assert [w.get("method") for w in written] == ["session/cancel", None]
+    assert written[1] == {
+        "jsonrpc": "2.0",
+        "id": frame["id"],
+        "result": {"outcome": {"outcome": "cancelled"}},
+    }
+    # Answered once: a second cancel has nothing left to answer.
+    asyncio.run(client.cancel_session())
+    assert len(proc.stdin.write.call_args_list) == len(written) + 1

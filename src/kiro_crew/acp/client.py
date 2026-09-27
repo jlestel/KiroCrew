@@ -12763,6 +12763,60 @@ class AcpClient:
             logger.debug("cancel_session: wrote session/cancel notification (%s)", outcome)
         except Exception:
             logger.debug("Cancel notification failed", exc_info=True)
+        # ACP: after session/cancel the client MUST answer every permission request
+        # still open with the ``cancelled`` outcome. A harness that waits for that
+        # answer before it acks the cancel (goose, pi) otherwise holds the turn open
+        # until the caller's ack budget runs out and the process is hard-killed --
+        # the path every Stop takes on a surface that did not reject the open
+        # approval first. ``_permission_options`` holds the requests not yet
+        # answered: ``reject_tool`` and ``approve_tool``'s auto-resolve path pop
+        # their entry, and a new turn clears the map. An ``approve_tool`` call with
+        # an explicit ``option_id`` leaves its entry behind; no caller passes one to
+        # this client.
+        open_requests = list(self._permission_options)
+        self._permission_options.clear()
+        if not open_requests:
+            return
+        for request_id in open_requests:
+            # A cancelled gate dialog is not an approval, so pi's tripwire treats
+            # the call exactly as it treats a rejected one.
+            self._note_pi_gate_denied(request_id)
+
+        # Each cancelled approval is a denial Crew made, so it gets its own SEL
+        # record before the answers go out. ONE off-loop hop for all of them, with
+        # the accessor inside it (an unwarmed ``sel()`` initialises on the calling
+        # thread), bounded the way ``_maybe_audit_tool_call`` bounds its write, so
+        # a stuck SEL backend costs this Stop at most one audit timeout.
+        def _audit_cancelled() -> None:
+            log = sel_module.sel()
+            for request_id in open_requests:
+                log.log_tool_invocation(
+                    session_key=self._session_key or "",
+                    agent=self._agent,
+                    source="acp",
+                    tool_name="approval_cancel",
+                    tool_kind="permission",
+                    outcome="rejected_on_cancel",
+                    request_id=request_id,
+                    metadata={"backend": self.backend},
+                )
+
+        try:
+            await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(subprocess_executor(), _audit_cancelled),
+                timeout=_SEL_AUDIT_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.warning("cancel_session: SEL audit of cancelled approvals failed", exc_info=True)
+        for request_id in open_requests:
+            try:
+                await self._send_response(request_id, {"outcome": {"outcome": OUTCOME_CANCELLED}})
+            except Exception:
+                logger.debug(
+                    "cancel_session: answering an open permission request failed",
+                    exc_info=True,
+                )
+                break
 
     async def steer(self, message: str) -> bool:
         """Inject a mid-turn steer into the running turn via kiro-cli's
