@@ -4821,8 +4821,8 @@ def _crew_memory_store_rejected(raw: object) -> str | None:
     )
 
 
-def _pin_entitlement_backend(cfg: Any) -> str | None:
-    """The harness whose live catalog may judge a crew's model pin, or ``None``.
+def _pin_entitlement_backend(cfg: Any) -> str:
+    """The harness whose live catalog may judge a crew's model pin.
 
     Every agent created or updated here is a Crew Member whose DM slot
     (``member-<slug>``) routes through ``agent.member_acp_backend`` — not
@@ -4832,8 +4832,12 @@ def _pin_entitlement_backend(cfg: Any) -> str | None:
     and kas share ``acp``). When they do not, the default's catalog cannot
     establish whether the pin the DM thread will actually run is usable — a
     live kiro session's catalog would deterministically reject a
-    claude-advertised id — so the answer is ``None``: entitlement unknown, and
-    the check consults any active provider instead of accusing on no evidence.
+    claude-advertised id — so the evidence must come from the harness the DM
+    thread will ACTUALLY run on, which is ``member_backend``. Returning it (not
+    ``None``) keeps the scope on the member's own namespace: a provider from an
+    unrelated harness can neither admit nor reject the pin, and when no member
+    -namespace provider is live the catalog is simply unknown (fail-open) rather
+    than judged by the wrong backend's advertised ids.
     """
     default_backend = getattr(cfg.agent, "acp_backend", "")
     member_backend = getattr(cfg.agent, "member_acp_backend", "")
@@ -4841,7 +4845,7 @@ def _pin_entitlement_backend(cfg: Any) -> str | None:
         capabilities_for(member_backend).model_id_namespace
         != capabilities_for(default_backend).model_id_namespace
     ):
-        return None
+        return member_backend
     return default_backend
 
 

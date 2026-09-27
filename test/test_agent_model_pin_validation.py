@@ -435,6 +435,44 @@ class TestSavePathRefusesAnUnusablePin:
                 assert (await response.json())["code"] == "invalid_model"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["post", "put"])
+    async def test_divergent_member_backend_ignores_a_wrong_namespace_catalog(
+        self, seeded_agent, method: str
+    ) -> None:
+        """A wrong-namespace live harness must not reject the member's pin.
+
+        default=codex, member=kas do not share a namespace, so the scope is
+        the member backend (kas). The only live provider is codex, whose
+        catalog does not advertise the pin. Scoping to kas means codex cannot
+        supply evidence, so entitlement is UNKNOWN (fail-open) rather than a
+        false rejection by the wrong backend's advertised ids — the defect the
+        unscoped fallback left open.
+        """
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig.load()
+        cfg.agent.acp_backend = "codex"
+        cfg.agent.member_acp_backend = "kas"
+        cfg.save()
+        app = _crud_app()
+        app["state"] = SimpleNamespace(
+            sessions=SimpleNamespace(
+                active_providers=lambda: [_catalog_provider("codex", "codex-only-model")]
+            )
+        )
+        body = {"model": "kas-pin-the-codex-catalog-cannot-judge"}
+        if method == "post":
+            body.update({"name": "divergent", "kiro_agent": "kirocrew"})
+
+        async with TestClient(TestServer(app)) as client:
+            response = await getattr(client, method)(
+                "/api/agents" if method == "post" else f"/api/agents/{seeded_agent}",
+                json=body,
+            )
+
+        assert response.status == 200
+
+    @pytest.mark.asyncio
     async def test_create_refuses_and_carries_an_error_code(self, seeded_agent):
         from kiro_crew.config.loader import KiroCrewConfig
 
