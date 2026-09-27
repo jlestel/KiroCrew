@@ -195,6 +195,23 @@ def test_main_answers_readiness_probes(monkeypatch):
     assert buf.getvalue().strip() == fake.FAKE_IDENTITY
 
 
+def test_main_answers_list_models_with_a_catalog(monkeypatch):
+    """``chat --list-models`` prints the fixed catalog in the shape ``api_models``
+    accepts: a dict whose ``models`` is a list of rows carrying ``model_name``.
+    A silent child here is a 503 behind the dashboard's model picker."""
+    buf = _capture(monkeypatch)
+    monkeypatch.setattr(
+        fake.sys,
+        "argv",
+        ["fake_acp_backend", "chat", "--list-models", "--format", "json", "--no-interactive"],
+    )
+    fake.main()
+    data = json.loads(buf.getvalue())
+    assert isinstance(data["models"], list) and data["models"]
+    assert all(row["model_name"] and row["model_id"] for row in data["models"])
+    assert data == fake.FAKE_MODEL_CATALOG
+
+
 def test_main_processes_messages_until_eof(monkeypatch):
     buf = _capture(monkeypatch)
     monkeypatch.setattr(fake.sys, "argv", ["fake_acp_backend", "acp"])

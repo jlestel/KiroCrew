@@ -70,7 +70,9 @@ live-test harness both point ``KIROCREW_KIRO_BIN`` at a launcher that runs it).
 ``AcpClient`` invokes it as ``<launcher> acp [--agent NAME ...]`` -- argv is
 ignored on that path and the protocol is driven entirely over stdio. The
 ``--version`` and ``whoami`` commands return deterministic success so the
-offline gateway exercises the same first-run readiness gate as production.
+offline gateway exercises the same first-run readiness gate as production, and
+``chat --list-models`` prints a fixed catalog so the dashboard's model picker
+(``/api/models``) has rows to show instead of a 503 for a silent child.
 """
 
 from __future__ import annotations
@@ -90,6 +92,29 @@ PROTOCOL_VERSION = "2025-08-22"
 REPLY_TEXT = "pong from the fake ACP backend"
 FAKE_VERSION = "kiro-cli fake-e2e"
 FAKE_IDENTITY = "fake-e2e-user"
+
+# The catalog ``chat --list-models --format json`` prints. Shaped like the real
+# CLI's payload (``{"models": [{model_name, model_id, description,
+# context_window_tokens}]}``) because ``api_models`` rejects anything else with
+# a 503, and every row names a model this fake will happily "run": it answers
+# every prompt the same way whatever model the picker selects. Two rows so the
+# picker has something to switch between.
+FAKE_MODEL_CATALOG: dict[str, Any] = {
+    "models": [
+        {
+            "model_name": "fake-model-fast",
+            "model_id": "fake-model-fast",
+            "description": "Fake e2e model (fast)",
+            "context_window_tokens": 200_000,
+        },
+        {
+            "model_name": "fake-model-large",
+            "model_id": "fake-model-large",
+            "description": "Fake e2e model (large context)",
+            "context_window_tokens": 1_000_000,
+        },
+    ]
+}
 
 # Prompt sentinels. Absent by default so a plain prompt stays text-only.
 TOOL_TRIGGER = "[[TOOL]]"
@@ -582,6 +607,14 @@ def main() -> None:
         return
     if args == ["whoami"]:
         print(FAKE_IDENTITY)
+        return
+    if args[:2] == ["chat", "--list-models"]:
+        # The dashboard's model picker spawns
+        # ``kiro-cli chat --list-models --format json --no-interactive`` and
+        # treats empty stdout as a 503. Flags after the subcommand are accepted
+        # and ignored; the payload is JSON regardless, which is what the one
+        # caller asks for.
+        print(json.dumps(FAKE_MODEL_CATALOG))
         return
     if args == ["acp", "--help"]:
         # The readiness probe runs this to confirm the `acp` subcommand exists
