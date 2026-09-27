@@ -96,6 +96,8 @@ class FileReader:
     SUPPORTED = {
         '', '.md', '.txt', '.org', '.py', '.java', '.ts', '.js', '.rs', '.go',
         '.html', '.htm', '.docx', '.pdf',
+        # AsciiDoc reads as text; .asc stays out because it also names PGP armor.
+        '.adoc', '.asciidoc',
         '.csv', '.log', '.json', '.jsonl', '.ndjson', '.yaml', '.yml',
         '.sh', '.rb', '.ps1', '.psm1', '.psd1', '.c', '.cpp', '.h',
         '.cs', '.kt', '.kts', '.swift', '.scala',

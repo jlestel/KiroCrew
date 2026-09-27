@@ -147,11 +147,12 @@ The remaining gap is therefore an **A/B task-lift harness** (Tier 2), plus a flo
 ```
 '', '.md', '.txt', '.org', '.py', '.java', '.ts', '.js', '.rs', '.go',
 '.html', '.htm', '.docx', '.pdf',
+'.adoc', '.asciidoc',
 '.csv', '.log', '.json', '.jsonl', '.ndjson', '.yaml', '.yml', '.sh', '.rb', '.ps1', '.psm1', '.psd1', '.c', '.cpp', '.h',
 '.cs', '.kt', '.kts', '.swift', '.scala'
 ```
 
-It includes markdown/plain-text (`.md`/`.txt`/`.org`), source-code extensions, and the two binary formats with declared optional deps (`.pdf` → pdfplumber, `.docx` → python-docx).
+It includes markdown/plain-text (`.md`/`.txt`/`.org`, AsciiDoc `.adoc`/`.asciidoc`; `.asc` is excluded because it also names PGP armor), source-code extensions, and the two binary formats with declared optional deps (`.pdf` → pdfplumber, `.docx` → python-docx).
 
 **`SUPPORTED` must be a superset of `ingestion.CODE_EXTS`.** The two sets are hand-maintained and overlap: `SUPPORTED` gates the folder scan (`folder_watcher._walk`, and a source's `include_extensions` can only narrow it), while `CODE_EXTS` picks the code-aware chunker. A code extension present in `CODE_EXTS` but absent from `SUPPORTED` is therefore skipped before any reader runs — a folder source over such a repo ingests only its README and config, with no error. `test/test_knowledge.py` pins the subset relation so the two cannot drift again.
 

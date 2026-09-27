@@ -777,6 +777,18 @@ class TestFileReader:
         for ext in (".md", ".txt", ".py", ".html", ".json", ".jsonl", ".ndjson", ".yaml", ".csv"):
             assert ext in reader.SUPPORTED, f"{ext} missing from SUPPORTED"
 
+    def test_asciidoc_extensions_ingested_as_plain_text(self, tmp_path):
+        reader = FileReader()
+        assert ".asc" not in reader.SUPPORTED
+        for ext in (".adoc", ".asciidoc"):
+            assert ext in reader.SUPPORTED
+            assert ext not in reader._DISPATCH
+            f = tmp_path / f"guide{ext}"
+            f.write_text("= Guide\n\nhello asciidoc", encoding="utf-8")
+            text, meta = reader.read(str(f))
+            assert "hello asciidoc" in text
+            assert meta["format"] == ext.lstrip(".")
+
     def test_powershell_extensions_ingested_as_plain_text(self, tmp_path):
         # PowerShell scripts (.ps1), modules (.psm1), and module manifests
         # (.psd1) are plain UTF-8 text: they must be in SUPPORTED (so folder
