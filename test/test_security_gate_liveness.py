@@ -58,7 +58,19 @@ def _url_payload_command(n: int) -> str:
 #: (``_child_realpath.py``, ~190 lines) that lives beside the resolver it serves
 #: rather than in the pool package. It is a bound on total volume:
 #: relocating a declaration between submodules moves nothing across it.
-_PACKAGE_LINE_BUDGET = 27_200
+#:
+#: Raised again, from 27,200, when the facade stopped binding re-exported names
+#: eagerly and began resolving each through its owner. That trades one import block
+#: for two name lists -- an owner table and a ``TYPE_CHECKING`` block, one line per
+#: exported name in each -- which measured 618 lines at the current surface and is
+#: machinery, not control logic.
+#:
+#: The number IS the package's measured total, carrying no spare room: a ratchet with
+#: headroom admits exactly the unreviewed growth it exists to catch, so the next line
+#: added here fails this gate and has to be re-pinned deliberately, with its reason
+#: written above. The guards that detect a monolith growing back are the per-file cap
+#: and the facade's share below, and both must stay untouched.
+_PACKAGE_LINE_BUDGET = 27_751
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

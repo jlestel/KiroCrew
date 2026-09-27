@@ -24,12 +24,12 @@ therefore covered on the commit that introduces it, with no edit here. A list of
 covered modules would be a second thing to remember, which is the same failure the
 rule is about.
 
-Seven modules in this package hold such a mapping today, so the rule is enforced as
+Six modules in this package hold such a mapping today, so the rule is enforced as
 a RATCHET rather than as a flat universal. ``_KNOWN_RESOLVED_OWNER_MIRRORS`` names
-those seven, and the assertions run in both directions against it: a mirroring
+those six, and the assertions run in both directions against it: a mirroring
 module OUTSIDE that set must satisfy the rule, and a module INSIDE it must still
 violate the rule, so a module that gets converted has to be de-listed and the set
-can only shrink. An eighth violator reddens on the commit that introduces it, and a
+can only shrink. A seventh violator reddens on the commit that introduces it, and a
 name that stops violating reddens until it leaves the list. The set is therefore a
 measurement of where the package stands, not permission to stay there.
 
@@ -193,7 +193,6 @@ _KNOWN_RESOLVED_OWNER_MIRRORS = frozenset(
         "kiro_crew.dashboard",
         "kiro_crew.diag",
         "kiro_crew.mcp_gateway",
-        "kiro_crew.security",
         "kiro_crew.stt",
     }
 )
