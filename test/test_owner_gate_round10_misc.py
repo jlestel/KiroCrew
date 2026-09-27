@@ -8,8 +8,7 @@ An allow-listed channel user can hold a dashboard token whose claims are
 * ``POST /api/memory/embedding-model`` rewrites the owner's model config and
   re-embeds the owner's vector store.
 * ``POST /api/apps/auto-improvement/deps/install`` runs pip in the gateway
-  interpreter. It is an App Kit route, so only the dashboard-user caller class
-  is owner-gated; an app token keeps its own app-scope check.
+  interpreter. Only the dashboard owner may run it; an app token is refused.
 
 Every side effect is a stub that records whether it was reached.
 """
@@ -225,14 +224,14 @@ async def test_deps_install_allows_owner(monkeypatch) -> None:
     assert calls == [True]
 
 
-async def test_deps_install_leaves_an_app_token_to_its_app_scope(monkeypatch) -> None:
-    """An app token is not a dashboard user; its access is decided by app scope."""
+async def test_deps_install_refuses_an_app_token(monkeypatch) -> None:
+    """An app token is not the owner, even the app's own token."""
     app, calls = _deps_app(monkeypatch)
     async with _client(app, "app-subject", app_claim="auto-improvement") as client:
         resp = await client.post("/api/apps/auto-improvement/deps/install")
         status = resp.status
-    assert status == 200
-    assert calls == [True]
+    assert status == 403
+    assert calls == []
 
 
 # ── allowed decisions are audited ────────────────────────────────────────────

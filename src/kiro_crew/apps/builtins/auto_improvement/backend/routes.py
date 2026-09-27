@@ -1369,15 +1369,12 @@ async def _audit_deps_install_allowed(request: web.Request) -> None:
 async def _handle_deps_install(request: web.Request) -> web.StreamResponse:
     """Install the optional dependencies that can be installed safely.
 
-    The install runs pip in the gateway interpreter, so a dashboard-user caller
-    (``app == ""``) must be the owner. An app token keeps its own app-scope check.
+    The install runs pip in the gateway interpreter, so only the dashboard owner
+    may run it; an app token is refused like any other non-owner caller.
     """
-    if request.get("app") == "":
-        owner_denied = await require_owner_dashboard_request(
-            request, "auto_improvement.deps_install"
-        )
-        if owner_denied is not None:
-            return owner_denied
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.deps_install")
+    if owner_denied is not None:
+        return owner_denied
     await _audit_deps_install_allowed(request)
     result = await asyncio.to_thread(deps.install_deps)
     if result.get("ok"):
