@@ -406,6 +406,50 @@ describe('Decisions (Jev) preview card', () => {
     expect(screen.getByText(/falls back to the same rule/i)).toBeInTheDocument()
   })
 
+  it('says nothing goes over the internet when the endpoint is on this machine', async () => {
+    stubGateway(
+      consentOf(true, {
+        endpoint: 'http://127.0.0.1:8577/v1/systemone',
+        configured_endpoint: 'http://127.0.0.1:8577/v1/systemone',
+        endpoint_kind: 'local',
+      }),
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/sent only to the decision server at the address below, on this machine/i)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/sent over the internet to Jev/i)).toBeNull()
+  })
+
+  it('names a self-hosted server instead of TypeSafe for any other address', async () => {
+    stubGateway(
+      consentOf(true, {
+        endpoint: 'https://jul.internal.example/v1/systemone',
+        configured_endpoint: 'https://jul.internal.example/v1/systemone',
+        endpoint_kind: 'other',
+      }),
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/instead of TypeSafe's hosted Jev service/i)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/sent over the internet to Jev/i)).toBeNull()
+  })
+
+  it('keeps the internet wording when an older gateway does not classify the address', async () => {
+    // No `endpoint_kind` at all: the card must not guess "local" from the URL.
+    stubGateway(
+      consentOf(true, {
+        endpoint: 'http://127.0.0.1:8577/v1/systemone',
+        configured_endpoint: 'http://127.0.0.1:8577/v1/systemone',
+      }),
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/sent over the internet to Jev/i)).toBeInTheDocument()
+    })
+  })
+
   it('lists one row per point the GATEWAY projects, never a list of its own', async () => {
     stubGateway({ enabled: true }, { decisions: { bucket: 100 } })
     renderSection()

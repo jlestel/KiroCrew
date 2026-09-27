@@ -26,6 +26,7 @@ import {
   readModelRoute,
   readNudgeWake,
   type DecisionPointRow,
+  type EndpointKind,
 } from './decisionsPreview'
 import { fmtPercent } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
@@ -136,6 +137,13 @@ const DecisionsPointPanel = lazy(async () => ({
 const GLOBAL_PANEL_ID = 'decisions-global-panel'
 const POINT_PANEL_ID = 'decisions-point-panel'
 const EGRESS_NOTE_ID = 'decisions-egress-note'
+
+/** The egress sentence for where the configured address sends a decision. */
+const EGRESS_KEY: Record<EndpointKind, string> = {
+  local: 'pages.developer.featurePreviewsTab.decisions_egress_local',
+  other: 'pages.developer.featurePreviewsTab.decisions_egress_self_hosted',
+  typesafe: 'pages.developer.featurePreviewsTab.decisions_egress',
+}
 const BACKEND_NOTE_ID = 'decisions-backend-note'
 const BUCKET_INPUT_ID = 'decisions-bucket-slider'
 /**
@@ -492,7 +500,7 @@ export function DecisionsCard() {
         id={EGRESS_NOTE_ID}
         className={backendMissing ? 'text-[12px] text-muted opacity-40' : 'text-[12px] text-text'}
       >
-        {i18nT('pages.developer.featurePreviewsTab.decisions_egress')}
+        {i18nT(EGRESS_KEY[view.endpointKind])}
       </p>
       {/* The sampling share, stated in BOTH switch states and OUTSIDE the disclosure.
         * The decisions module spec under docs/system-specs/modules pins it there: the

@@ -220,6 +220,8 @@ export function readPoints(body: unknown): DecisionPointRow[] {
 const BUCKET_MIN = 0
 const BUCKET_MAX = 100
 
+export type EndpointKind = 'local' | 'typesafe' | 'other'
+
 export interface DecisionsView {
   /**
    * Whether this gateway has the consent endpoint at all. An older gateway
@@ -234,6 +236,13 @@ export interface DecisionsView {
    * so the reader consents to an ADDRESS, not just to "sending".
    */
   configuredEndpoint: string
+  /**
+   * Where that address sends a decision, as the gateway classifies it. Words the
+   * egress note: only an exact `local` or `other` changes it, so an older gateway
+   * (no field) or an unknown value keeps the "over the internet to Jev" wording,
+   * which never understates what leaves the machine.
+   */
+  endpointKind: EndpointKind
   /**
    * Consent was given, but for a different address than the config names now
    * (`provider.endpoint` was edited afterwards). Nothing is sent in this state;
@@ -312,6 +321,7 @@ const UNSUPPORTED: DecisionsView = {
   supported: false,
   enabled: false,
   configuredEndpoint: '',
+  endpointKind: 'typesafe',
   endpointMoved: false,
   bucket: null,
   toolArgs: false,
@@ -365,6 +375,7 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
       supported: false,
       enabled: false,
       configuredEndpoint: '',
+      endpointKind: 'typesafe',
       endpointMoved: false,
       toolArgs: false,
       compaction: false,
@@ -379,6 +390,8 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
   // rather than re-deriving equality here, so the card and the gate cannot
   // disagree about whether anything is being sent.
   const endpointMoved = enabled && root.permits !== true
+  const endpointKind: EndpointKind =
+    root.endpoint_kind === 'local' || root.endpoint_kind === 'other' ? root.endpoint_kind : 'typesafe'
   // An exact `true`, like `enabled` above: this field decides whether a new
   // category of conversation content leaves the machine, so a truthy stand-in is
   // not a deliberate yes. An older gateway omits it entirely and reads as off.
@@ -404,6 +417,7 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
     supported: true,
     enabled,
     configuredEndpoint,
+    endpointKind,
     endpointMoved,
     toolArgs,
     compaction,

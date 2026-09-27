@@ -6204,7 +6204,9 @@ class DecisionProviderConfig:
             "Endpoint",
             "Full URL of the evaluation endpoint. Override only to point at a "
             "compatible proxy — the request and response field names are fixed by "
-            "the TypeSafe API, not by this setting.",
+            "the TypeSafe API, not by this setting. JuL's `jul serve` speaks it on this "
+            "machine (http://127.0.0.1:8577/v1/systemone), and a loopback endpoint "
+            "needs no API key.",
         ),
     )
     api_key: str = field(
@@ -6217,7 +6219,8 @@ class DecisionProviderConfig:
             "key here is NOT used, and no other vault entry is readable through this "
             "field, because config.json is agent-writable. With no usable key the "
             "seam logs a row saying so and returns None — it never sends an empty "
-            "bearer credential.",
+            "bearer credential — except for an endpoint on this machine (localhost "
+            "or a loopback address), which is asked without an Authorization header.",
             sensitive=True,
         ),
     )
