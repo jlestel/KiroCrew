@@ -589,9 +589,9 @@ class HybridRetriever:
         """Cosine-score ``rows`` against ``query_vec`` one row at a time (stdlib only).
 
         The reference scorer: the query norm is derived once per search (it is
-        the same for every row — recomputing it per row was the #3109 defect on
-        the lesson path) and each row costs one blob decode, one dot product and
-        one norm. Returns ``(scored, mismatched)`` where ``scored`` holds
+        the same for every row, so the loop never recomputes it — the same
+        hoisting ``vector_memory._stored_similarity_scorer`` does for lessons)
+        and each row costs one blob decode, one dot product and one norm. Returns ``(scored, mismatched)`` where ``scored`` holds
         ``(item_id, similarity)`` for every row with a positive similarity, in
         row order, and ``mismatched`` counts rows skipped for having another
         dimensionality than the query.
@@ -625,28 +625,36 @@ class HybridRetriever:
     def _score_rows_numpy(
         rows: list, query_vec: list[float]
     ) -> tuple[list[tuple[str, float]], int]:
-        """Cosine-score ``rows`` against ``query_vec`` as one matrix-vector product.
+        """Cosine-score ``rows`` against ``query_vec`` as matrix-vector products.
 
-        Same admission rules and return shape as :meth:`_score_rows_python`. The
-        struct-packed blobs of the query's byte width — the whole corpus, in
-        practice — are joined and viewed as one float32 matrix in a single
-        ``np.frombuffer`` (no per-row ``struct.unpack`` → ``list`` round trip);
-        anything else — a legacy JSON blob, an odd length — goes through
-        :func:`_bytes_to_floats` exactly as the Python path does, so both paths
-        admit and reject the same rows, and each decoded row is written back at
-        its own position so row order (the tie-break of the final sort) is the
-        Python path's. Arithmetic is float64 like the Python path (the stored
-        dtype is float32, but the reference sums in Python floats), which keeps
-        the two rankings aligned rather than merely close.
+        Same admission rules and return shape as :meth:`_score_rows_python`. A
+        struct-packed blob of the query's byte width — the whole corpus, in
+        practice — is viewed in place as float32 with ``np.frombuffer`` (no
+        per-row ``struct.unpack`` → ``list`` round trip); anything else — a
+        legacy JSON blob, an odd length — goes through :func:`_bytes_to_floats`
+        exactly as the Python path does, so both paths admit and reject the same
+        rows, and every similarity is written back at its row's own position so
+        row order (the tie-break of the final sort) is the Python path's.
+        Arithmetic is float64 like the Python path (``einsum`` accumulates in
+        float64 straight from the float32 view; the reference sums float32
+        values in Python floats), which keeps the two rankings aligned rather
+        than merely close.
+
+        Rows are decoded and scored :data:`_SCORE_BATCH_ROWS` at a time, in row
+        order: a batch's decoded JSON lists and its contiguous float32 copy are
+        released before the next batch is read, so working memory is a few MB
+        however large the library is and whatever mix of encodings it holds; the
+        blobs themselves are already resident in ``rows``.
         """
         q_len = len(query_vec)
         q_bytes = q_len * 4
-        survivors: list[str] = []
-        packed: list[bytes] = []
-        packed_at: list[int] = []
-        decoded: list[list[float]] = []
-        decoded_at: list[int] = []
+        q = np.asarray(query_vec, dtype=np.float64)
+        q_norm = math.sqrt(float(np.einsum("i,i->", q, q)))
+        scored: list[tuple[str, float]] = []
         mismatched = 0
+        ids: list[str] = []
+        # A packed blob (bytes) or an already decoded vector (list), per row.
+        vectors: list[bytes | list[float]] = []
         for row in rows:
             blob = row["embedding"]
             if (
@@ -655,45 +663,24 @@ class HybridRetriever:
                 and len(blob) >= _BINARY_BLOB_MIN_BYTES
                 and not _looks_like_json(blob)
             ):
-                packed.append(blob)
-                packed_at.append(len(survivors))
-                survivors.append(row["id"])
-                continue
-            item_vec = _bytes_to_floats(blob)
-            if not item_vec:
-                continue
-            if len(item_vec) != q_len:
-                mismatched += 1
-                continue
-            decoded.append(item_vec)
-            decoded_at.append(len(survivors))
-            survivors.append(row["id"])
-        if not survivors:
-            return [], mismatched
-        q = np.asarray(query_vec, dtype=np.float64)
-        q_norm = math.sqrt(float(np.einsum("i,i->", q, q)))
-        if q_norm == 0.0:
-            return [], mismatched
-        mat = np.empty((len(survivors), q_len), dtype=np.float64)
-        if packed:
-            mat[packed_at] = np.frombuffer(b"".join(packed), dtype=np.float32).reshape(
-                len(packed), q_len
-            )
-        if decoded:
-            mat[decoded_at] = np.asarray(decoded, dtype=np.float64)
-        # einsum, not ``mat @ q``: the matvec is a few hundred rows by ~1k dims,
-        # and BLAS hands one that size to its thread pool, whose wake-up on a busy
-        # host costs more than the arithmetic (measured 20 ms vs 0.1 ms for
-        # 500x1024). einsum stays single-threaded and deterministic here.
-        norms = np.sqrt(np.einsum("ij,ij->i", mat, mat))
-        dots = np.einsum("ij,j->i", mat, q)
-        # A zero-norm row is 0.0 by contract (never divides by zero), and 0.0 is
-        # below the positive-similarity admission bar, so it drops out here too.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            sims = np.where(norms > 0.0, dots / (norms * q_norm), 0.0)
-        return [
-            (item_id, float(sim)) for item_id, sim in zip(survivors, sims) if sim > 0.0
-        ], mismatched
+                ids.append(row["id"])
+                vectors.append(blob)
+            else:
+                item_vec = _bytes_to_floats(blob)
+                if not item_vec:
+                    continue
+                if len(item_vec) != q_len:
+                    mismatched += 1
+                    continue
+                ids.append(row["id"])
+                vectors.append(item_vec)
+            if len(ids) >= _SCORE_BATCH_ROWS:
+                if q_norm > 0.0:
+                    scored.extend(_score_batch(ids, vectors, q, q_norm, q_len))
+                ids, vectors = [], []
+        if ids and q_norm > 0.0:
+            scored.extend(_score_batch(ids, vectors, q, q_norm, q_len))
+        return scored, mismatched
 
     @staticmethod
     def _rrf_fuse(*ranked_lists, k: int = 60, weights=None) -> list[tuple[str, float]]:
@@ -744,30 +731,99 @@ def _l2_norm(vec: list[float]) -> float:
     return math.sqrt(sum(x * x for x in vec))
 
 
+def _score_batch(
+    ids: list[str],
+    vectors: list[bytes | list[float]],
+    q: Any,
+    q_norm: float,
+    q_len: int,
+) -> list[tuple[str, float]]:
+    """``(item_id, similarity)`` for the positively scoring rows of one batch, in order.
+
+    Packed blobs are joined into one contiguous float32 view and decoded lists
+    into one float64 array; each group is scored in a single :func:`_cosine_rows`
+    call and the results land back at the rows' own positions.
+    """
+    sims = np.zeros(len(vectors), dtype=np.float64)
+    packed_at = [i for i, v in enumerate(vectors) if isinstance(v, bytes)]
+    if packed_at:
+        packed = np.frombuffer(
+            b"".join([vectors[i] for i in packed_at]),  # type: ignore[misc]
+            dtype=np.float32,
+        ).reshape(len(packed_at), q_len)
+        sims[packed_at] = _cosine_rows(packed, q, q_norm)
+    decoded_at = [i for i, v in enumerate(vectors) if not isinstance(v, bytes)]
+    if decoded_at:
+        decoded = np.asarray([vectors[i] for i in decoded_at], dtype=np.float64)
+        sims[decoded_at] = _cosine_rows(decoded, q, q_norm)
+    return [(item_id, float(sim)) for item_id, sim in zip(ids, sims) if sim > 0.0]
+
+
+def _cosine_rows(mat: Any, q: Any, q_norm: float) -> Any:
+    """Cosine of every row of ``mat`` against ``q`` (numpy path), accumulated in float64.
+
+    ``einsum``, not ``mat @ q``: the matvec is a few hundred rows by ~1k dims,
+    and BLAS hands one that size to its thread pool, whose wake-up on a busy
+    host costs more than the arithmetic (measured 20 ms vs 0.1 ms for
+    500x1024). einsum stays single-threaded, and with ``dtype=float64`` it
+    accumulates a float32 ``mat`` in double without materialising a float64
+    copy of it. A zero-norm row is 0.0 by contract (never divides by zero), and
+    0.0 is below the positive-similarity admission bar, so it never ranks.
+    """
+    norms = np.sqrt(np.einsum("ij,ij->i", mat, mat, dtype=np.float64))
+    dots = np.einsum("ij,j->i", mat, q, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(norms > 0.0, dots / (norms * q_norm), 0.0)
+
+
 # A struct-packed blob must be at least this long to be admitted as binary;
 # shorter byte strings are too easily something else (the guard predates the
 # JSON sniff below and is kept as-is so admission does not widen).
 _BINARY_BLOB_MIN_BYTES = 16
 
-# The bytes JSON allows before a value: the four whitespace characters of RFC
-# 8259. A JSON-encoded embedding is a list, so after skipping these the first
-# byte of a legacy blob is ``[``; a struct-packed float32 blob has no such
-# structure and only ever begins with ``[`` by coincidence.
-_JSON_WHITESPACE = b" \t\n\r"
+# Rows per batch in the numpy scorer: 1024 rows x 1024 dims is a 4 MB float32
+# copy, so working memory is bounded by this and not by the size of the library.
+_SCORE_BATCH_ROWS = 1024
+
+# The whitespace JSON allows before a value (RFC 8259), as text.
+_JSON_WHITESPACE = " \t\n\r"
+
+# A JSON-encoded embedding is a list, so in any encoding ``json.loads`` accepts
+# (UTF-8/16/32, with or without a BOM, after optional whitespace) the blob's
+# FIRST byte is one of: ``[`` itself, an ASCII whitespace byte, NUL (the
+# big-endian UTF-16/32 lead byte of an ASCII character), or a BOM lead byte
+# (0xEF for UTF-8, 0xFE/0xFF for UTF-16/32). A struct-packed float32 blob
+# beginning with any other byte cannot be JSON and is dismissed on that byte
+# alone; only the rare one that starts with one of these pays the full sniff.
+_JSON_LEAD_BYTES = frozenset(b"[ \t\n\r\x00\xef\xfe\xff")
 
 
 def _looks_like_json(blob: bytes) -> bool:
     """Whether ``blob`` can possibly be a legacy JSON-encoded embedding list.
 
     A cheap sniff run BEFORE ``json.loads``: a struct-packed float32 blob almost
-    never starts with ``[``, so for the common binary row the failed parse (and
-    the exception it raises) is skipped entirely. Sniffing is admission-only —
-    a blob that passes still has to parse, and one that happens to start with
-    ``[`` yet fails to parse falls through to the binary decoder exactly as it
-    always did, so the decoded value is the same as before for every input.
+    never starts like a JSON list, so for the common binary row the failed parse
+    (and the exception it raises) is skipped entirely. The check mirrors
+    ``json.loads`` own admission — the encoding it would pick
+    (:func:`json.detect_encoding`), the whitespace it would skip — so every blob
+    ``json.loads`` decodes to a list passes here. Sniffing is admission-only: a
+    blob that passes still has to parse, and one that fails to parse falls
+    through to the binary decoder exactly as it always did, so the decoded value
+    is the same as before for every input.
+
+    The full sniff decodes the whole blob rather than a fixed prefix: JSON puts no
+    bound on leading whitespace, so any cutoff would misroute a valid list padded
+    past it. Only a blob whose first byte JSON could start with reaches this
+    decode — a few percent of packed rows — and a lenient decode of a 4 KB blob
+    is still far cheaper than the failed parse it replaces.
     """
-    first = blob.lstrip(_JSON_WHITESPACE)[:1]
-    return first == b"["
+    if not blob or blob[0] not in _JSON_LEAD_BYTES:
+        return False
+    try:
+        text = blob.decode(json.detect_encoding(blob), errors="ignore")
+    except LookupError:
+        return False
+    return text.lstrip(_JSON_WHITESPACE)[:1] == "["
 
 
 def _bytes_to_floats(blob: bytes | str | None) -> list[float]:

@@ -1,18 +1,19 @@
 """The Knowledge Library vector leg: one query norm, a sniffed blob, two equal paths.
 
-``HybridRetriever._vector_search`` used to score every candidate row in a Python
-loop that recomputed the query's own norm per row, paid a failed ``json.loads``
-(plus the exception) on every struct-packed blob before falling back to
-``struct.unpack``, and summed three 1024-element generators per row -- while
-numpy, a declared dependency the memory layer already guards behind
-``_HAS_NUMPY``, went unused in ``knowledge/``. These tests pin the three
-mechanics of the fix and the one property that makes it safe: the numpy path and
-the pure-Python fallback rank identically on a corpus that mixes both stored
+``HybridRetriever._vector_search`` scores its candidate rows either as one numpy
+matrix-vector product (when numpy imports, behind ``_HAS_NUMPY`` like the memory
+layer) or as a per-row stdlib loop. On both paths the query's own norm is derived
+once per search rather than once per row, and ``_bytes_to_floats`` sniffs a blob's
+first significant byte before offering it to ``json.loads``, so a struct-packed
+blob does not pay a failed parse and its exception on every row. These tests pin
+those three mechanics and the one property that makes the numpy path safe: it
+ranks identically to the pure-Python fallback on a corpus that mixes both stored
 encodings with the rows every search must skip.
 """
 
 from __future__ import annotations
 
+import codecs
 import json
 import random
 import struct
@@ -160,8 +161,8 @@ class TestRankingParity:
 
 
 class TestQueryNormHoisted:
-    """The query norm is derived once per search, not once per row (#3109's defect,
-    mirrored on the knowledge path)."""
+    """The query norm is derived once per search, not once per row -- the same
+    hoisting the lesson scorer in ``vector_memory`` does."""
 
     def test_fallback_computes_query_norm_once(self, store, monkeypatch):
         rng = random.Random(4)
@@ -238,3 +239,109 @@ class TestBlobSniff:
         assert _bytes_to_floats(json.dumps({"k": 1}).encode()) == []  # JSON, not a list
         assert _bytes_to_floats(b"\x00" * 15) == []  # packed but below the 16-byte floor
         assert _bytes_to_floats(b"\x00" * 18) == []  # packed but not a multiple of 4
+
+    def test_every_json_encoding_json_loads_accepts_is_sniffed(self, json_loads_spy):
+        """The sniff mirrors ``json.loads`` own admission: a JSON list in any
+        encoding it decodes (UTF-8 with a BOM, UTF-16/32 either endianness, with
+        or without a BOM, after leading whitespace) still parses as JSON and never
+        reaches the binary decoder."""
+        vec = [1.0, 2.0, 3.0, 4.0, 5.0]
+        text = json.dumps(vec)
+        blobs = [
+            codecs.BOM_UTF8 + text.encode(),
+            text.encode("utf-16"),
+            text.encode("utf-16-le"),
+            text.encode("utf-16-be"),
+            text.encode("utf-32"),
+            text.encode("utf-32-le"),
+            text.encode("utf-32-be"),
+            (" \n" + text).encode("utf-16-le"),
+            (" \n" + text).encode("utf-32-be"),
+            # JSON puts no bound on leading whitespace: well past any prefix a
+            # sniff might read, in the narrowest and the widest encoding.
+            (" " * 300 + text).encode(),
+            ("\n" * 200 + text).encode("utf-32-be"),
+        ]
+        for blob in blobs:
+            assert json.loads(blob) == vec, "fixture must be something json accepts"
+            assert _looks_like_json(blob), blob[:8]
+            assert _bytes_to_floats(blob) == vec, blob[:8]
+        assert len(json_loads_spy) == 2 * len(blobs)
+
+    def test_packed_blob_with_a_json_lead_byte_still_decodes_as_binary(self, json_loads_spy):
+        """A float32 blob whose first byte is NUL or a BOM byte takes the full sniff,
+        is not a JSON list, and decodes as binary without a parse attempt."""
+        for lead in (0x00, 0xEF, 0xFE, 0xFF, 0x20):
+            raw = bytearray(floats_to_bytes([float(i) + 1.5 for i in range(_DIM)]))
+            raw[0] = lead
+            blob = bytes(raw)
+            assert _bytes_to_floats(blob) == list(struct.unpack(f"{_DIM}f", blob)), hex(lead)
+        assert json_loads_spy == []
+
+
+class TestBatching:
+    """The numpy scorer works in bounded batches and the batch seam is invisible."""
+
+    def test_batched_scoring_matches_python_path_and_keeps_order(self, store, monkeypatch):
+        np = pytest.importorskip("numpy")
+        rng = random.Random(5)
+        _mixed_corpus(store, rng)
+        for i in range(9):
+            store.add_item(f"extra {i}", "c", "doc", embedding=floats_to_bytes(_vec(rng)))
+        query_vec = _vec(rng)
+        rows = store.db.execute("SELECT id, embedding FROM items").fetchall()
+        python_scored, _ = HybridRetriever._score_rows_python(rows, query_vec)
+
+        calls: list[int] = []
+        real_frombuffer = np.frombuffer
+
+        def spy(buf, *a, **kw):
+            calls.append(len(buf))
+            return real_frombuffer(buf, *a, **kw)
+
+        monkeypatch.setattr(retrieval.np, "frombuffer", spy)
+        monkeypatch.setattr(retrieval, "_SCORE_BATCH_ROWS", 4)
+        numpy_scored, _ = HybridRetriever._score_rows_numpy(rows, query_vec)
+
+        assert [i for i, _ in numpy_scored] == [i for i, _ in python_scored]
+        for (_, a), (_, b) in zip(numpy_scored, python_scored):
+            assert a == pytest.approx(b, rel=1e-12, abs=1e-12)
+        # 19 admitted rows in batches of 4 -> 5 batches, each with at most 4
+        # packed rows in its frombuffer.
+        assert len(calls) == 5
+        assert all(n <= 4 * _DIM * 4 for n in calls)
+
+    def test_json_rows_are_decoded_and_scored_batch_by_batch(self, store, monkeypatch):
+        """A legacy JSON corpus does not accumulate every decoded list before any
+        scoring happens: decoding and scoring interleave at the batch boundary, so
+        working memory is bounded by the batch and not by the library."""
+        pytest.importorskip("numpy")
+        rng = random.Random(6)
+        for i in range(10):
+            store.add_item(f"json {i}", "c", "doc", embedding=json.dumps(_vec(rng)).encode())
+        query_vec = _vec(rng)
+        rows = store.db.execute("SELECT id, embedding FROM items").fetchall()
+
+        events: list[str] = []
+        real_decode = retrieval._bytes_to_floats
+        real_score = retrieval._score_batch
+
+        def decode_spy(blob):
+            events.append("decode")
+            return real_decode(blob)
+
+        def score_spy(ids, vectors, *a, **kw):
+            events.append(f"score:{len(vectors)}")
+            return real_score(ids, vectors, *a, **kw)
+
+        monkeypatch.setattr(retrieval, "_bytes_to_floats", decode_spy)
+        monkeypatch.setattr(retrieval, "_score_batch", score_spy)
+        monkeypatch.setattr(retrieval, "_SCORE_BATCH_ROWS", 4)
+        scored, _ = HybridRetriever._score_rows_numpy(rows, query_vec)
+        python_scored, _ = HybridRetriever._score_rows_python(rows, query_vec)
+
+        assert [i for i, _ in scored] == [i for i, _ in python_scored]
+        # 10 rows, batches of 4: the first batch is scored after its 4 decodes and
+        # BEFORE the fifth row is decoded; no batch holds more than 4 rows.
+        assert events[:5] == ["decode"] * 4 + ["score:4"]
+        assert [e for e in events if e.startswith("score")] == ["score:4", "score:4", "score:2"]
