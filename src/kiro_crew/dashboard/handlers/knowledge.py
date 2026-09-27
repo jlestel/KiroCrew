@@ -24,7 +24,10 @@ from kiro_crew.artifacts import get_default_store
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
 from kiro_crew.dashboard import part_stream
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.handlers._shared import (
+    read_bounded_json,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.handlers.files import (
     _ZIP_CONTAINER_EXTS,
     _content_matches_ext,
@@ -178,6 +181,22 @@ def _validate_knowledge_bundle(body: object) -> str | None:
         if not isinstance(parsed, list) or not all(isinstance(a, str) for a in parsed):
             return "'entities.aliases' must be a JSON array of strings"
     return None
+
+
+async def _require_knowledge_owner(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate for the mutating knowledge routes, or ``None`` to proceed.
+
+    Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    the class ``is_owner_dashboard_request`` can rule on at all. The other two
+    caller classes keep the control that already governs them -- an
+    ``X-Internal-Secret`` loopback process (the ``knowledge_add_document`` MCP
+    tool) reaches here with ``app`` ABSENT, and an app token (the Notes app
+    declares ``/api/knowledge``) is confined to its manifest's declared paths
+    by ``_enforce_app_scope``.
+    """
+    if request.get("app") != "":
+        return None
+    return await require_owner_dashboard_request(request, operation)
 
 
 def _store(request: web.Request):
@@ -635,6 +654,9 @@ async def get_item(request: web.Request) -> web.Response:
 
 async def update_item(request: web.Request) -> web.Response:
     """PATCH /api/knowledge/items/{id} -- update fields."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.item.update")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     item_id = request.match_info["id"]
     if not await asyncio.to_thread(store.get_item, item_id):
@@ -655,6 +677,9 @@ async def update_item(request: web.Request) -> web.Response:
 
 async def delete_item(request: web.Request) -> web.Response:
     """DELETE /api/knowledge/items/{id}."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.item.delete")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     item_id = request.match_info["id"]
     item = await asyncio.to_thread(store.get_item, item_id)
@@ -1215,6 +1240,9 @@ async def pick_folder(request: web.Request) -> web.Response:
     Offered only on a local macOS dashboard (see _folder_picker_available). The
     returned path is not trusted -- it is fed back into the folder path field and
     re-validated by add_source like any typed path."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.pick_folder")
+    if owner_denied is not None:
+        return owner_denied
     if not _folder_picker_available(request):
         return web.json_response(
             {"error": "Folder picker is not available on this system"},
@@ -1229,6 +1257,9 @@ async def pick_folder(request: web.Request) -> web.Response:
 
 async def add_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources -- add a remote source."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.add")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
@@ -1545,6 +1576,9 @@ async def _hand_off_under_gate(  # type: ignore[no-untyped-def]
 
 async def sync_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/sync -- trigger sync for a source."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.sync")
+    if owner_denied is not None:
+        return owner_denied
     pipeline = _pipeline(request)
     if pipeline is None:
         return await _sync_source_body(request)
@@ -1695,6 +1729,9 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
 
 async def delete_source(request: web.Request) -> web.Response:
     """DELETE /api/knowledge/sources/{id} -- remove a source and its items."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.delete")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     row = await asyncio.to_thread(_source_row, store, source_id)
@@ -1718,6 +1755,9 @@ async def rename_source(request: web.Request) -> web.Response:
 
     Only ``name`` is editable; ``uri`` (the source identity) stays immutable.
     """
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.rename")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     if not await asyncio.to_thread(_source_row, store, source_id):
@@ -1833,6 +1873,9 @@ def _track_scan_task(app: web.Application, task: asyncio.Task) -> None:  # type:
 
 async def confirm_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/confirm -- confirm and start scanning."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.confirm")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     outcome, row, props = await asyncio.to_thread(
@@ -1857,6 +1900,9 @@ async def confirm_source(request: web.Request) -> web.Response:
 
 async def pause_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/pause -- pause active scan."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.pause")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     if not await asyncio.to_thread(_pause_source_row, store, source_id):
@@ -1866,6 +1912,9 @@ async def pause_source(request: web.Request) -> web.Response:
 
 async def resume_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/resume -- resume paused scan."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.resume")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     outcome, row, props = await asyncio.to_thread(
@@ -1917,6 +1966,9 @@ async def list_source_files(request: web.Request) -> web.Response:
 
 async def retry_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/retry -- reset file to pending."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.file_retry")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     body, body_err = await read_bounded_json(request, max_bytes=None)
@@ -1937,6 +1989,9 @@ async def retry_file(request: web.Request) -> web.Response:
 
 async def skip_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/skip -- mark file as skipped."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.file_skip")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     body, body_err = await read_bounded_json(request, max_bytes=None)
@@ -1957,6 +2012,9 @@ async def skip_file(request: web.Request) -> web.Response:
 
 async def ingest_text(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/ingest-text -- agent submits fetched text."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.ingest_text")
+    if owner_denied is not None:
+        return owner_denied
     source_id = request.match_info["id"]
     store = _store(request)
     pipeline = _pipeline(request)
@@ -2138,6 +2196,9 @@ def _inspect_zip_archive(path: str) -> str | None:
 
 async def ingest_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/ingest -- multipart file upload."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.ingest")
+    if owner_denied is not None:
+        return owner_denied
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "ingestion pipeline not configured"}, status=503)
@@ -2405,6 +2466,9 @@ async def export_all(request: web.Request) -> web.Response:
 
 async def import_bundle(request: web.Request) -> web.Response:
     """POST /api/knowledge/import -- accept .knowledge JSON bundle."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.import")
+    if owner_denied is not None:
+        return owner_denied
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -2681,6 +2745,9 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     ``GET /api/knowledge/jobs/{id}``. The default (fill-NULL) path stays synchronous
     since it only touches items missing an embedding at cold start.
     """
+    owner_denied = await _require_knowledge_owner(request, "knowledge.embedding.generate")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     embedder = request.app.get("knowledge_embedder")
     if not embedder:
@@ -2840,6 +2907,9 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
     the MCP process because ingestion needs the pipeline (reader, chunker,
     extraction pool, embedder), which only the gateway holds.
     """
+    owner_denied = await _require_knowledge_owner(request, "knowledge.agent_document.add")
+    if owner_denied is not None:
+        return owner_denied
     cfg = KiroCrewConfig.load()
     if not cfg.knowledge.auto_add_documents:
         return web.json_response(
