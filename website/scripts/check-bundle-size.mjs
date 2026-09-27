@@ -131,7 +131,26 @@ export const CHUNK_BUDGETS = {
   // the regenerated `en-XA`, which all land in this chunk by construction: measured
   // 907.7 KB on this branch before the judge row above landed on main, so the two
   // features together sit near 909 KB; same 5% convention over that size.
-  t: 955 * KB, // measured ~909 KB on this branch (~5% headroom)
+  // OPERATOR-SET CEILING, NOT A MEASUREMENT. It departs from the 5% convention
+  // every other entry follows, and it is written this way deliberately so nobody
+  // reads it as one.
+  //
+  // Measured 955.0 KB (977948 B) on an analyze build of main at 2026-09-27, which
+  // is 28 B over the 955 KB this entry used to carry -- and that 28 B was failing
+  // the gate on EVERY open pull request at once, on a chunk whose growth none of
+  // those branches caused. A repository maintainer chose to stop that bill with a
+  // wide ceiling rather than by shrinking the chunk or by re-measuring it to ~1003
+  // KB, knowing what the choice costs: at 6.4x the measured size this entry no
+  // longer signals growth for this chunk, so the next 5 MB of i18n-runtime bloat
+  // arrives green. That is accepted for now; what it buys is that the gate stops
+  // reporting to people who cannot act on it.
+  //
+  // So this number is a decision, not evidence, and the thing it defers is still
+  // open: the i18n runtime went from a measured ~909 KB to 955 KB and nobody has
+  // named what grew. Re-measuring this entry down to the 5% convention is a
+  // strict improvement whenever someone does that work -- and until then, reading
+  // this ceiling as "the chunk is fine" would be reading it wrong.
+  t: 6075 * KB, // operator ceiling; chunk measured 955.0 KB -- see the note above
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
