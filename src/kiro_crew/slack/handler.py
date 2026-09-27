@@ -152,7 +152,6 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SessionManager
-from kiro_crew.session_map import SessionMap
 from kiro_crew.slack.blocks import build_working_blocks, deprecation_warning_block
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.format import (
@@ -808,17 +807,6 @@ def _is_slack_restricted(session_key: str) -> bool:
     return privacy_mode.is_restricted(session_key)
 
 
-def _conv_state_map(sessions: object) -> "SessionMap | None":
-    """Return the SessionManager's canonical SessionMap, or None.
-
-    Thin wrapper over :func:`kiro_crew.messaging.privacy_mode.conv_state_map`,
-    which documents why requiring the real class (rather than any attribute) is
-    load-bearing for a test double.
-    """
-    sm = privacy_mode.conv_state_map(sessions)
-    return sm if isinstance(sm, SessionMap) else None
-
-
 def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
     """Restore persisted temporary/incognito flags into the in-memory caches.
 
@@ -827,21 +815,6 @@ def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
     from the durable ``SessionMap`` entry).
     """
     privacy_mode.hydrate(sessions, session_key)
-
-
-def _strip_incognito_token(text: str) -> tuple[str, bool]:
-    """Remove standalone ``!incognito`` token from *text*."""
-    return privacy_mode.strip_token(text, privacy_mode.MODE_INCOGNITO)
-
-
-def _strip_temporary_token(text: str) -> tuple[str, bool]:
-    """Remove standalone ``!temporary`` token from *text*.
-
-    Returns ``(cleaned_text, found)`` where *found* is True if the token
-    was present.  The cleaned text has the token removed and excess
-    whitespace collapsed.
-    """
-    return privacy_mode.strip_token(text, privacy_mode.MODE_TEMPORARY)
 
 
 async def _apply_privacy_mode(
@@ -886,50 +859,6 @@ async def _apply_privacy_mode(
         sessions=sessions,
         notify=_notify,
         on_applied=_on_applied,
-    )
-
-
-async def _apply_temporary_modifier(
-    session_key: str,
-    user_id: str,
-    channel: str,
-    slack: SlackClientOps,
-    sessions: SessionManager,
-    reply_ts: str,
-    link_thread: bool = True,
-) -> None:
-    """Mark a session as temporary and notify the user (idempotent)."""
-    await _apply_privacy_mode(
-        privacy_mode.MODE_TEMPORARY,
-        session_key,
-        user_id,
-        channel,
-        slack,
-        sessions,
-        reply_ts,
-        link_thread,
-    )
-
-
-async def _apply_incognito_modifier(
-    session_key: str,
-    user_id: str,
-    channel: str,
-    slack: SlackClientOps,
-    sessions: SessionManager,
-    reply_ts: str,
-    link_thread: bool = True,
-) -> None:
-    """Mark a session as incognito and notify the user (idempotent)."""
-    await _apply_privacy_mode(
-        privacy_mode.MODE_INCOGNITO,
-        session_key,
-        user_id,
-        channel,
-        slack,
-        sessions,
-        reply_ts,
-        link_thread,
     )
 
 

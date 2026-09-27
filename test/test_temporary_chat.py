@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -223,20 +223,6 @@ class TestTemporaryCommand:
     # The notice text, audit event, and session-link behaviour of applying the
     # modifier are covered by test_messaging_privacy_mode.py::TestApplyMode
     # (the implementation moved into kiro_crew.messaging.privacy_mode).
-
-    @pytest.mark.asyncio
-    async def test_temporary_modifier_idempotent(self):
-        from kiro_crew.slack.handler import _apply_temporary_modifier, _mark_temporary
-
-        _mark_temporary("sk2")
-
-        slack = AsyncMock()
-        sessions = MagicMock()
-
-        await _apply_temporary_modifier("sk2", "U1", "C123", slack, sessions, "ts2")
-
-        # Idempotent — no message posted on second call
-        slack.post_message.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

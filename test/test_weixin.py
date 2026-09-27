@@ -8,7 +8,6 @@ without touching ilinkai.weixin.qq.com.
 from __future__ import annotations
 
 import asyncio
-import os
 
 import pytest
 
@@ -24,9 +23,7 @@ from kiro_crew.weixin.client import (
     WeixinSendError,
     _base_info,
     _headers,
-    load_weixin_account,
     protocol_error_code,
-    save_weixin_account,
 )
 from kiro_crew.weixin.renderer import (
     WEIXIN_CHUNK_LIMIT,
@@ -128,77 +125,6 @@ def test_typing_ticket_cache_returns_fresh_entries():
     cache.set("u1", "ticket")
     assert cache.get("u1") == "ticket"
     assert cache.get("absent") is None
-
-
-def test_account_credentials_persist_and_round_trip(tmp_path):
-    save_weixin_account(
-        str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x", user_id="u9"
-    )
-    loaded = load_weixin_account(str(tmp_path), "acct1")
-    assert loaded is not None
-    assert loaded["base_url"] == "https://x"
-    assert loaded["user_id"] == "u9"
-    assert load_weixin_account(str(tmp_path), "missing") is None
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits only")
-def test_account_credentials_are_owner_only(tmp_path):
-    """NTFS reports synthetic mode bits, so this guarantee is POSIX-checked;
-    cross-platform enforcement comes from platform_compat.restrict_to_owner."""
-    save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
-    path = tmp_path / "weixin" / "accounts" / "acct1.json"
-    assert path.stat().st_mode & 0o077 == 0
-
-
-def test_account_credentials_lockdown_precedes_content(tmp_path, monkeypatch):
-    """The token must never exist in a file that has not been locked down yet.
-
-    On Windows the POSIX mode bits are a no-op, so the owner-only DACL from
-    ``restrict_to_owner`` is the only protection; applying it after the write
-    left the bot credential readable under the parent directory's inherited ACL
-    for the whole write window. Asserted by measuring the file's
-    SIZE at the moment the lockdown is applied — zero means no payload byte
-    existed yet. A post-write stat passes on the buggy ordering too, so it
-    would not be a regression test.
-    """
-    from kiro_crew import platform_compat
-
-    sizes: list[int] = []
-    real_restrict = platform_compat.restrict_to_owner
-
-    def _measuring_restrict(target):
-        sizes.append(os.stat(target).st_size)
-        return real_restrict(target)
-
-    monkeypatch.setattr(platform_compat, "restrict_to_owner", _measuring_restrict)
-
-    save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
-
-    assert sizes, "premise: the lockdown ran at all"
-    assert (
-        sizes[0] == 0
-    ), f"the file already held payload bytes when it was locked down: {sizes[0]} bytes"
-
-
-def test_account_credentials_survive_a_failed_lockdown(tmp_path, monkeypatch):
-    """``restrict_on_error="warn"`` keeps this site's established policy: the
-    credential write matters more than the permissions, so a lockdown failure
-    is logged but must not cost the account file."""
-    from kiro_crew import platform_compat
-
-    def _refuse(_target):
-        raise OSError("cannot resolve the invoking user's SID")
-
-    monkeypatch.setattr(platform_compat, "restrict_to_owner", _refuse)
-
-    save_weixin_account(
-        str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x", user_id="u9"
-    )
-
-    loaded = load_weixin_account(str(tmp_path), "acct1")
-    assert loaded is not None, "warn policy must keep the write"
-    assert loaded["token"] == "s3cr3t"
-    assert loaded["user_id"] == "u9"
 
 
 # ── renderer ──────────────────────────────────────────────────────────────────

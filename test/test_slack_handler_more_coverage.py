@@ -275,19 +275,6 @@ class TestAddPhaseReaction:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# privacy modifiers
-# ──────────────────────────────────────────────────────────────────────
-class TestIncognitoModifierIdempotence:
-    @pytest.mark.asyncio
-    async def test_second_apply_is_a_no_op(self):
-        """``!incognito`` twice in one thread must not re-notify the user."""
-        h._mark_incognito("slack:t1")
-        slack = MockSlackClient()
-        await h._apply_incognito_modifier("slack:t1", "U1", "C1", slack, FakeSessions(), "t1")
-        assert slack.actions == []
-
-
-# ──────────────────────────────────────────────────────────────────────
 # set_orch_cfg — voice_reply provider validation
 # ──────────────────────────────────────────────────────────────────────
 class _Cfg:
