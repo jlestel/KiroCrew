@@ -664,6 +664,129 @@ async def test_persistence_rechecked_inside_skill_publication_hold(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_consolidate_refuses_a_channel_thread_whose_map_entry_was_pruned(
+    tmp_path, monkeypatch
+):
+    """The transcript header is the record a memory reader consults.
+
+    ``privacy_mode.apply_mode`` stamps ``memory_mode`` into the header, the record
+    ``_consolidate`` refuses on, so a channel thread's mode survives the pruning
+    of its session-map entry. Driven the way production runs it: the real
+    modifier path over a real ``SessionMap``, then a consolidator that holds NO
+    session map at all (a header-only reader), with the process-local trackers
+    emptied (the restart), through the session-end hook's entry point.
+    """
+    from types import SimpleNamespace
+
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.messaging import privacy_mode
+    from kiro_crew.session_map import SessionMap
+
+    monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", tmp_path / "kiro")
+    live_key = "telegram:kirocrew:direct:4242"
+    log = _seed_default_log(live_key)  # three turns before the modifier
+    sm = SessionMap()
+    sessions = SimpleNamespace(_session_map=sm, channel_key_for_stem=sm.channel_key_for_stem)
+    privacy_mode.reset()
+    try:
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            live_key,
+            source="telegram",
+            sessions=sessions,
+        )
+        sm.flush()
+        assert log.get_metadata(live_key).get("memory_mode") == "incognito", "premise: stamped"
+        privacy_mode.reset()  # the fresh gateway's trackers start empty
+        c = _make_consolidator(log, sessions=None)  # no map: the header must answer
+        c._call_llm = AsyncMock(return_value={"history_entry": "x"})
+        c.consolidate_session(live_key)
+        tasks = list(c._tasks)
+        assert len(tasks) == 1, "premise: the session-end hook scheduled one pass"
+        result = await asyncio.wait_for(tasks[0], 10)
+    finally:
+        privacy_mode.reset()
+
+    assert (
+        c._call_llm.await_count == 0
+    ), "a channel thread marked incognito was consolidated without its session map"
+    assert result is _CONSOLIDATION_REFUSED
+    assert log.unconsolidated_count(live_key) == 3
+    assert log.get_metadata(live_key).get("last_consolidated", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_privacy_flag_is_kept_by_prune_and_stamped_by_the_startup_sweep(
+    tmp_path, monkeypatch
+):
+    """A thread flagged before the header carried the mode: the map entry is all it has.
+
+    Pre-upgrade installs hold private threads whose flag was written straight to
+    the session map, with no header stamp, and ``apply_mode`` returns early for a
+    mode already marked, so nothing re-stamps them. Two facts pinned in one
+    lifecycle: the startup ``prune()`` keeps such an entry (clearing only its
+    dead ``sid``) and never reads a transcript for it; and the startup path's
+    off-loop step then copies the mode into the existing transcript's header
+    while the row STAYS (it is what the channel gate hydrates from), after which
+    the consolidator -- a header reader, holding no map -- refuses the thread.
+    """
+    import threading
+
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.messaging import privacy_mode
+    from kiro_crew.session_map import SessionMap
+
+    monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", tmp_path / "kiro")
+    live_key = "telegram:kirocrew:direct:4242"
+    log = _seed_default_log(live_key)
+    assert "memory_mode" not in log.get_metadata(live_key), "premise: legacy header, no mode"
+    sm = SessionMap()
+    sm.set(live_key, "sid-reclaimed-by-kiro-cli")  # the provider session, since reclaimed
+    sm.set_flag(live_key, "incognito", True)  # the legacy flag: map only, no header stamp
+    sm.flush()
+    privacy_mode.reset()
+    loop_thread = threading.current_thread()
+    header_reads: list[threading.Thread] = []
+    real_get_metadata = ConversationLog.get_metadata
+
+    def _recording_get_metadata(self, key):
+        header_reads.append(threading.current_thread())
+        return real_get_metadata(self, key)
+
+    monkeypatch.setattr(ConversationLog, "get_metadata", _recording_get_metadata)
+    try:
+        # The restart: startup prunes stale entries on the loop -- no transcript read.
+        pruned = sm.prune()
+        sm.flush()
+        assert pruned == 0
+        assert sm.get_flag(live_key, "incognito") is True
+        assert header_reads == [], "prune read a transcript header on the loop"
+
+        # The startup path's off-loop step: the mode moves into the header, the
+        # row stays, and neither happened on the loop thread.
+        assert await sm.stamp_privacy_headers() == 1
+        assert header_reads, "premise: the header was probed"
+        assert [t for t in header_reads if t is loop_thread] == []
+        assert sm.get_flag(live_key, "incognito") is True
+        assert real_get_metadata(log, live_key).get("memory_mode") == "incognito"
+        assert log.unconsolidated_count(live_key) == 3
+
+        # From here the header answers: a consolidator with no map refuses.
+        privacy_mode.reset()
+        header_only = _make_consolidator(log, sessions=None)
+        header_only._call_llm = AsyncMock(return_value={"history_entry": "x"})
+        assert (
+            await asyncio.wait_for(header_only._consolidate(live_key), 10) is _CONSOLIDATION_REFUSED
+        )
+        header_only._call_llm.assert_not_awaited()
+    finally:
+        privacy_mode.reset()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("version", "seed_source", "assistant_value"),
     (
@@ -771,6 +894,21 @@ def _seed_log(tmp_path, key: str = KEY, count: int = 3) -> ConversationLog:
     log.init()
     # These tests run on the event loop; the mutations under test are the
     # production ones (offloaded inside _consolidate), not this fixture setup.
+    with history_mod.allow_on_loop_persist():
+        for i in range(count):
+            log.append(key, "user", f"m{i}")
+    return log
+
+
+def _seed_default_log(key: str, count: int = 3) -> ConversationLog:
+    """Like :func:`_seed_log`, in the DEFAULT sessions directory.
+
+    For a test that drives ``privacy_mode.apply_mode``: its header stamp goes
+    through a default ``ConversationLog``, so the transcript under test has to
+    live where that instance writes (the conftest pins the directory per test).
+    """
+    log = ConversationLog()
+    log.init()
     with history_mod.allow_on_loop_persist():
         for i in range(count):
             log.append(key, "user", f"m{i}")

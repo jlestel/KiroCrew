@@ -103,7 +103,12 @@ header, Slack (`!incognito` / `!temporary` prefix), or Telegram (`/incognito` /
 `/temporary`). Telegram spells them as commands because it has a command grammar;
 the modes, the guarantees and the durability are the same on both channels, and
 both accept a question after the modifier to mark the conversation and answer in
-one message.
+one message. The gateway keeps one small record per private conversation and
+retains at most 10,000 of them; if that limit is ever reached, a modifier on a
+conversation that is not yet private is refused with a message saying so, and the
+message it was attached to is NOT processed -- it is never run with the mode
+silently dropped, and no existing private conversation is forgotten to make room.
+Conversations already private keep their mode and can still be tightened.
 
 Every dashboard mode keeps its chat history. An Incognito or Temporary dashboard
 chat is saved to History exactly like a Persistent one, so you can reopen it --
@@ -178,7 +183,42 @@ Kiro Crew automatically consolidates conversations into memory:
 - **Preferences/projects**: every 30 messages per session
 - **Daily history + lessons**: after 3 hours idle per session
 
-No manual action needed — it happens in the background.
+No manual action needed — it happens in the background. The manual trigger
+(Overview → Memory tab → Summarize now, or `POST /api/memory/consolidate`) refuses
+an Incognito or Temporary session with a 403 no matter which session triggers it,
+and the background paths skip those sessions — including a Slack or Telegram
+thread marked `!incognito` / `!temporary`, whose mode is recorded in the thread's
+own transcript header so it holds across restarts — so the mode table above holds
+for every route. The Memory tab's tally reports those refusals as skipped, not
+failed, names the mode when every skipped session shares one ("1 skipped:
+incognito session") and otherwise the category with each mode counted ("2
+private sessions skipped (1 temporary, 1 incognito)"), with a "?" beside the
+skip that says in one line what each mode promises, in the words the Default
+Memory Mode setting uses ("Temporary starts blank and saves no new memory.
+Incognito uses what it knows but saves no new memory."); when nothing failed it disappears after four
+seconds like every other tally, and a clean press says "Summarized N sessions"
+-- the button's own verb, which every message on the tab uses. A failed count means a request genuinely
+failed: it is shown as an error notice carrying the count, a plain-words line
+of two sentences -- the server rejected a summarize request and its reply,
+which calls this operation "consolidation", is shown below, the other
+sessions were not affected; press Summarize now to retry (the reply carries any
+timing the server asks for, such as a
+backoff) -- the failed session named the way the sidebar names it -- its
+title, or its key when it has none (the first of them, with the count, when
+several failed) -- as a link that opens that chat, and that request's own reply
+as detail, labelled
+"Server's reply:" -- the server's words, not the tab's (the plain-words line
+says the server calls this operation "consolidation", so the two names are one
+thing); the skip tally,
+when there was one, stands beside the notice in its own success tone, not
+inside it. Both stay until you dismiss the notice -- there is no retry button;
+the button itself is the retry. If the server would not give the list of
+sessions at all (down, or answering with an error), that is reported through
+the same notice -- "Could not list the sessions to summarize", with the
+server's reply -- not as "no sessions to summarize", which is only said when
+the list came back empty. The
+line under the button says what it does: it writes summaries into memory and
+leaves your conversations untouched.
 
 ## Reading Memory Programmatically
 

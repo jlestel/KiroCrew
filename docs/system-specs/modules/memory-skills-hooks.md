@@ -409,7 +409,52 @@ Idle detection: `_last_activity[key]` updated on every `maybe_consolidate()` cal
 
 **Both paths write to the session's captured store.** `_consolidate` captures the
 canonical execution context before its first await and refuses incognito or
-temporary sessions before reading their transcripts. V2 uses that context's exact
+temporary sessions before reading their transcripts. A channel thread's
+`!temporary` / `!incognito` mode lives in two durable records for two readers:
+the session map's flag (`SessionMap.set_flag`, keyed by the live `slack:<ts>`
+key) is what the channel's inbound gate hydrates from per message, and the
+transcript header's `memory_mode` is what every memory reader refuses on -- this
+pass's pre-snapshot check, the derivation seam (`TranscriptWithheld`) and the
+publication hold around each durable write, above. `privacy_mode._commit_mode`
+writes both, the row first and then the header, tighten-only against the
+header's mode read NORMALIZED (`history.transcript_privacy_mode`: the shared
+predicate's `lower()` and set, returning the mode, so a header spelled
+`Temporary` is the stricter mode it is rather than an unknown string an
+incognito stamp would overwrite; upserted, so a thread flagged before its first
+turn gets a metadata-only header that `ConversationLog.append` then keeps), so a
+transcript read never depends on the session map. A privacy flag keeps its map
+entry alive through `SessionMap.prune` and the per-read repair, both of which
+run under the map lock on the event loop and read no transcript, and through
+every other path: no step removes a privacy-flagged row, whatever the header
+says, because the gate hydrates from the map alone and a removed row leaves it
+reading the thread as persistent after the next restart. The header of a row
+flagged before the stamp existed is ensured by `SessionMap.stamp_privacy_headers`,
+which the session pool's `start_pool` runs right after `prune` (awaited in place
+by a blocking start; inside the already-scheduled task by a non-blocking one, so
+a live-config apply or a background-session restart never waits on it): every
+flagged row is named under the map lock (a snapshot of candidates, no file
+touched), then each row is re-read and stamped under that session's
+durable-write lock (`privacy_mode._serialized`, the lock the modifier's commit
+and a reservation's release hold across their own row-and-header sequences): a
+row the re-read finds unflagged is skipped, and a row still flagged has its
+existing transcript's header probed on a worker thread and the mode copied in
+where it is missing or weaker (tighten-only, never creating a transcript).
+Serialized because the snapshot goes stale under live traffic: a reservation
+released after the snapshot restores the header and clears the row, and a stamp
+from the snapshot alone re-wrote the released mode into that header over a row
+that was gone -- which nothing loosens again (the sweep only tightens, from
+rows; a later release of the same mode reads the stale stamp as its own
+`header_before`), so the thread's consolidation stayed refused for good. A flag
+tightened during the probe is re-stamped by the next pass, and a header that
+already records the mode costs no write (`needs_tightening`). The rows are
+capped at `SessionMap.PRIVACY_ROW_CAP` (the trackers' `PRIVACY_LRU_MAX`), held
+by refusing a NEW flag fail-closed -- the modifier tells the user the message
+was not processed and does not run it -- never by evicting a retained row.
+Retiring those rows needs the inbound gate to read the header, a separate
+change. This pre-snapshot refusal is the memory-mode choke point every entry
+point inherits (idle sweep, `maybe_consolidate`, expiry sweep, dashboard
+trigger, CLI); the dashboard trigger adds its own target-side 403 in front of it
+(see the route table below). V2 uses that context's exact
 member store and commits learned records, history and the retry receipt in one
 SQLite transaction. V1 retains `context.store_of_session(log, key)` and its
 Markdown and lesson fallback behavior. See [Memory across surfaces and channels](#memory-across-surfaces-and-channels).
@@ -2326,7 +2371,7 @@ before reading transcript bodies, opening learned memory or billing a model.
 | POST | `/api/memory/migrate` | Migrate markdown → structured memory (gated) |
 | POST | `/api/memory/import` | Import from JSON export (gated) |
 | POST | `/api/memory/promote` | Promote repeated episodic patterns to semantic facts, tombstoning the rows folded in (gated) |
-| POST | `/api/memory/consolidate` | Trigger consolidation for one session (restricted-mode check only) |
+| POST | `/api/memory/consolidate` | Trigger consolidation for one session. Gated on the caller like every write, and additionally on the TARGET: the body's `key` is resolved through `resolve_session_memory_mode` (live slot first, then the persisted execution record and transcript header) and a temporary or incognito target is 403 `restricted_target_session` (the body carries the target's `mode` as a field, which the Memory tab's tally names) before the running claim or any other work. A channel transcript reaches the route as its filename stem (`slack_<ts>`), so the stem is first unfolded to the thread's live key through the session map (`channel_key_for_stem`) and the thread's flag is read there. When that live resolution does not refuse, the route reads the transcript header under `key` exactly as `_consolidate` does (`get_metadata`, the mode normalized), so a stem the map cannot unfold, or an entry the map no longer holds, is refused from its header here instead of answering 200 for a pass the consolidator refuses. A key no record calls restricted proceeds |
 | GET | `/api/memory/context-preview?q=` | Preview injected semantic + episodic context |
 | GET | `/api/memory/observability?q=` | `stats` + `rejections` + `context_preview`, plus `reads` — the read-volume counters (see above). `reads` is resolved LAST, so it INCLUDES the reads this request itself performed; that is what lets a caller issue the same `q` twice and compare the two objects |
 | GET | `/api/memory/recall?q=` | V2 task recall with evidence. Explicit `store` requires the dashboard owner; the authenticated MCP path uses the owning session's canonical execution context and requires memory reads to be allowed. Invalid or unavailable member memory returns an explicit error |

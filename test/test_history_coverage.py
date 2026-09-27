@@ -1724,6 +1724,28 @@ class TestIsIncognitoTranscript:
         assert H.is_incognito_transcript("incognito ") is False
 
 
+class TestTranscriptPrivacyMode:
+    """The predicate's companion returns the MODE under the predicate's own rule."""
+
+    @pytest.mark.parametrize(
+        ("raw", "mode"),
+        [("temporary", "temporary"), ("Temporary", "temporary"), ("INCOGNITO", "incognito")],
+    )
+    def test_a_recognized_header_yields_its_normalized_mode(self, raw: str, mode: str) -> None:
+        assert H.transcript_privacy_mode(raw) == mode
+
+    @pytest.mark.parametrize("raw", [None, "", "persistent", "unknown", 42, "incognito ", False])
+    def test_anything_the_predicate_rejects_yields_no_mode(self, raw: object) -> None:
+        """Including the unstripped ``"incognito "``: the two answer alike by
+        construction, so no reader can see a mode the other does not."""
+        assert H.is_incognito_transcript(raw) is False
+        assert H.transcript_privacy_mode(raw) == ""
+
+    @pytest.mark.parametrize("raw", ["incognito", "Temporary", "x", None])
+    def test_the_two_agree_on_every_input(self, raw: object) -> None:
+        assert bool(H.transcript_privacy_mode(raw)) is H.is_incognito_transcript(raw)
+
+
 class TestSidecarSummariesSurviveMtimePreservingRewrites:
     """Housekeeping that CHANGES the transcript must drop the summary sidecars.
 
