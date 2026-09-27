@@ -1791,6 +1791,234 @@ async def test_creating_writes_wait_for_a_running_sync(fixtures, monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_a_symlink_landing_while_a_writer_waits_on_the_lock_is_refused(
+    fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fence closed: resolve the destination INSIDE the lock, after the walk.
+
+    The destination folder is a REAL directory when the request arrives, so a
+    pre-lock resolution would capture a benign path. Then a sync's merge lands
+    `Projects -> .git/refs/heads` in its place while the create/save parks on the
+    vault write lock. Because the link walk AND the directory resolution both run
+    inside the lock — in the same worker thread as the write, on the tree the
+    merge produced — the write is refused (`folder_is_symlink`) and `.git` is
+    never touched. A resolution captured before the lock would instead have aimed
+    the write at the stale target and passed the in-lock lexical walk.
+    """
+    _mod, remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        heads = root / ".git" / "refs" / "heads"
+        assert heads.is_dir()
+        # `Projects` starts as a REAL directory, so any resolution done before
+        # the lock resolves to a benign in-vault path.
+        (root / "Projects").mkdir()
+        try:
+            (root / ".git-swap-probe").symlink_to(".git", target_is_directory=True)
+            (root / ".git-swap-probe").unlink()
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform/filesystem")
+
+        lock = _mod.vault_write_lock(vault["localPath"])
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_sync = _mod.git_ops.sync
+
+        async def swapping_sync(*args, **kwargs):  # type: ignore[no-untyped-def]
+            # Stand in for a merge: while holding the lock, replace the real
+            # `Projects` directory with a link into `.git`, exactly what a pulled
+            # commit could do to the tree.
+            assert lock.locked(), "sync ran without the vault write lock"
+            (root / "Projects").rmdir()
+            (root / "Projects").symlink_to(
+                Path(".git") / "refs" / "heads", target_is_directory=True
+            )
+            entered.set()
+            await release.wait()
+            return await real_sync(*args, **kwargs)
+
+        monkeypatch.setattr(_mod.git_ops, "sync", swapping_sync)
+        monkeypatch.setattr(syncer_mod.git_ops, "sync", swapping_sync)
+
+        before = sorted(p.name for p in heads.iterdir())
+        syncing = asyncio.ensure_future(client.post("/api/sync"))
+        await asyncio.wait_for(entered.wait(), 5)
+        # The link is now in place; these requests park on the lock the sync holds.
+        creating = asyncio.ensure_future(client.post("/api/note/new", {"folder": "Projects"}))
+        saving = asyncio.ensure_future(
+            client.put("/api/note", {"path": "Projects/Plan.md", "content": "x"})
+        )
+        await asyncio.sleep(0.05)
+        assert not creating.done(), "the create did not wait for the sync"
+        assert not saving.done(), "the save did not wait for the sync"
+        release.set()
+        await syncing
+        create_status, create_body = await creating
+        save_status, save_body = await saving
+        assert create_status == 400, create_body
+        assert create_body["code"] == "folder_is_symlink"
+        assert save_status == 400, save_body
+        assert save_body["code"] == "folder_is_symlink"
+        assert sorted(p.name for p in heads.iterdir()) == before, ".git must be untouched"
+        assert not (heads / "Untitled.md").exists()
+        assert not (heads / "Plan.md").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_folder", [".trash", ".git"])
+@pytest.mark.parametrize("remove_link", [False, True], ids=["link-remains", "link-removed"])
+async def test_duplicate_source_link_swap_under_the_vault_lock(
+    fixtures, monkeypatch: pytest.MonkeyPatch, target_folder: str, remove_link: bool
+) -> None:
+    """A duplicate must neither read a linked folder nor retain its content.
+
+    A merge holds the lock while it installs a link and optionally replaces it
+    with a real folder. Lock-entry notification orders the swap without sleeps.
+    """
+    _mod, remote, _seed = fixtures
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        target = root / target_folder
+        target.mkdir(exist_ok=True)
+        hidden = target / "Private.md"
+        hidden.write_text("local-only content", encoding="utf-8")
+        projects = root / "Projects"
+        projects.mkdir()
+        try:
+            probe = root / "LinkProbe"
+            probe.symlink_to(target_folder, target_is_directory=True)
+            probe.unlink()
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform/filesystem")
+
+        lock = _mod.vault_write_lock(vault["localPath"])
+        waiting = asyncio.Event()
+
+        @asynccontextmanager
+        async def observed_lock(_path):
+            waiting.set()
+            async with lock:
+                yield
+
+        hidden_reads = []
+        real_read = _mod.hooks.safe_read_file_bytes
+
+        def observing_read(path, *args, **kwargs):
+            if Path(path).resolve() == hidden.resolve():
+                hidden_reads.append(path)
+            return real_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(_mod, "vault_write_lock", observed_lock)
+        monkeypatch.setattr(_mod.hooks, "safe_read_file_bytes", observing_read)
+        writing = None
+        try:
+            async with lock:
+                projects.rmdir()
+                projects.symlink_to(target_folder, target_is_directory=True)
+                writing = asyncio.create_task(
+                    client.post("/api/note/duplicate", {"path": "Projects/Private.md"})
+                )
+                await asyncio.wait_for(waiting.wait(), 5)
+                assert not writing.done()
+                if remove_link:
+                    projects.unlink()
+                    projects.mkdir()
+                    (projects / "Private.md").write_text("current note", encoding="utf-8")
+            status, body = await asyncio.wait_for(writing, 5)
+            if remove_link:
+                assert status == 200, body
+                assert (projects / "Private copy.md").read_text(encoding="utf-8") == "current note"
+            else:
+                assert status == 400, body
+                assert body["code"] == "folder_is_symlink"
+            assert hidden_reads == [], "the duplicate read local-only link-target content"
+            assert hidden.read_text(encoding="utf-8") == "local-only content"
+            assert not (target / "Private copy.md").exists()
+        finally:
+            if writing is not None and not writing.done():
+                writing.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await writing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["delete", "move"])
+@pytest.mark.parametrize("alias", [False, True], ids=["note", "alias"])
+async def test_scoped_mutation_rederives_paths_after_a_scope_link_swap(
+    fixtures, monkeypatch: pytest.MonkeyPatch, operation: str, alias: bool
+) -> None:
+    """A scope link replaced during lock contention cannot retain a stale target.
+
+    Both trees contain the requested entry. Only the real scope may be mutated,
+    and an alias must move as a link rather than displacing its target.
+    """
+    _mod, remote, _seed = fixtures
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote, subfolder="Scope")
+        root = Path(vault["localPath"])
+        public = root / "public"
+        public.mkdir()
+        (public / "Kept.md").write_text("tracked target", encoding="utf-8")
+        scope = root / "Scope"
+        try:
+            scope.symlink_to("public", target_is_directory=True)
+            if alias:
+                (public / "Alias.md").symlink_to("Kept.md")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform/filesystem")
+        name = "Alias.md" if alias else "Kept.md"
+        lock = _mod.vault_write_lock(vault["localPath"])
+        waiting = asyncio.Event()
+
+        @asynccontextmanager
+        async def observed_lock(_path):
+            waiting.set()
+            async with lock:
+                yield
+
+        monkeypatch.setattr(_mod, "vault_write_lock", observed_lock)
+        writing = None
+        try:
+            async with lock:
+                writing = asyncio.create_task(
+                    client.delete(f"/api/note?path={name}")
+                    if operation == "delete"
+                    else client.post("/api/note/move", {"from": name, "to": "Moved.md"})
+                )
+                await asyncio.wait_for(waiting.wait(), 5)
+                assert not writing.done()
+                scope.unlink()
+                scope.mkdir()
+                (scope / "Kept.md").write_text("scope note", encoding="utf-8")
+                if alias:
+                    (scope / "Alias.md").symlink_to("Kept.md")
+            status, body = await asyncio.wait_for(writing, 5)
+            assert status == 200, body
+            assert (public / "Kept.md").read_text(encoding="utf-8") == "tracked target"
+            assert (public / name).exists(), "the stale target entry was mutated"
+            assert not (public / "Moved.md").exists()
+            assert not (public / ".trash").exists()
+            assert not (scope / name).exists() and not (scope / name).is_symlink()
+            destination = scope / (body["trashed"] if operation == "delete" else "Moved.md")
+            if alias:
+                assert destination.is_symlink()
+                assert destination.readlink() == Path("Kept.md")
+                assert (public / "Alias.md").is_symlink()
+                assert (scope / "Kept.md").read_text(encoding="utf-8") == "scope note"
+            else:
+                assert destination.read_text(encoding="utf-8") == "scope note"
+        finally:
+            if writing is not None and not writing.done():
+                writing.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await writing
+
+
+@pytest.mark.asyncio
 async def test_every_save_publishes_under_the_vault_lock(fixtures) -> None:
     """A sync's merge landing between a save's last check and its publish would
     be replaced by the publish with a 200: the tokenless path checks nothing on
@@ -2020,6 +2248,45 @@ async def test_duplicate_note_copies_content_beside_the_source(fixtures) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refuse_read", [False, True], ids=["readable", "gate-refused"])
+async def test_duplicate_alias_keeps_cross_folder_read_and_sensitive_gate(
+    fixtures, monkeypatch: pytest.MonkeyPatch, refuse_read: bool
+) -> None:
+    """A note alias may point across folders, but cannot bypass the read gate."""
+    _mod, remote, _seed = fixtures
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        target = root / "One.md"
+        target.write_bytes(b"first\r\nsecond\rthird\n")
+        alias = root / "sub" / "Alias.md"
+        try:
+            alias.symlink_to(Path("..") / "One.md")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform/filesystem")
+        real_read = _mod.hooks.safe_read_file_bytes
+
+        def checked_read(path, *args, **kwargs):
+            if refuse_read and Path(path).resolve() == target.resolve():
+                return None
+            return real_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(_mod.hooks, "safe_read_file_bytes", checked_read)
+        status, body = await client.post("/api/note/duplicate", {"path": "sub/Alias.md"})
+        copy = root / "sub" / "Alias copy.md"
+        if refuse_read:
+            assert status == 404, body
+            assert body["code"] == "no_such_note"
+            assert not copy.exists()
+        else:
+            assert status == 200, body
+            assert body["path"] == "sub/Alias copy.md"
+            assert copy.read_bytes() == b"first\nsecond\nthird\n"
+        assert alias.is_symlink()
+        assert target.read_bytes() == b"first\r\nsecond\rthird\n"
+
+
+@pytest.mark.asyncio
 async def test_duplicate_note_names_are_unique(fixtures) -> None:
     """Two quick duplications must not collide, or overwrite the first copy."""
     _mod, remote, _seed = fixtures
@@ -2038,6 +2305,7 @@ async def test_duplicate_note_requires_an_existing_note(fixtures) -> None:
         await _clone(client, remote)
         status, body = await client.post("/api/note/duplicate", {"path": "Nope.md"})
         assert status == 404, body
+        assert body["code"] == "no_such_note"
         assert (await client.post("/api/note/duplicate", {}))[0] == 400
 
 
