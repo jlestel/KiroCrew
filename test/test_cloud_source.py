@@ -1236,6 +1236,81 @@ class TestSourceChecksumPin:
         assert reads, "found no tarfile read-mode open at all -- the scan is broken"
         assert set(writes) == {"_write_tar_gz"}, f"tarball bytes written outside the pin: {writes}"
 
+    def test_a_failed_archive_attempt_does_not_contaminate_the_fallback_digest(
+        self, monkeypatch, tmp_path
+    ):
+        """A digest must never span two tarball attempts.
+
+        ``_use_git_archive`` SWALLOWS a mid-write ``_refilter_archive`` failure so it
+        can fall through to the tarfile fallback. By then the gzip header has already
+        gone through ``_HashingWriter``, so ONE shared accumulator would fold those
+        discarded bytes into the fallback's checksum -- the pin would no longer
+        describe the file it names, and S3 would refuse a perfectly good tarball.
+
+        Real ``_use_git_archive`` and real ``_refilter_archive`` run here. Only
+        ``git archive`` itself is stubbed, and it is stubbed to SUCCEED with a corrupt
+        archive, which is what makes the re-filter raise after it has begun writing.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+        # A clean tree, so the git-archive attempt is the one that runs first.
+        monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: False)
+        real_run = subprocess.run
+
+        def _git_archive_writes_a_corrupt_tarball(argv, **kw):
+            if argv[:1] == ["git"] and "archive" in argv:
+                Path(argv[argv.index("-o") + 1]).write_bytes(b"not a gzip stream")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _git_archive_writes_a_corrupt_tarball)
+
+        staged = source.build_source_tarball(repo)
+        try:
+            assert staged.sha256 == self._b64_sha256_of(staged.path)
+        finally:
+            staged.path.unlink(missing_ok=True)
+
+    def test_each_tarball_attempt_gets_its_own_digest(self, monkeypatch, tmp_path):
+        """The same property stated as identity, so it holds however an attempt fails.
+
+        ``_use_git_archive`` dirtying the accumulator it was handed and then returning
+        ``None`` is the reachable case, but any future producer that fails part way is
+        the same hazard. What keeps the checksum honest is that no accumulator is ever
+        read for an attempt other than the one that filled it.
+        """
+        (tmp_path / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+        monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: False)
+        handed: list[object] = []
+        real_fallback = source._tar_fallback
+
+        def _dirties_its_digest_then_gives_up(root, *, digest=None):
+            handed.append(digest)
+            if digest is not None:
+                digest.update(b"bytes from an attempt that produced no file")
+            return None
+
+        def _recording_fallback(root, *, digest=None):
+            handed.append(digest)
+            return real_fallback(root, digest=digest)
+
+        monkeypatch.setattr(source, "_use_git_archive", _dirties_its_digest_then_gives_up)
+        monkeypatch.setattr(source, "_tar_fallback", _recording_fallback)
+
+        staged = source.build_source_tarball(tmp_path)
+        try:
+            assert len(handed) == 2, f"expected two attempts, got {len(handed)}: {handed}"
+            # Control: both attempts really were handed an accumulator, so the
+            # identity check below is comparing two digests rather than two Nones.
+            assert handed[0] is not None and handed[1] is not None
+            assert handed[0] is not handed[1], "the fallback reused the failed attempt's digest"
+            assert staged.sha256 == self._b64_sha256_of(staged.path)
+        finally:
+            staged.path.unlink(missing_ok=True)
+
 
 class TestBucketNaming:
     def test_bucket_name(self, monkeypatch):

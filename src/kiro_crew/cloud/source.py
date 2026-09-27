@@ -714,23 +714,40 @@ def build_source_tarball(root: Optional[Path] = None) -> StagedSource:
     a read-back of the finished file, and :func:`upload_source` hands it to S3 as
     ``--checksum-sha256``. That is what makes a substituted tarball a refused
     upload rather than a shipped one: see that function for why the check has to
-    live at S3 rather than in a pre-flight inspection of this path.
+    live at S3 rather than in a pre-flight inspection of this path. It describes
+    exactly ONE attempt's bytes -- each attempt below owns its own accumulator,
+    because an attempt that fails part way has already fed bytes to the one it
+    was given.
     """
     root = root or repo_root()
-    digest = hashlib.sha256()
 
-    def _staged(path: Path) -> StagedSource:
+    def _staged(path: Path, digest: "hashlib._Hash") -> StagedSource:
         return StagedSource(path, base64.b64encode(digest.digest()).decode("ascii"))
 
+    # Every attempt below hashes into its OWN accumulator, and each digest is read
+    # only for the attempt that filled it. One shared accumulator would be wrong,
+    # not merely untidy: a producer that fails PART WAY through has already pushed
+    # bytes through _HashingWriter (see _write_tar_gz), and _use_git_archive
+    # SWALLOWS a mid-write _refilter_archive failure in order to fall through to
+    # the fallback here. Those discarded bytes would then be folded into the
+    # fallback's checksum, which would no longer describe the file it names -- and
+    # S3 would refuse a perfectly good tarball on a --checksum-sha256 mismatch.
     if _tracked_tree_is_dirty(root):
         logger.info("working tree has uncommitted tracked changes; packaging the working tree")
-        return _staged(_tar_fallback(root, digest=digest))
-    archive = _use_git_archive(root, digest=digest)
+        dirty_digest = hashlib.sha256()
+        packaged = _tar_fallback(root, digest=dirty_digest)
+        return _staged(packaged, dirty_digest)
+
+    archive_digest = hashlib.sha256()
+    archive = _use_git_archive(root, digest=archive_digest)
     if archive is not None:
         logger.info("packaged source via git archive: %s", archive)
-        return _staged(archive)
+        return _staged(archive, archive_digest)
+
     logger.info("git archive unavailable; using tracked-file tarfile fallback")
-    return _staged(_tar_fallback(root, digest=digest))
+    fallback_digest = hashlib.sha256()
+    fallback = _tar_fallback(root, digest=fallback_digest)
+    return _staged(fallback, fallback_digest)
 
 
 def _account_id(profile: str, region: str) -> str:
