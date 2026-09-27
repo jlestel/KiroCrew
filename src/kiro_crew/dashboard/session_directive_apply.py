@@ -961,10 +961,11 @@ async def _stop_resolved_loop(
     through ``authorize_and_stop_monitor``, which RETAINS a terminal record for
     later inspection. A legacy loop has no such record: a research-owned slot is
     deactivated with a tombstone reason a Research Lab consumer reads, and every
-    other legacy loop is REMOVED, leaving nothing behind. So a stop of a legacy
-    loop cannot be inspected afterward -- there is no stopped-loop record to
-    read, and ``monitor_inspect`` reports it as not armed. Callers that need a
-    retained terminal record must be watching a structured monitor.
+    other legacy loop is REMOVED, leaving no row behind. So a stop of a legacy
+    loop cannot be inspected afterward -- ``monitor_inspect`` reports it as not
+    armed; only the WARNING stop line in ``gateway.log`` says why it went (the
+    agent's own explanation rides along on the removal path only). Callers that
+    need a retained terminal record must be watching a structured monitor.
     """
     from kiro_crew.autonudge import is_structured_monitor_loop
 
@@ -1001,7 +1002,9 @@ async def _stop_resolved_loop(
     if is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
     else:
-        await svc.remove(loop_id)
+        # The removal leaves no row, so the agent's own reason travels in the WARNING
+        # stop line instead (autonudge_stop_log); without it a self-stop is "removed".
+        await svc.remove(loop_id, stop_reason=AUTONUDGE_STOP_REASON, stop_detail=reason)
     return (
         f"Auto-nudge loop {loop_id} stopped on this session"
         + (f" (reason: {reason})" if reason else "")
