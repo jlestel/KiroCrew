@@ -60,6 +60,7 @@ from kiro_crew.monitoring.decision import (
 # the probe set, and a reason code belongs to the kind that emits it.
 from kiro_crew.monitoring.github_provider_errors import is_unattempted_probe
 from kiro_crew.monitoring.models import (
+    MAX_MONITOR_STOP_REASON_CHARS,
     MONITOR_BUSY_RETRY_SECS,
     MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS,
     MONITOR_STATE_VERSION,
@@ -92,7 +93,12 @@ from kiro_crew.platform import (
     redact_via_context,
 )
 from kiro_crew.probes import targets
-from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    is_sensitive_path,
+    redact_and_truncate,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -439,6 +445,19 @@ def _resolve_beat(beat: "asyncio.Future[None]") -> None:
     """Resolve one reconciler heartbeat future (see ``_reconcile_forever``)."""
     if not beat.done():
         beat.set_result(None)
+
+
+async def _await_future_deferring_cancellation(
+    future: "asyncio.Future[Any]",
+) -> tuple[Any, bool]:
+    """Join *future* and report cancellation only after its result is known."""
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+    return future.result(), cancelled
 
 
 # Persisted source category for a deliberate ``autonudge_stop`` directive.
@@ -1134,6 +1153,30 @@ class NudgeLoop:
     # concurrency framework. Absent in a store written before this field ->
     # decodes to 0, and a first fire simply captures 0.
     config_generation: int = 0
+    # WHY, in the stopping party's own words: the redacted, length-capped
+    # free-text reason a directive stop (``autonudge_stop`` / ``monitor_stop``)
+    # was given, kept beside the machine code in ``stopped_reason`` so the
+    # Crew Members drawer can show a person what the member said when it
+    # stopped itself. Set only on a deactivation that supplies one, cleared
+    # on every revival with ``stopped_reason``. Absent in a store written
+    # before the field decodes to ""; ``_load`` filters unknown keys, so a
+    # downgrade merely loses the text.
+    stopped_detail: str = ""
+
+
+def normalize_stopped_detail(value: Any) -> str:
+    """The one spelling of ``NudgeLoop.stopped_detail`` every boundary applies.
+
+    A non-string is no detail. A string is redacted (credentials,
+    exfiltration URLs) and capped at ``MAX_MONITOR_STOP_REASON_CHARS`` -- the
+    same cap a structured monitor's stop reason carries. Applied on the
+    write (``update``), on ``_load`` (the store is agent-writable) and again
+    on the REST output (``handlers.autonudge._serialize``), so no path can
+    hand a reader a raw persisted value.
+    """
+    if not isinstance(value, str):
+        return ""
+    return redact_and_truncate(value, MAX_MONITOR_STOP_REASON_CHARS)
 
 
 def is_structured_monitor_loop(loop: NudgeLoop) -> bool:
@@ -1466,14 +1509,14 @@ class AutoNudgeService:
         # mutation supervised (no GC, failures logged) even when every awaiting
         # caller was cancelled. Discarded on completion.
         self._inflight_adds: set = set()
-        # Structured replacements whose prior row must keep its protected trust
-        # until the caller completes a second durable authorization step. The
-        # monitor snapshot and the protected trust record are separate files, so
-        # the authorizer either commits this entry after activating the new grant
-        # or rolls the monitor snapshot back to it.
-        self._deferred_monitor_replacements: dict[str, tuple[NudgeLoop | None, NudgeLoop, bool]] = (
-            {}
-        )
+        # Structured replacements whose prior row may need its protected trust
+        # restored if the caller rolls the monitor snapshot back. The tuple
+        # carries provider authorization and strict owner-arm revocation
+        # separately: self-arm trust remains on the historical deferred path,
+        # while owner admission must be gone before the prior row disappears.
+        self._deferred_monitor_replacements: dict[
+            str, tuple[NudgeLoop | None, NudgeLoop, bool, Any]
+        ] = {}
         # Runtime turn-start evidence for the narrow window between a channel
         # accepting a claimed wake and the controller persisting DISPATCHED.
         # One monitor can own only one claim, so the loop id maps directly to
@@ -1697,6 +1740,16 @@ class AutoNudgeService:
                             _cg,
                         )
                         loop_values["config_generation"] = 0
+                # ``stopped_detail`` is display text from an agent-writable
+                # store: anything but a string reads as no detail, and a
+                # string is redacted and capped here exactly as the write
+                # path caps it, so a hand-edited value never reaches a
+                # reader longer or more sensitive than one the gateway
+                # itself would have stored.
+                if "stopped_detail" in loop_values:
+                    loop_values["stopped_detail"] = normalize_stopped_detail(
+                        loop_values["stopped_detail"]
+                    )
                 loop = NudgeLoop(**loop_values)
                 # Rotated on EVERY load: a human may have hand-edited the goal while we
                 # were down, so a pre-restart token must not authorise overwriting it.
@@ -1898,6 +1951,24 @@ class AutoNudgeService:
                     fallback=float(_MIN_IDLE_SECS),
                 )
                 loop.idle_secs = int(idle_num)
+                created_ts, created_repaired = _repair_number(loop.created_ts, lo=0.0, fallback=0.0)
+                loop.created_ts = created_ts
+                last_fire_ts, last_fire_repaired = _repair_number(
+                    loop.last_fire_ts, lo=0.0, fallback=0.0
+                )
+                loop.last_fire_ts = last_fire_ts
+                max_cycles_num, max_cycles_repaired = _repair_number(
+                    loop.max_cycles, lo=0.0, fallback=0.0
+                )
+                loop.max_cycles = int(max_cycles_num)
+                cycle_count_num, cycle_count_repaired = _repair_number(
+                    loop.cycle_count, lo=0.0, fallback=0.0
+                )
+                loop.cycle_count = int(cycle_count_num)
+                runtime_num, runtime_repaired = _repair_number(
+                    loop.max_runtime_secs, lo=0.0, fallback=0.0
+                )
+                loop.max_runtime_secs = int(runtime_num)
                 # ``consecutive_start_failures`` is compared with ``>=`` on every
                 # wake, and this store is agent-writable, so a persisted string or
                 # ``null`` would raise ``TypeError`` inside ``_timer`` and the
@@ -1921,7 +1992,15 @@ class AutoNudgeService:
                     # its atomically-persisted inspection mirror.
                     loop.monitor.next_probe_at = loop.next_due_ts
                     self._store_dirty = True
-                if due_repaired or idle_repaired:
+                if (
+                    due_repaired
+                    or idle_repaired
+                    or created_repaired
+                    or last_fire_repaired
+                    or max_cycles_repaired
+                    or cycle_count_repaired
+                    or runtime_repaired
+                ):
                     self._store_dirty = True
                 notification_stopped_at, notification_time_repaired = _repair_number(
                     loop.terminal_notification_stopped_at,
@@ -2069,6 +2148,32 @@ class AutoNudgeService:
                     if loop.monitor is not None:
                         loop.monitor.next_probe_at = 0.0
                 self._store_dirty = True
+        try:
+            from kiro_crew import autonudge_provider_trust, autonudge_selfarm
+
+            accepted_loop_rows = {
+                loop.id: (
+                    loop.slot_key,
+                    autonudge_selfarm.durable_loop_row_fingerprint(
+                        self._durable_loop_row(loop),
+                        loop.slot_key,
+                    ),
+                )
+                for loop in self._loops.values()
+            }
+            autonudge_selfarm.recover_owner_arm_revocation(accepted_loop_rows)
+            live_monitors = {
+                loop.id: (loop.slot_key, loop.monitor.kind, loop.monitor.target)
+                for loop in self._loops.values()
+                if loop.monitor is not None
+            }
+            autonudge_provider_trust.recover_monitor_owner_credentials(live_monitors)
+        except (OSError, ValueError):
+            logger.error(
+                "AutoNudge: durable monitor trust transaction could not be recovered; "
+                "affected authorization remains fail-closed",
+                exc_info=True,
+            )
         logger.info("AutoNudge: loaded %d loops", len(self._loops))
 
     @classmethod
@@ -2167,22 +2272,32 @@ class AutoNudgeService:
         for candidate in list(self._loops.values()) + list(extra or []):
             if skip and candidate.id in skip:
                 continue
-            row = self._serialize_loop((replace or {}).get(candidate.id, candidate))
-            claimed = self._delivering_claim.get(candidate.id)
-            if claimed is not None:
-                # BESIDE the spent count, never inside it: a restart must be able to tell a
-                # claimed-but-undelivered cycle from a spent one. Disk-only, so no client sees it.
-                row["inflight_cycle"], row["last_fire_ts"] = claimed
-            elif candidate.id in self._unreconciled_claim:
-                # Carried from an earlier run: dropping it here would leave the next restart
-                # with no marker at all, and re-activation would then replay that turn.
-                row["inflight_cycle"] = self._unreconciled_claim[candidate.id]
-            if candidate.id in self._undelivered_claim and "inflight_cycle" in row:
-                # Disk-only, like the claim it qualifies: without it a restart cannot tell a
-                # turn that never went out from one whose delivery is merely unknown.
-                row["inflight_undelivered"] = True
-            rows.append(row)
+            serialized = (replace or {}).get(candidate.id, candidate)
+            rows.append(self._durable_loop_row(candidate, serialized=serialized))
         return rows + list(self._unparsed_rows)
+
+    def _durable_loop_row(
+        self,
+        candidate: NudgeLoop,
+        *,
+        serialized: NudgeLoop | None = None,
+    ) -> dict[str, Any]:
+        """Serialize the exact durable row, including disk-only claim markers."""
+        row = self._serialize_loop(serialized or candidate)
+        claimed = self._delivering_claim.get(candidate.id)
+        if claimed is not None:
+            # BESIDE the spent count, never inside it: a restart must be able to tell a
+            # claimed-but-undelivered cycle from a spent one. Disk-only, so no client sees it.
+            row["inflight_cycle"], row["last_fire_ts"] = claimed
+        elif candidate.id in self._unreconciled_claim:
+            # Carried from an earlier run: dropping it here would leave the next restart
+            # with no marker at all, and re-activation would then replay that turn.
+            row["inflight_cycle"] = self._unreconciled_claim[candidate.id]
+        if candidate.id in self._undelivered_claim and "inflight_cycle" in row:
+            # Disk-only, like the claim it qualifies: without it a restart cannot tell a
+            # turn that never went out from one whose delivery is merely unknown.
+            row["inflight_undelivered"] = True
+        return row
 
     @staticmethod
     def _serialize_loop(loop: NudgeLoop) -> dict[str, Any]:
@@ -2190,6 +2305,10 @@ class AutoNudgeService:
         # In-memory only: the load path re-mints it unconditionally, so a persisted
         # value could never be honoured and writing one would dirty a clean store.
         payload.pop("goal_token", None)
+        # The loader always bounds this map, including the empty ``remarks``
+        # list. Apply the same canonical shape before persistence and trust
+        # fingerprinting, so a clean restart cannot change a row's identity.
+        payload["judge_pr_seen"] = _bounded_judge_pr_seen(payload.get("judge_pr_seen"))
         if loop.monitor is None:
             # Preserve the legacy wire shape instead of eagerly migrating every
             # record the next time an unrelated loop is saved.
@@ -2444,7 +2563,10 @@ class AutoNudgeService:
                 logger.warning("AutoNudge: detached add() failed", exc_info=t.exception())
 
         inner.add_done_callback(_finish)
-        return await asyncio.shield(inner)
+        result, cancelled = await _await_future_deferring_cancellation(inner)
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def add_monitor(
         self,
@@ -2497,7 +2619,10 @@ class AutoNudgeService:
                 logger.warning("detached structured monitor add failed", exc_info=t.exception())
 
         inner.add_done_callback(_finish)
-        return await asyncio.shield(inner)
+        result, cancelled = await _await_future_deferring_cancellation(inner)
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def _add_monitor_locked(
         self,
@@ -2521,6 +2646,7 @@ class AutoNudgeService:
         creation_surface: MonitorCreationSurface,
     ) -> NudgeLoop:
         created = time.time() if now is None else now
+        transaction_cancelled = False
         cadence = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(cadence_secs)))
         async with _maintenance_lock(self._base_dir):
             async with self._lock:
@@ -2537,6 +2663,7 @@ class AutoNudgeService:
                     ):
                         raise MonitorUpdateConflict("monitor changed before restart")
                 if existing:
+                    self._assert_monitor_replacement_mutable(existing.id)
                     # Same split as the legacy add: create-only refuses ANY
                     # record unless the caller opted into ``replace_stopped``,
                     # which under the owner's ruling displaces only
@@ -2615,24 +2742,31 @@ class AutoNudgeService:
                     else None
                 )
                 restore_prior_provider_credentials = False
-                if existing is not None and defer_replaced_trust_revocation:
-                    restore_prior_provider_credentials = (
-                        await self._provider_credentials_authorized(existing)
-                    )
-                    await self._revoke_provider_credentials_before_removal(existing.id)
-                replacement_payload = {
-                    "version": _STORE_VERSION,
-                    "loops": self._serialized_loops(
-                        skip={existing.id} if existing is not None else None,
-                        extra=[loop],
-                    ),
-                }
+                prior_owner_revocation: Any = None
                 try:
-                    await self._write_monitor_snapshot_locked(replacement_payload)
+                    if existing is not None:
+                        (
+                            prior_owner_revocation,
+                            restore_prior_provider_credentials,
+                        ) = await self._prepare_trust_before_removal(existing)
+                    replacement_payload = {
+                        "version": _STORE_VERSION,
+                        "loops": self._serialized_loops(
+                            skip={existing.id} if existing is not None else None,
+                            extra=[loop],
+                        ),
+                    }
+                    transaction_cancelled = await self._write_monitor_snapshot_locked(
+                        replacement_payload,
+                        defer_cancellation=True,
+                    )
                 except BaseException:
-                    if restore_prior_provider_credentials:
-                        assert existing is not None
-                        await self._restore_provider_credentials(existing)
+                    if existing is not None:
+                        await self._rollback_trust_after_failed_removal(
+                            existing,
+                            prior_owner_revocation,
+                            restore_prior_provider_credentials,
+                        )
                     raise
                 if existing is not None:
                     self.remove_sync(existing.id, persist=False)
@@ -2641,8 +2775,13 @@ class AutoNudgeService:
                             deferred_prior,
                             deepcopy(loop),
                             restore_prior_provider_credentials,
+                            prior_owner_revocation,
                         )
                     else:
+                        transaction_cancelled = (
+                            await self._commit_owner_revocation(prior_owner_revocation)
+                            or transaction_cancelled
+                        )
                         # The snapshot above already committed the replacement.
                         self._revoke_self_arm_for(existing)
                 elif defer_replaced_trust_revocation:
@@ -2650,22 +2789,48 @@ class AutoNudgeService:
                         None,
                         deepcopy(loop),
                         False,
+                        None,
                     )
                 self._loops[loop.id] = loop
-                if self._on_monitor_tick is not None:
+                if self._on_monitor_tick is not None and not defer_replaced_trust_revocation:
                     self._arm_from_deadline(loop)
         self._emit("added", loop)
+        if transaction_cancelled:
+            raise asyncio.CancelledError
         return loop
 
-    def commit_monitor_replacement(self, loop_id: str) -> None:
-        """Release prior trust after a replacement's authorization commits."""
-        if loop_id not in self._deferred_monitor_replacements:
-            raise MonitorUpdateConflict("monitor replacement is no longer pending")
-        prior, _replacement, _restore_prior_provider_credentials = (
-            self._deferred_monitor_replacements.pop(loop_id)
-        )
-        if prior is not None:
-            self._revoke_self_arm_for(prior)
+    async def commit_monitor_replacement(self, loop_id: str) -> bool:
+        """CAS-finalize prior trust after a replacement authorization commits.
+
+        Returns whether cancellation landed while the owner-fence writer was
+        joined. The caller propagates it only after the deferred transaction is
+        complete.
+        """
+        async with _maintenance_lock(self._base_dir):
+            async with self._lock:
+                pending = self._deferred_monitor_replacements.get(loop_id)
+                if pending is None:
+                    raise MonitorUpdateConflict("monitor replacement is no longer pending")
+                (
+                    prior,
+                    replacement,
+                    _restore_prior_provider_credentials,
+                    prior_owner_revocation,
+                ) = pending
+                current = self._loops.get(loop_id)
+                if current is None or self._serialize_loop(current) != self._serialize_loop(
+                    replacement
+                ):
+                    raise MonitorUpdateConflict(
+                        "monitor changed before replacement authorization committed"
+                    )
+                cancelled = await self._commit_owner_revocation(prior_owner_revocation)
+                self._deferred_monitor_replacements.pop(loop_id, None)
+                if prior is not None:
+                    self._revoke_self_arm_for(prior)
+                if current.active and self._on_monitor_tick is not None:
+                    self._arm_from_deadline(current)
+                return cancelled
 
     async def rollback_monitor_replacement(self, loop_id: str) -> bool:
         """Restore the pre-replacement row after authorization cannot commit.
@@ -2676,20 +2841,45 @@ class AutoNudgeService:
         """
         removed: NudgeLoop | None = None
         prior: NudgeLoop | None = None
+        transaction_cancelled = False
         async with _maintenance_lock(self._base_dir):
             async with self._lock:
                 if loop_id not in self._deferred_monitor_replacements:
                     return False
-                prior, replacement, restore_prior_provider_credentials = (
-                    self._deferred_monitor_replacements.pop(loop_id)
-                )
+                (
+                    prior,
+                    replacement,
+                    restore_prior_provider_credentials,
+                    prior_owner_revocation,
+                ) = self._deferred_monitor_replacements[loop_id]
                 current = self._loops.get(loop_id)
                 if current is None or self._serialize_loop(current) != self._serialize_loop(
                     replacement
                 ):
+                    transaction_cancelled = await self._commit_owner_revocation(
+                        prior_owner_revocation
+                    )
+                    self._deferred_monitor_replacements.pop(loop_id, None)
                     if prior is not None:
                         self._revoke_self_arm_for(prior)
+                    if transaction_cancelled:
+                        raise asyncio.CancelledError
                     return False
+                current_owner_revocation: Any = None
+                restore_current_provider_credentials = False
+                try:
+                    (
+                        current_owner_revocation,
+                        restore_current_provider_credentials,
+                    ) = await self._prepare_trust_before_removal(current)
+                except BaseException:
+                    self._deferred_monitor_replacements[loop_id] = (
+                        prior,
+                        replacement,
+                        restore_prior_provider_credentials,
+                        prior_owner_revocation,
+                    )
+                    raise
                 payload = {
                     "version": _STORE_VERSION,
                     "loops": self._serialized_loops(
@@ -2698,25 +2888,50 @@ class AutoNudgeService:
                     ),
                 }
                 try:
-                    await self._write_monitor_snapshot_locked(payload)
+                    transaction_cancelled = await self._write_monitor_snapshot_locked(
+                        payload,
+                        defer_cancellation=True,
+                        allow_deferred_replacement_ids={loop_id},
+                    )
                 except BaseException:
+                    await self._rollback_trust_after_failed_removal(
+                        current,
+                        current_owner_revocation,
+                        restore_current_provider_credentials,
+                    )
                     self._deferred_monitor_replacements[loop_id] = (
                         prior,
                         replacement,
                         restore_prior_provider_credentials,
+                        prior_owner_revocation,
                     )
                     raise
+                self._deferred_monitor_replacements.pop(loop_id, None)
                 removed = self.remove_sync(loop_id, persist=False, emit=False)
+                transaction_cancelled = (
+                    await self._commit_owner_revocation(current_owner_revocation)
+                    or transaction_cancelled
+                )
+                if removed is not None:
+                    self._revoke_self_arm_for(removed)
                 if prior is not None:
                     self._loops[prior.id] = prior
-                    if restore_prior_provider_credentials:
-                        await self._restore_provider_credentials(prior)
+                    transaction_cancelled = (
+                        await self._rollback_trust_after_failed_removal(
+                            prior,
+                            prior_owner_revocation,
+                            restore_prior_provider_credentials,
+                        )
+                        or transaction_cancelled
+                    )
                     if prior.active and self._on_monitor_tick is not None:
                         self._arm_from_deadline(prior)
         if removed is not None:
             self._emit("removed", removed)
         if prior is not None:
             self._emit("added", prior)
+        if transaction_cancelled:
+            raise asyncio.CancelledError
         return True
 
     def _mint_loop_id(self, requested: str | None) -> str:
@@ -2795,6 +3010,7 @@ class AutoNudgeService:
         creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     ) -> NudgeLoop:
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
+        transaction_cancelled = False
         async with self._lock:
             if admission_check is not None and not admission_check():
                 raise NudgeAdmissionRefused("session changed before nudge arm committed")
@@ -2803,7 +3019,9 @@ class AutoNudgeService:
             # removal+add atomically, avoiding a duplicate blocking save here.
             existing = self._find_by_slot(slot_key)
             restore_existing_provider_credentials = False
+            existing_owner_revocation: Any = None
             if existing:
+                self._assert_monitor_replacement_mutable(existing.id)
                 # Create-only (``replace_existing=False``) refuses ANY existing
                 # record by default — the dashboard REST creates depend on that:
                 # their documented contract is a 409 that never discards a
@@ -2857,10 +3075,10 @@ class AutoNudgeService:
                     raise MonitorUpdateConflict(
                         "existing monitor cannot be replaced while a wake is in flight"
                     )
-                restore_existing_provider_credentials = await self._provider_credentials_authorized(
-                    existing
-                )
-                await self._revoke_provider_credentials_before_removal(existing.id)
+                (
+                    existing_owner_revocation,
+                    restore_existing_provider_credentials,
+                ) = await self._prepare_trust_before_removal(existing)
                 self.remove_sync(existing.id, persist=False, emit=False)
             now = time.time()
             loop = NudgeLoop(
@@ -2926,25 +3144,35 @@ class AutoNudgeService:
             # worker thread, and await it so a persistence failure still
             # propagates to the caller before the loop is reported armed.
             payload = self._serialize_state()
+            future = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
             try:
-                await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
+                _result, transaction_cancelled = await _await_future_deferring_cancellation(future)
             except BaseException:
                 self._loops.pop(loop.id, None)
                 if existing is not None:
                     self._loops[existing.id] = existing
-                    if restore_existing_provider_credentials:
-                        await self._restore_provider_credentials(existing)
+                    await self._rollback_trust_after_failed_removal(
+                        existing,
+                        existing_owner_revocation,
+                        restore_existing_provider_credentials,
+                    )
                     if existing.active:
                         self._arm_from_deadline(existing)
                 raise
             self._arm_from_deadline(loop)
             if existing is not None:
+                transaction_cancelled = (
+                    await self._commit_owner_revocation(existing_owner_revocation)
+                    or transaction_cancelled
+                )
                 # Committed: the displaced row is gone from the store, so its
                 # self-arm entry is revoked now, not before the write.
                 self._revoke_self_arm_for(existing)
                 self._emit("removed", existing)
         self._emit("added", loop)
         logger.info("AutoNudge: added loop %s on slot %s (idle=%ds)", loop.id, slot_key, idle_secs)
+        if transaction_cancelled:
+            raise asyncio.CancelledError
         return loop
 
     async def _persist_locked(self) -> None:
@@ -2980,6 +3208,7 @@ class AutoNudgeService:
         judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
+        stopped_detail: str | None = None,
     ) -> NudgeLoop | None:
         # CANCELLATION SAFETY: same contract as add(). The mutate+persist runs
         # as a SHIELDED, supervised task so a caller cancelled mid-write cannot
@@ -2999,6 +3228,7 @@ class AutoNudgeService:
                 judge=judge,
                 expected_generation=expected_generation,
                 expect_fingerprint=expect_fingerprint,
+                stopped_detail=stopped_detail,
             )
         )
         self._inflight_adds.add(inner)
@@ -3015,7 +3245,10 @@ class AutoNudgeService:
             logger.warning("AutoNudge: detached update() failed", exc_info=exc)
 
         inner.add_done_callback(_finish)
-        return await asyncio.shield(inner)
+        result, cancelled = await _await_future_deferring_cancellation(inner)
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def deactivate_and_wait(self, loop_id: str) -> bool:
         """Persistently pause a loop and wait for its current timer to quiesce.
@@ -3083,6 +3316,7 @@ class AutoNudgeService:
         judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
+        stopped_detail: str | None = None,
     ) -> NudgeLoop | None:
         lock = await self._acquire_mutation_lock(loop_id)
         if lock is None:
@@ -3100,6 +3334,7 @@ class AutoNudgeService:
                 judge=judge,
                 expected_generation=expected_generation,
                 expect_fingerprint=expect_fingerprint,
+                stopped_detail=stopped_detail,
             )
         finally:
             lock.release()
@@ -3118,6 +3353,7 @@ class AutoNudgeService:
         judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
+        stopped_detail: str | None = None,
     ) -> NudgeLoop | None:
         async with self._lock:
             loop = self._loops.get(loop_id)
@@ -3378,6 +3614,7 @@ class AutoNudgeService:
                     # "manual", which the revive logic never auto-resumes.
                     if loop.active:
                         loop.stopped_reason = ""
+                        loop.stopped_detail = ""
                         # Spent only by an actual REVIVAL, hence ``not
                         # was_active``. A still-active loop also receives
                         # ``active=True`` from an ordinary settings save (the
@@ -3394,6 +3631,9 @@ class AutoNudgeService:
                             loop.consecutive_start_failures = 0
                     else:
                         loop.stopped_reason = stopped_reason or MANUAL_STOP_REASON
+                        # A stop with no words of its own leaves the field
+                        # empty rather than carrying an earlier stop's text.
+                        loop.stopped_detail = normalize_stopped_detail(stopped_detail)
             revived = loop.active and not was_active
             if revived:
                 # A revival re-arms the loop for a fresh run: a structural verdict
@@ -3476,15 +3716,145 @@ class AutoNudgeService:
         self._emit("updated", loop)
         return loop
 
+    @staticmethod
+    async def _rollback_trust_after_failed_removal(
+        loop: NudgeLoop,
+        owner_revocation: Any,
+        restore_provider_credentials: bool,
+    ) -> bool:
+        """Restore every pre-commit trust mutation before returning an error."""
+        from kiro_crew import autonudge_provider_trust, autonudge_selfarm
+
+        cancelled = False
+        failure: BaseException | None = None
+        if owner_revocation is not None:
+            try:
+                restored, step_cancelled = (
+                    await autonudge_selfarm.await_thread_deferring_cancellation(
+                        autonudge_selfarm.rollback_owner_arm_revocation,
+                        owner_revocation,
+                    )
+                )
+                cancelled = cancelled or step_cancelled
+                if not restored:
+                    failure = MonitorUpdateConflict(
+                        "owner admission changed before removal compensation"
+                    )
+            except BaseException as exc:  # finish provider compensation too
+                failure = exc
+        if restore_provider_credentials:
+            state = loop.monitor
+            if state is None:
+                failure = failure or ValueError(
+                    "provider credential restoration requires a structured monitor"
+                )
+            else:
+                try:
+                    _result, step_cancelled = (
+                        await autonudge_selfarm.await_thread_deferring_cancellation(
+                            autonudge_provider_trust.record_monitor_owner_credentials,
+                            loop.id,
+                            loop.slot_key,
+                            state.kind,
+                            state.target,
+                        )
+                    )
+                    cancelled = cancelled or step_cancelled
+                except BaseException as exc:  # owner compensation already ran
+                    failure = failure or exc
+        if failure is not None:
+            raise failure
+        return cancelled
+
+    async def _prepare_trust_before_removal(
+        self,
+        loop: NudgeLoop,
+        *,
+        durable_loop_row: Mapping[str, Any] | None = None,
+    ) -> tuple[Any, bool]:
+        """Fence owner admission and revoke provider trust before store deletion."""
+        from kiro_crew import autonudge_selfarm
+
+        exact_row = durable_loop_row or self._durable_loop_row(loop)
+        owner_revocation, cancelled = await autonudge_selfarm.await_thread_deferring_cancellation(
+            autonudge_selfarm.begin_owner_arm_revocation,
+            loop.id,
+            loop.slot_key,
+            exact_row,
+        )
+        restore_provider_credentials = False
+        try:
+            restore_provider_credentials = await self._provider_credentials_authorized(loop)
+            await self._revoke_provider_credentials_before_removal(loop.id)
+        except BaseException:
+            rollback_cancelled = await self._rollback_trust_after_failed_removal(
+                loop,
+                owner_revocation,
+                bool(restore_provider_credentials),
+            )
+            if cancelled or rollback_cancelled:
+                raise asyncio.CancelledError
+            raise
+        if cancelled:
+            await self._rollback_trust_after_failed_removal(
+                loop,
+                owner_revocation,
+                bool(restore_provider_credentials),
+            )
+            raise asyncio.CancelledError
+        return owner_revocation, bool(restore_provider_credentials)
+
+    @staticmethod
+    async def _commit_owner_revocation(owner_revocation: Any) -> bool:
+        """CAS-delete one owner fence after the loop-store write committed."""
+        if owner_revocation is None:
+            return False
+        from kiro_crew import autonudge_selfarm
+
+        committed, cancelled = await autonudge_selfarm.await_thread_deferring_cancellation(
+            autonudge_selfarm.commit_owner_arm_revocation,
+            owner_revocation,
+        )
+        if not committed:
+            raise MonitorUpdateConflict("owner admission changed before removal committed")
+        return cancelled
+
     def remove_sync(
         self, loop_id: str, *, persist: bool = True, emit: bool = True
     ) -> NudgeLoop | None:
-        """Remove a loop. ``persist=False`` skips the blocking save — used by
-        async callers that snapshot+offload the write themselves right after."""
-        if persist and loop_id in self._loops:
-            from kiro_crew import autonudge_provider_trust
+        """Remove a loop, fencing owner admission across the store commit."""
+        self._assert_monitor_replacement_mutable(loop_id)
+        loop = self._loops.get(loop_id)
+        owner_revocation: Any = None
+        restore_provider_credentials = False
+        if persist and loop is not None:
+            from kiro_crew import autonudge_provider_trust, autonudge_selfarm
 
-            autonudge_provider_trust.forget_monitor_owner_credentials(loop_id)
+            owner_revocation = autonudge_selfarm.begin_owner_arm_revocation(
+                loop.id,
+                loop.slot_key,
+                self._durable_loop_row(loop),
+            )
+            state = loop.monitor
+            try:
+                if state is not None:
+                    restore_provider_credentials = (
+                        autonudge_provider_trust.is_monitor_owner_credentials_recorded(
+                            loop.id,
+                            loop.slot_key,
+                            state.kind,
+                            state.target,
+                        )
+                    )
+                autonudge_provider_trust.forget_monitor_owner_credentials(loop.id)
+            except BaseException:
+                if owner_revocation is not None:
+                    restored = autonudge_selfarm.rollback_owner_arm_revocation(owner_revocation)
+                    if not restored:
+                        raise MonitorUpdateConflict(
+                            "owner admission changed before removal compensation"
+                        )
+                raise
         loop = self._loops.pop(loop_id, None)
         if loop is None:
             return None
@@ -3494,13 +3864,45 @@ class AutoNudgeService:
         self._rearm_pending.discard(loop_id)
         self._accepted_monitor_turns.pop(loop_id, None)
         if persist:
-            self._save()
-            # Revoke the keystone-gated self-arm entry only AFTER the store
-            # committed the removal: a save that raises leaves the loop's
-            # durable row in place, and a loop that is still stored must keep
-            # the entry it needs to fire. Provider credential denial is the
-            # inverse: it must be durable before the agent-writable row can
-            # disappear. ``persist=False`` callers own both commit boundaries.
+            try:
+                self._save()
+            except BaseException:
+                self._loops[loop.id] = loop
+                failure: BaseException | None = None
+                if owner_revocation is not None:
+                    try:
+                        if not autonudge_selfarm.rollback_owner_arm_revocation(owner_revocation):
+                            failure = MonitorUpdateConflict(
+                                "owner admission changed before removal compensation"
+                            )
+                    except BaseException as exc:
+                        failure = exc
+                if restore_provider_credentials:
+                    assert loop.monitor is not None
+                    try:
+                        autonudge_provider_trust.record_monitor_owner_credentials(
+                            loop.id,
+                            loop.slot_key,
+                            loop.monitor.kind,
+                            loop.monitor.target,
+                        )
+                    except BaseException as exc:
+                        failure = failure or exc
+                if loop.active:
+                    try:
+                        asyncio.get_running_loop()
+                    except RuntimeError:
+                        pass
+                    else:
+                        self._arm_from_deadline(loop)
+                if failure is not None:
+                    raise failure
+                raise
+            if owner_revocation is not None and not autonudge_selfarm.commit_owner_arm_revocation(
+                owner_revocation
+            ):
+                raise MonitorUpdateConflict("owner admission changed before removal committed")
+            # Self-arm entries retain the historical after-commit cleanup.
             self._revoke_self_arm_for(loop)
         if emit:
             self._emit("removed", loop)
@@ -3508,37 +3910,38 @@ class AutoNudgeService:
         if deferred_replacement is not None and deferred_replacement[0] is not None:
             deferred_prior = deferred_replacement[0]
             assert deferred_prior is not None
+            prior_owner_revocation = deferred_replacement[3]
+            if prior_owner_revocation is not None:
+                from kiro_crew import autonudge_selfarm
+
+                if not autonudge_selfarm.commit_owner_arm_revocation(prior_owner_revocation):
+                    raise MonitorUpdateConflict(
+                        "owner admission changed before deferred removal committed"
+                    )
             self._revoke_self_arm_for(deferred_prior)
         return loop
 
     def _revoke_self_arm_for(self, loop: NudgeLoop) -> None:
-        """Revoke for EVERY loop leaving the store, not only ``self_armed`` ones.
+        """Finish post-commit cleanup without trusting ``self_armed``.
 
-        The ``self_armed`` bit lives in the agent-writable store, so keying the
-        revocation on it would let a forged ``false`` (plus a restart) skip the
-        revoke and leave the keystone entry orphaned for a later loop that
-        reuses the id on the same slot -- the exact adversary the trust record
-        exists to defeat. Revocation therefore keys on the one fact the store
-        cannot forge: the loop is being removed. A loop with no entry costs one
-        offloaded read (``forget_self_arm`` writes only when it deletes).
+        OWNER admission is revoked strictly before the durable store deletion.
+        This legacy cleanup still runs for every removed id because the
+        agent-writable ``self_armed`` bit cannot classify the trust entry: a
+        forged ``false`` must not let a self-arm entry survive for an id-reusing
+        forgery. For an owner entry already revoked, the operation is an
+        idempotent no-op; provider-trust cleanup is idempotent too.
         """
         self._revoke_self_arm(loop.id)
 
     @staticmethod
     def _revoke_self_arm(loop_id: str) -> None:
-        """Finish best-effort trust cleanup after a loop leaves the store.
+        """Finish best-effort self-arm and provider cleanup after store commit.
 
-        Every removal path (explicit remove, session close, replacement by a
-        new arm) funnels through ``remove_sync``, so this is the one place the
-        self-arm trust record is told a loop has left the store -- and the ONLY
-        path that drops an entry, since ``record_self_arm`` is a pure upsert.
-        Provider credential denial has already been made durable before removal;
-        repeating it here finishes cleanup after a partial tombstone transaction.
-        File IO is offloaded when an event loop is running (``remove_sync`` is
-        reached from async paths that must not block on fsync); the sync
-        fallback covers shutdown/test callers with no loop. Best-effort: a
-        revocation failure is logged inside ``forget_self_arm`` and never
-        breaks the removal.
+        Owner admission is deliberately absent from this boundary: it was
+        revoked strictly and joined before the store mutation. This callback
+        remains best-effort for self-arm entries, whose historical contract is
+        cleanup after their durable loop row is gone. File IO is offloaded when
+        an event loop is running; the sync fallback covers shutdown and tests.
         """
         from kiro_crew import autonudge_provider_trust, autonudge_selfarm
 
@@ -3626,6 +4029,7 @@ class AutoNudgeService:
         in between. A refused precondition changes nothing.
         """
         async with self._lock:
+            self._assert_monitor_replacement_mutable(loop_id)
             existed = loop_id in self._loops
             if not existed and loop_id not in self._pending_removals:
                 return False
@@ -3634,16 +4038,21 @@ class AutoNudgeService:
                 if current is None or not precondition(current):
                     return False
             restore_provider_credentials = False
+            owner_revocation: Any = None
             if existed:
                 assert current is not None
+                durable_loop_row = self._durable_loop_row(current)
                 was_active = current.active
                 current.active = False
                 self._cancel_timer(loop_id)
                 try:
-                    restore_provider_credentials = await self._provider_credentials_authorized(
-                        current
+                    (
+                        owner_revocation,
+                        restore_provider_credentials,
+                    ) = await self._prepare_trust_before_removal(
+                        current,
+                        durable_loop_row=durable_loop_row,
                     )
-                    await self._revoke_provider_credentials_before_removal(loop_id)
                 except BaseException:
                     current.active = was_active
                     if current.active:
@@ -3663,63 +4072,45 @@ class AutoNudgeService:
             payload = self._serialize_state()
             fut = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
 
-            async def _restore_failed_removal() -> None:
+            async def _restore_failed_removal() -> bool:
                 self._pending_removals.discard(loop_id)
                 if removed_loop is None:
-                    return
+                    return False
                 self._loops[loop_id] = removed_loop
-                if restore_provider_credentials:
-                    await self._restore_provider_credentials(removed_loop)
+                cancelled = await self._rollback_trust_after_failed_removal(
+                    removed_loop,
+                    owner_revocation,
+                    restore_provider_credentials,
+                )
                 if removed_loop.active:
                     self._arm_from_deadline(removed_loop)
+                return cancelled
 
             try:
-                await asyncio.shield(fut)
-            except asyncio.CancelledError:
-                # Caller cancelled mid-write: the executor thread can't be
-                # cancelled and is still fsyncing. shield re-raised on us
-                # immediately, so DRAIN the write to completion before this
-                # `async with` exits and releases _lock — otherwise a waiter
-                # (add()/update()/_persist_locked) could acquire the lock and
-                # race a second os.replace(), clobbering newer state with this
-                # stale removal snapshot ("lost update after restart"). Then
-                # propagate the cancellation.
-                while not fut.done():
-                    try:
-                        await asyncio.shield(fut)
-                    except asyncio.CancelledError:
-                        continue
-                try:
-                    fut.result()
-                except Exception:
-                    await _restore_failed_removal()
-                    raise
-                self._pending_removals.discard(loop_id)
-                if removed_loop is not None:
-                    self._revoke_self_arm_for(removed_loop)
-                    self._emit("removed", removed_loop)
-                raise
-            except Exception:
-                # Persistence is the commit point. Restore the live row (and
-                # its timer when it was active) so an immediate retry can still
-                # see the same loop the durable store retained.
+                _result, write_cancelled = await _await_future_deferring_cancellation(fut)
+            except BaseException:
+                # Persistence is the commit point. Restore the live row, trust,
+                # and timer so an immediate retry sees the durable prior state.
                 await _restore_failed_removal()
                 raise
-            else:
-                self._pending_removals.discard(loop_id)
-                if removed_loop is not None:
-                    # The store committed: the row is gone, so its self-arm
-                    # entry may go too (see remove_sync for why not earlier).
-                    self._revoke_self_arm_for(removed_loop)
-                    self._emit("removed", removed_loop)
-                return True
+
+            self._pending_removals.discard(loop_id)
+            commit_cancelled = await self._commit_owner_revocation(owner_revocation)
+            if removed_loop is not None:
+                # The store committed and the owner fence is now gone. Self-arm
+                # trust retains its historical post-commit cleanup.
+                self._revoke_self_arm_for(removed_loop)
+                self._emit("removed", removed_loop)
+            if write_cancelled or commit_cancelled:
+                raise asyncio.CancelledError
+            return True
 
     @staticmethod
     async def _revoke_provider_credentials_before_removal(loop_id: str) -> None:
         """Require a durable provider denial before an agent-writable row disappears."""
-        from kiro_crew import autonudge_provider_trust
+        from kiro_crew import autonudge_provider_trust, autonudge_selfarm
 
-        await asyncio.to_thread(
+        await autonudge_selfarm.await_thread_to_completion(
             autonudge_provider_trust.forget_monitor_owner_credentials,
             loop_id,
         )
@@ -3727,28 +4118,30 @@ class AutoNudgeService:
     @staticmethod
     async def _provider_credentials_authorized(loop: NudgeLoop) -> bool:
         """Whether this exact structured row currently owns provider credentials."""
-        from kiro_crew import autonudge_provider_trust
+        from kiro_crew import autonudge_provider_trust, autonudge_selfarm
 
         state = loop.monitor
         if state is None:
             return False
-        return await asyncio.to_thread(
-            autonudge_provider_trust.is_monitor_owner_credentials_recorded,
-            loop.id,
-            loop.slot_key,
-            state.kind,
-            state.target,
+        return bool(
+            await autonudge_selfarm.await_thread_to_completion(
+                autonudge_provider_trust.is_monitor_owner_credentials_recorded,
+                loop.id,
+                loop.slot_key,
+                state.kind,
+                state.target,
+            )
         )
 
     @staticmethod
     async def _restore_provider_credentials(loop: NudgeLoop) -> None:
         """Restore the exact grant for a row whose replacement did not commit."""
-        from kiro_crew import autonudge_provider_trust
+        from kiro_crew import autonudge_provider_trust, autonudge_selfarm
 
         state = loop.monitor
         if state is None:
             raise ValueError("provider credential restoration requires a structured monitor")
-        await asyncio.to_thread(
+        await autonudge_selfarm.await_thread_to_completion(
             autonudge_provider_trust.record_monitor_owner_credentials,
             loop.id,
             loop.slot_key,
@@ -4109,12 +4502,20 @@ class AutoNudgeService:
                 deepcopy(getattr(staged_state, state_field.name)),
             )
 
+    def _assert_monitor_replacement_mutable(self, loop_id: str) -> None:
+        """Refuse any change while owner-credential activation is unfinished."""
+        if loop_id in self._deferred_monitor_replacements:
+            raise MonitorUpdateConflict(
+                "monitor replacement authorization is still being finalized"
+            )
+
     async def _persist_staged_monitor_locked(
         self,
         loop: NudgeLoop,
         staged: NudgeLoop,
     ) -> None:
         """Persist a complete replacement before publishing it to live readers."""
+        self._assert_monitor_replacement_mutable(loop.id)
         payload = self._monitor_snapshot_with_replacement(loop, staged)
         try:
             await self._write_monitor_snapshot_locked(payload)
@@ -4722,25 +5123,51 @@ class AutoNudgeService:
             return
         self._cancel_timer(loop.id)
 
-    async def _write_monitor_snapshot_locked(self, payload: dict | None = None) -> None:
-        """Persist a monitor transition without releasing ``_lock`` mid-write."""
+    def _assert_deferred_replacements_unchanged(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        allow: set[str] | None = None,
+    ) -> None:
+        """Verify a snapshot preserves every replacement still awaiting trust."""
+        rows = payload.get("loops")
+        if not isinstance(rows, list):
+            raise MonitorUpdateConflict("monitor snapshot has no loop rows")
+        allowed = allow or set()
+        for loop_id, pending in self._deferred_monitor_replacements.items():
+            if loop_id in allowed:
+                continue
+            replacement = pending[1]
+            matching = [row for row in rows if isinstance(row, dict) and row.get("id") == loop_id]
+            if len(matching) != 1 or matching[0] != self._serialize_loop(replacement):
+                raise MonitorUpdateConflict(
+                    "monitor replacement authorization is still being finalized"
+                )
+
+    async def _write_monitor_snapshot_locked(
+        self,
+        payload: dict | None = None,
+        *,
+        defer_cancellation: bool = False,
+        allow_deferred_replacement_ids: set[str] | None = None,
+    ) -> bool:
+        """Persist a monitor transition without releasing ``_lock`` mid-write.
+
+        When ``defer_cancellation`` is true, return whether cancellation landed
+        after joining the write. Removal/replacement transactions use that signal
+        to finalize or compensate trust before propagating cancellation.
+        """
         if payload is None:
             payload = self._serialize_state()
+        self._assert_deferred_replacements_unchanged(
+            payload,
+            allow=allow_deferred_replacement_ids,
+        )
         future = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
-        cancelled = False
-        while not future.done():
-            try:
-                await asyncio.shield(future)
-            except asyncio.CancelledError:
-                # Executor writes cannot be cancelled. Absorb every
-                # cancellation until the write settles so the caller's lock
-                # scope cannot release around an older snapshot.
-                cancelled = True
-        future.result()
-        if cancelled:
-            # Propagate cancellation only after the executor result has been
-            # observed while the caller still owns the lock.
+        _result, cancelled = await _await_future_deferring_cancellation(future)
+        if cancelled and not defer_cancellation:
             raise asyncio.CancelledError
+        return cancelled
 
     async def record_monitor_dispatch_failure(
         self,
@@ -4988,7 +5415,12 @@ class AutoNudgeService:
         window does not provide for dashboard slots (their turn outlives it).
         """
         loop = self._find_by_slot(slot_key)
-        if not loop or not loop.active or loop.approval_stalled:
+        if (
+            not loop
+            or loop.id in self._deferred_monitor_replacements
+            or not loop.active
+            or loop.approval_stalled
+        ):
             return
         loop.approval_stalled = True
         logger.warning(
@@ -5013,7 +5445,7 @@ class AutoNudgeService:
         touching a timer that may be mid-fire.
         """
         loop = self._find_by_slot(slot_key)
-        if not loop or not loop.active:
+        if not loop or loop.id in self._deferred_monitor_replacements or not loop.active:
             return
         loop.consecutive_start_failures += 1
         logger.warning(
@@ -5035,7 +5467,11 @@ class AutoNudgeService:
         let a loop keep running, never stop one.
         """
         loop = self._find_by_slot(slot_key)
-        if not loop or not loop.consecutive_start_failures:
+        if (
+            not loop
+            or loop.id in self._deferred_monitor_replacements
+            or not loop.consecutive_start_failures
+        ):
             return
         loop.consecutive_start_failures = 0
         # Drop the paid-deferral marker with the streak it belonged to: a streak
@@ -5277,6 +5713,8 @@ class AutoNudgeService:
         wrote it and must survive the downgrade so an upgrade resumes the watch.
         Inertness is the local consequence, not a change of intent.
         """
+        if loop.id in self._deferred_monitor_replacements:
+            return
         monitor = loop.monitor
         if monitor is not None and monitor.version != MONITOR_STATE_VERSION:
             logger.info(

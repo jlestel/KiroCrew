@@ -51,13 +51,14 @@ def _no_host_ssh_probe(monkeypatch):
 TIERS = ("standard", "cc", "strict")
 
 #: Protected names held by an ENCLOSING stand-in mask today. Measured, not aspired
-#: to: it is EMPTY, because nothing in the launcher holds a protected
-#: name for the namespace lifetime. Every mask is placed once, at spawn.
+#: to: the auto-nudge trust directory is nested beneath the whole-directory
+#: ``tag-grants`` stand-in, so host-side replacement of the nested name never
+#: becomes visible inside a running namespace.
 #:
 #: A fix that gives a name a durable hold adds it here, and the equality
 #: assertion below then locks it: the name can never fall back to leaf-name
 #: holding without this constant being edited in the same diff.
-HELD_BY_ENCLOSING_MASK: frozenset[str] = frozenset()
+HELD_BY_ENCLOSING_MASK: frozenset[str] = frozenset({"tag-grants/autonudge-trust"})
 
 
 def _launcher_sets(tier: str) -> tuple[list[str], list[str]]:
@@ -302,6 +303,12 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   refresh-chain state is never listable from inside the namespace;
     #: * ``redaction-allow`` -- the reader's allowed link hosts, sealed read-only
     #:   so an agent cannot allow the host it wants to send conversation data to.
+    #:
+    #: The auto-nudge arm record (``tag-grants/autonudge-trust``) is deliberately
+    #: NOT among them: it is a nested leaf inside an existing whole-directory
+    #: stand-in, so it lands in ``HELD_BY_ENCLOSING_MASK`` and costs this count
+    #: nothing. A root-level ``autonudge-trust`` leaf would add three entries per
+    #: tier and weaken the existing enclosing-directory hold.
     EXPECTED: dict[str, int] = {"standard": 244, "cc": 251, "strict": 252}
 
     @pytest.mark.parametrize("tier", TIERS)
