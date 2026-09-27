@@ -8,9 +8,28 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sage_lib import results
+from sage_lib import discovery, results
 from sage_lib import review_driver as D  # noqa: N812
 from sage_lib import store
+
+
+def _refuse_real_gh(case: unittest.TestCase) -> None:
+    """No test in this module may reach a real ``gh``.
+
+    Every gh call the driver makes routes through ``discovery._run_gh``. With a gh
+    installed and authenticated on the host, ``run_review(..., post=True)``'s draft
+    read-back (``_confirm_github_draft``) otherwise performs a LIVE GitHub API
+    request for the made-up ``o/r`` repository -- four real spawns of gh per run in
+    a five-run hygiene sweep, from a unit test. The driver already treats an
+    unavailable gh as "unproven" and carries on; a unit test wants that branch
+    deterministically, not by whether the host happens to have gh.
+    """
+    no_gh = mock.patch.object(
+        discovery, "_run_gh",
+        side_effect=discovery.GhError("gh is not reachable from a unit test"),
+    )
+    no_gh.start()
+    case.addCleanup(no_gh.stop)
 
 
 class TestHostQualifiedIdentity(unittest.TestCase):
@@ -108,6 +127,7 @@ class TestReviewDriver(unittest.TestCase):
         self.calls = []
         self.lock = threading.Lock()
         self.archived = []
+        _refuse_real_gh(self)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -761,6 +781,7 @@ class TestGithubPosting(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.root = Path(self.tmp) / "apps" / "code-review-sage"
         store.ensure_layout(self.root)
+        _refuse_real_gh(self)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)

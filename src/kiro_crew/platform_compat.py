@@ -1829,6 +1829,14 @@ def darwin_process_environ(pid: int) -> list[bytes] | None:
     an *argument* that merely looks like an environment entry can never be read
     as one -- the point of the read is that a user's own shell can reproduce any
     argv.
+
+    An Apple PLATFORM binary (``/bin/sleep``, ``/usr/bin/env``) is one of the
+    ``None`` cases on macOS 26: the kernel answers with an argv-only record for
+    it even to a same-uid reader (``ps -E`` shows no environment either), so
+    the read fails closed and such a process is never identified as ours. The
+    launchers this oracle exists for (``node``, ``python``, an MCP CLI) are
+    never platform binaries; a test that needs a readable child must spawn one
+    of those, not ``sleep``.
     """
     libc = _darwin_sysctl_handle()
     if libc is None:

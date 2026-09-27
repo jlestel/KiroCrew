@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from html import escape
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,8 +117,20 @@ def test_shell_requires_bash_with_native_windows_resolver(monkeypatch, platform,
         assert not calls
 
 
+# One nested ``--collect-only`` of the two TARGETS takes about 2 s on an idle host and
+# 8 to 13 s on a host running the full suite at 8 workers. The test needs five of them.
+# Run sequentially, that put up to 300 s of inner budget inside the 120 s ``--timeout``
+# every test gets, so pytest-timeout fired on the sum. The five are independent (each
+# is its own interpreter), so they run CONCURRENTLY -- wall time is the slowest one, not
+# the sum -- and each keeps ``_run``'s 60 s cap: that cap is the ratchet on how slow a
+# single collection may get, and concurrency is what fixes the budget, not a looser cap.
+
+
 def test_real_collected_nodes_are_the_disjoint_fleet_and_hosted_union(tmp_path):
     def collect(*args):
+        # ``--basetemp`` under THIS test's tmp_path (testing-conventions: a nested pytest
+        # always gets one), so its startup prune and its output describe only its run.
+        basetemp = tmp_path / "bt" / str(abs(hash(args)))
         result = _run(
             [
                 sys.executable,
@@ -130,6 +143,8 @@ def test_real_collected_nodes_are_the_disjoint_fleet_and_hosted_union(tmp_path):
                 "--color=no",
                 "-p",
                 "no:cacheprovider",
+                "--basetemp",
+                str(basetemp),
                 *args,
                 *TARGETS,
             ],
@@ -141,28 +156,32 @@ def test_real_collected_nodes_are_the_disjoint_fleet_and_hosted_union(tmp_path):
         assert nodes and len(nodes) == len(set(nodes))
         return set(nodes)
 
-    original = collect()
-    fleet = collect("-m", "not ipv6_required")
-    hosted = collect("-m", "ipv6_required")
+    # Only the owners of these two files can collect their ordinary items.
+    owners = sorted({file_shard(ROOT / target, ROOT, 8) for target in TARGETS})
+    jobs = [
+        (),
+        ("-m", "not ipv6_required"),
+        ("-m", "ipv6_required"),
+        *(
+            (
+                "-p",
+                "scripts.ci_file_shards",
+                "--file-shards=8",
+                f"--file-shard={owner}",
+                "-m",
+                "not ipv6_required",
+            )
+            for owner in owners
+        ),
+    ]
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        original, fleet, hosted, *shards = pool.map(lambda a: collect(*a), jobs)
     assert hosted == EXPECTED
     assert not fleet & hosted
     assert original == fleet | hosted
     assert PEER + f"[{int(socket.AF_INET)}-127.0.0.1]" in fleet
     assert DNS + "test_a_normal_public_host_still_fetches" in fleet
     assert DNS + "test_resolution_stays_off_the_event_loop" in fleet
-    # Only the owners of these two files can collect their ordinary items.
-    owners = {file_shard(ROOT / target, ROOT, 8) for target in TARGETS}
-    shards = [
-        collect(
-            "-p",
-            "scripts.ci_file_shards",
-            "--file-shards=8",
-            f"--file-shard={owner}",
-            "-m",
-            "not ipv6_required",
-        )
-        for owner in owners
-    ]
     assert sum(map(len, shards)) == len(fleet)
     assert set().union(*shards) == fleet
 

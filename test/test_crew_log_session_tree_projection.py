@@ -67,6 +67,14 @@ def _isolated_home(tmp_path, monkeypatch):
     stp.reset_for_tests()
     yield
     stp.reset_for_tests()
+    # ``_write_unit`` goes through the emitter, and the emitter KEEPS the handle it
+    # wrote through (correct for a live session). A kept handle holds that session's
+    # write lease, and ``lease._held`` is process-wide -- so without this, every unit
+    # written here stayed leased in later tests on the same xdist worker, and
+    # test_eventlog_hooks' "no lease is held after release" read those leases as its
+    # own (red in one of five runs of a hygiene sweep). Dropping the handles
+    # releases the leases through their finalizers.
+    emit.reset_caches()
 
 
 def _rec(sid: str, slot: str, created: int = 1, parent: str | None = None) -> OpenedRecord:

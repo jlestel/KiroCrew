@@ -2151,3 +2151,84 @@ class TestCliProcessEnvironmentIsRestored:
             cycle.close()
 
         assert {name: os.environ.get(name) for name in names} == before
+
+
+class TestTheHooksDispatcherIsRestored:
+    """``hooks_integration._lifecycle_dispatcher`` goes back after every test.
+
+    ``init_hooks_system`` -- reached by every test that builds the real dashboard app --
+    assigns the process-wide dispatcher (and the route registry beside it) and nothing
+    in production clears them: a gateway sets them once. In a worker the LAST such test's
+    dispatcher, with whatever it passed as ``cron_service`` (routinely a ``MagicMock``),
+    therefore reaches every later test; the trust-revoke teardown awaits that mock's
+    cron store and answers 409 ``teardown_incomplete``. Seven to nine of
+    ``test_trusted_apps_api.py``'s revoke tests were red in every round of a five-run
+    hygiene sweep with exactly that body, all green alone.
+
+    ``conftest._restore_hooks_integration_globals`` is what removes the class; without a
+    test, an edit to it reverts silently. Its teardown is driven directly (see
+    ``_autouse_floor_generator``), so the proof needs no adjacent observer test.
+    """
+
+    @staticmethod
+    def _hi():
+        from kiro_crew.apps import hooks_integration
+
+        return hooks_integration
+
+    def test_this_test_starts_with_no_dispatcher(self) -> None:
+        """Which is only true if no earlier test on this worker left one behind."""
+        assert self._hi()._lifecycle_dispatcher is None
+
+    def test_a_leaked_dispatcher_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot, leak through the real installer, restore.
+
+        The leak is produced by the real ``init_hooks_system`` on a bare aiohttp app with a
+        ``MagicMock`` cron service -- exactly how ~170 dashboard tests produce it -- so
+        this still fails if the production install site moves. A failure part-way cannot
+        leak past this test: the live autouse instance of the same fixture wraps it too.
+        """
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+
+        hi = self._hi()
+        cycle = _autouse_floor_generator("_restore_hooks_integration_globals")()
+        next(cycle)  # snapshot, taken while both slots are empty
+
+        hi.init_hooks_system(web.Application(), cron_service=MagicMock())
+        leaked = hi._lifecycle_dispatcher
+        assert leaked is not None, "init_hooks_system no longer installs the dispatcher"
+        assert hi._route_registry is not None
+
+        with pytest.raises(StopIteration):
+            next(cycle)  # the restore under test
+        assert hi._lifecycle_dispatcher is None, (
+            f"the slot still holds {hi._lifecycle_dispatcher!r} -- the next revoke test on "
+            "this worker would await its MagicMock cron store and answer 409"
+        )
+        assert hi._route_registry is None
+
+    def test_the_restore_target_is_what_the_test_inherited(self, monkeypatch) -> None:
+        """The floor restores the INHERITED dispatcher, so a higher-scoped installer survives."""
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+
+        hi = self._hi()
+        sentinel = object()
+        monkeypatch.setattr(hi, "_lifecycle_dispatcher", sentinel)
+        monkeypatch.setattr(hi, "_route_registry", None)
+
+        cycle = _autouse_floor_generator("_restore_hooks_integration_globals")()
+        next(cycle)  # snapshot taken while the sentinel holds the slot
+
+        hi.init_hooks_system(web.Application(), cron_service=MagicMock())
+        assert hi._lifecycle_dispatcher is not sentinel
+
+        with pytest.raises(StopIteration):
+            next(cycle)
+        assert hi._lifecycle_dispatcher is sentinel, (
+            "the floor restored past the dispatcher this cycle inherited, so a "
+            "higher-scoped installer would be torn out after its first test"
+        )

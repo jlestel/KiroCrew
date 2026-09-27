@@ -773,15 +773,30 @@ class TestCancelInsideTheClaimWindow:
         gate = _SnapshotGate(svc, park_call=4)
         merging = _FirstCallGate(svc._merge_job_result)
         state = _make_state(svc)
+        # The first run's refresh is NOT parked here (call 4 is the replacement's), so
+        # by the time the route's response reaches the client ``_run_claimed_manual``
+        # may already have swapped the claim's task for its inner ``_run_job_isolated``
+        # task -- whose result is None, not the wrapper's True. Reading
+        # ``svc._claims[job.id].task`` after the POST therefore named one task or the
+        # other by scheduling luck (red in two of five full-suite runs of a sweep).
+        # The wrapper is taken from the seam the route hands it through instead.
+        attached: list[asyncio.Task[Any]] = []
+        real_attach = svc.attach_run_task
+
+        def _attach(job_id: str, task: asyncio.Task[Any]) -> None:
+            attached.append(task)
+            real_attach(job_id, task)
+
         with (
             patch.object(svc, "_synced_snapshot", gate),
             patch.object(svc, "_merge_job_result", merging),
+            patch.object(svc, "attach_run_task", _attach),
         ):
             try:
                 async with TestClient(TestServer(_make_app(state))) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    first = svc._claims[job.id].task
+                    first = attached[0]
                     # The first run has released its claim and parks in its merge;
                     # its wrapper resumes only once that merge and the history
                     # append are done.

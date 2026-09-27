@@ -63,6 +63,18 @@ _POSIX_EXEC_PATHS_ONLY = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
+def _pin_the_installed_kiro_cli_version(monkeypatch):
+    """The writer gate in ``_write_derived_permissions`` reads
+    ``installed_kiro_cli_version`` function-locally, and on a host with a kiro-cli
+    installed that is one REAL ``kiro-cli --version`` spawn per binary identity --
+    32 per full run of this file on a five-run hygiene sweep, from tests that drive
+    protocol and process doubles. The version the gate sees is a property of the
+    host, not of the client under test; ``None`` is the "cannot be established"
+    branch every host without the binary already takes."""
+    monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _native_projection_for_fake_processes(monkeypatch):
     from kiro_crew.acp import skill_projection
 

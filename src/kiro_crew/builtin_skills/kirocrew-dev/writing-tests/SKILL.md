@@ -644,6 +644,28 @@ The consequence for how you write a test:
       (`pool.spawn_shutdown`), never an inline `await shutdown()` in a handler's `finally`:
       teardown cancels the handler after the backend has left the map, and the child then
       belongs to nobody
+- [ ] A child whose environment or argv the test must READ BACK through the kernel
+      (`KERN_PROCARGS2`, `/proc/<pid>/environ`) is a non-platform binary -- the test's own
+      `sys.executable` -- never `sleep` or `env`: macOS 26 answers an argv-only record for
+      Apple platform binaries even to a same-uid reader, so the oracle reads `None` and a
+      "refused" assertion passes for the wrong reason
+- [ ] The bounds on nested `python -m pytest` runs fit INSIDE the per-test `--timeout`: N
+      sequential children each capped at 60 s inside a 120 s test can only fail the test
+      ahead of pytest-timeout, never protect it; independent children run concurrently
+      (wall = the slowest) and each gets the outer budget less a margin
+- [ ] A handle the product REWRITES asynchronously (a claim's `.task` that the run swaps for
+      its inner task) is never read off shared state after an awaited response -- take it
+      from the seam that hands it over (`attach_run_task`), or the assertion names whichever
+      task won the race
+- [ ] A fixture never answers a production path with a FIXED absolute host location to keep
+      a golden host-free: the product WRITES into the window it is handed (`record_owner`
+      unlinks `.owner`, the gate probe `shutil.rmtree`s it), and a path that "never exists"
+      is one `mkdir` on some host away from a real deletion -- answer a real directory under
+      `tmp_path` and stub the golden's env contribution instead
+- [ ] A test whose red survives neither running the file ALONE nor running it WITHOUT
+      `-p probe_plugin` is the probe's finding, not the suite's: a per-test observer that
+      reaches `os.path` through the module a spied test patches records itself as the code
+      under test
 - [ ] A child that polices its OWN peak memory reads `/proc/self/status` `VmHWM` on Linux,
       never `getrusage(RUSAGE_SELF).ru_maxrss`: `execve` seeds `ru_maxrss` with the parent's
       high-water mark, so a child of a 2 GiB xdist worker (or gateway) reads over its ceiling

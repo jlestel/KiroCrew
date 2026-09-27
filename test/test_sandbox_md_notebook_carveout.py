@@ -36,6 +36,19 @@ _MODES = ("standard", "cc", "strict")
 _CREW_PREFIXES = (".kiro/crew", ".kirocrew")
 
 
+@pytest.fixture(autouse=True)
+def _pin_ssh_accept_new(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``_ssh_supports_accept_new`` at the seam ``_build_launcher_script`` reads.
+
+    The real probe runs the host's ``ssh -V``. It is ``lru_cache``d, but any test
+    that clears the cache (``TestSshSupportsAcceptNew`` does) hands the next
+    launcher-building test in the process a real spawn -- 32 across the three
+    launcher suites on a five-run hygiene sweep, a host program none of them is about
+    (test-hygiene class 7). ``True`` is what a modern host answers.
+    """
+    monkeypatch.setattr("kiro_crew.sandbox._ssh_supports_accept_new", lambda: True)
+
+
 def _crew_path(prefix: str, leaf: str) -> str:
     from pathlib import Path
 

@@ -63,6 +63,11 @@ def _isolated_home(tmp_path, monkeypatch):
     stp.reset_for_tests()
     yield
     stp.reset_for_tests()
+    # Units written through ``emit.on_session_opened`` leave the emitter holding their
+    # handles, and a kept handle holds that session's write lease process-wide (see the
+    # projection suite's fixture). Drop them here too, so this file's leases do not
+    # surface as another test's "lease still held" on the same xdist worker.
+    emit.reset_caches()
 
 
 def _rec(

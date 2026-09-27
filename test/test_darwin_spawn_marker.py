@@ -320,7 +320,17 @@ class TestDarwinEnvironIsReadableSameUid:
 
     @staticmethod
     def _child(env: dict[str, str]) -> subprocess.Popen[bytes]:
-        return subprocess.Popen(["sleep", "30"], env=env)
+        # The interpreter running this test, NOT ``sleep``: Apple platform binaries
+        # (``/bin/sleep``, ``/usr/bin/env``) answer ``KERN_PROCARGS2`` with an
+        # argv-only record to same-uid readers on macOS 26 -- ``ps -E`` shows no
+        # environment for them either -- so with ``sleep`` both tests below passed
+        # or failed on the HOST's macOS version, never on the oracle (the first
+        # was red in all five runs of a hygiene sweep, and the second was
+        # vacuous: ``None`` collapses to the ``False`` it asserted). The sweep's
+        # real subjects are launchers such as ``node`` and ``python``, which are
+        # never platform binaries, and the test interpreter is the one such
+        # executable every host has.
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], env=env)
 
     def test_a_child_spawned_with_the_marker_is_identified(self) -> None:
         """Polls briefly: the record shows the parent's environment until exec

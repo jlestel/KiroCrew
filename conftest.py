@@ -2192,6 +2192,54 @@ def _restore_log_queue_listener():
     cli._LOG_QUEUE_LISTENER = before
 
 
+# ── the hooks system's process-wide dispatcher goes back after every test ──
+
+
+@pytest.fixture(autouse=True)
+def _restore_hooks_integration_globals():
+    """Put ``hooks_integration._lifecycle_dispatcher`` / ``_route_registry`` back.
+
+    ``init_hooks_system`` -- which every test that builds the real dashboard app
+    reaches through ``server.py`` -- assigns BOTH module globals and nothing in
+    production ever clears them: a gateway sets them once at boot. In a worker they
+    therefore carry the LAST such test's ``LifecycleDispatcher`` into every later
+    test, together with whatever that test passed as ``cron_service`` -- routinely
+    a ``MagicMock``. The trust-revoke teardown (``teardown_app_runtime`` ->
+    ``on_app_disable`` -> ``_cleanup_app_crons``) reads that global and awaits the
+    stale mock's cron store, gets ``object MagicMock can't be used in 'await'
+    expression``, and reports ``hooks disable failed`` -- so the route answers 409
+    ``teardown_incomplete`` for an app whose teardown had nothing to do.
+
+    Measured on a five-run hygiene sweep: seven to nine of
+    ``test_trusted_apps_api.py``'s revoke tests were red in EVERY round with that
+    body, a different subset each round, and all of them pass alone -- the file
+    is a victim, not the leak. Reproduced by replaying one worker's 1,874 files
+    in order at ``-n0`` with a debug hook on the handler, which named the stale
+    dispatcher and its ``MagicMock`` cron service. Restored rather than blamed,
+    like the log-record factory above: the assignment is production's, the
+    tests that trigger it are exercising real boot code, and any of ~170 files
+    that build the app can be the one that lands before the victim. Reached
+    through ``sys.modules`` so a worker that never imported the module pays
+    nothing and no import is charged to the lazy-import ratchets.
+    """
+    hi = sys.modules.get("kiro_crew.apps.hooks_integration")
+    before = None
+    if hi is not None:
+        before = (
+            getattr(hi, "_lifecycle_dispatcher", None),
+            getattr(hi, "_route_registry", None),
+        )
+    yield
+    hi = sys.modules.get("kiro_crew.apps.hooks_integration")
+    if hi is None:
+        return
+    if before is None:
+        # Imported DURING the test: whatever it set is the test's, and the module
+        # started life with both slots empty.
+        before = (None, None)
+    hi._lifecycle_dispatcher, hi._route_registry = before
+
+
 # ── logger levels go back after every test ──────────────────────────
 
 
