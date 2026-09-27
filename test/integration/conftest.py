@@ -1009,6 +1009,20 @@ def integration_home(
     # live agents) does not apply here.
     monkeypatch.setenv("KIROCREW_KIRO_BIN", str(fake_acp_backend.__file__))
     monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    # Unsandboxed consent, for THIS disposable home only, written as the operator
+    # would write it. The agent binary is the fake above -- a stdlib echo stub --
+    # so OS isolation guards nothing this layer asserts, and the CI container
+    # refuses ``unshare(CLONE_NEWUSER)`` at the runtime policy level, which no
+    # sysctl can lift. Without it every spawn (a chat turn, ``--list-models``,
+    # the sandboxed ``aws configure list-profiles``) fails with a sandbox
+    # refusal instead of running the stub. The E2E suite grants the same
+    # consent for the same reason; a sandboxed spawn doing real work stays
+    # proven by the ``e2e-private-namespace`` and ``e2e-boot-matrix`` lanes.
+    # A test that pins more config merges into this file rather than replacing
+    # it, or the consent goes with it.
+    (home / "config.local.json").write_text(
+        json.dumps({"agent": {"sandbox_allow_unsandboxed_exec": True}}), encoding="utf-8"
+    )
     # Strict on-loop persistence, set HERE rather than in the CI job's env: the
     # rootdir conftest deletes this name before every test body, so a job-level
     # value never reaches the boot. Set per test it makes an on-loop store write

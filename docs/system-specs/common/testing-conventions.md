@@ -629,6 +629,12 @@ with `auth=False`. `gw.state` is the live `DashboardState`, `gw.app` the real
 `web.Application`, `gw.home` the data home -- use them to assert on what a
 request left behind, not to bypass the request.
 
+`integration_home` grants the disposable home unsandboxed-exec consent in its
+`config.local.json`, as the E2E suite does for its gateway: the agent binary is
+the fake stub, and the CI container has no sandbox backend, so without it every
+spawn is refused before the stub runs. Write further per-test config through the
+same file by merging, never by replacing it.
+
 `integration_home` also releases the rootdir conftest's agent-spec pin: that
 pin sends the boot's spec WRITES to a per-test directory while request-time
 READS follow `KIRO_HOME`, so under it the boot would write `kirocrew.json`
@@ -636,6 +642,14 @@ where no request reads it. Both sides resolve to `<home>/kiro/agents` here,
 which is the private target the shared-home write guard exempts. A test that
 edits the agents directory waits for the managed `kirocrew.json` first (the
 spec rebuild runs after the dashboard is serving).
+
+A chat turn is the real thing too: `gw.post("/api/chat", {"message", "slot"})`
+returns the SSE response, and the test reads `resp.content` line by line
+(`data: {...}` events, `data: [DONE]` last). The fake model's `[[SLOW]]`
+prompt streams thirty chunks half a second apart, which is what a timing
+contract across two slots is built on; a cold session start costs several
+seconds before the first chunk, so bound a turn generously and assert on the
+ORDER of what the two streams saw, never on absolute latency.
 
 The directory is a package (`test/integration/__init__.py`) so its conftest
 imports as `integration.conftest`. The unit files import `test/conftest.py` by
