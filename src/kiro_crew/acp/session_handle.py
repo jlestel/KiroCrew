@@ -2278,7 +2278,7 @@ class AcpSessionHandle:
                         MODEL_CONFIG_ID,
                     )
                     return ""
-                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID):
+                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID, self._runtime.acp_backend):
                     raise
                 last_exc = exc
                 continue

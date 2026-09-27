@@ -203,6 +203,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_PROCESS_NAMES,
     NODE_ADAPTER_ENTRY_SEGMENTS,
     launch_for,
+    model_refusal_phrase,
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
@@ -4670,14 +4671,17 @@ def _jsonrpc_error_code(error: object) -> int | None:
 _JSONRPC_INVALID_PARAMS = -32602
 
 
-def _is_config_value_rejection(exc: AcpError, config_id: str) -> bool:
+def _is_config_value_rejection(exc: AcpError, config_id: str, backend: str = "") -> bool:
     """Whether *exc* is the adapter refusing a config option VALUE.
 
-    Two shapes count. claude-agent-acp names the option in its message
+    Three shapes count. claude-agent-acp names the option in its message
     (``Invalid value for config option <id>: ...``); codex-acp answers with a
     bare JSON-RPC ``-32602`` and no detail -- the request shape is fixed, so the
-    code is the verdict on the value. ``unknown config option`` is NOT a value
-    rejection (the option itself is missing) and is left to the caller.
+    code is the verdict on the value; and a harness that declares its own model
+    refusal text (``agent_sdk.backends.model_refusal_phrase``) is read by that
+    text, for the ``model`` option of that *backend* only. ``unknown config
+    option`` is NOT a value rejection (the option itself is missing) and is left
+    to the caller.
 
     The bare-code half rests on "the request shape is fixed, so only the value can
     be invalid", which is a per-adapter fact and not a protocol guarantee. A
@@ -4689,9 +4693,11 @@ def _is_config_value_rejection(exc: AcpError, config_id: str) -> bool:
     classifier -- do not widen it -- when a member does not fit.
     """
     lowered = str(exc).lower()
+    phrase = model_refusal_phrase(backend) if config_id == MODEL_CONFIG_ID else ""
     return (
         f"config option {config_id}" in lowered
         or getattr(exc, "code", None) == _JSONRPC_INVALID_PARAMS
+        or (bool(phrase) and phrase.lower() in lowered)
     )
 
 
@@ -8170,7 +8176,7 @@ class AcpClient:
                         raise
                     logger.debug("adapter exposes no 'model' config option; skipping model push")
                     return ""
-                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID):
+                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID, self.backend):
                     raise  # transport/protocol failure — not a value rejection
                 last_exc = exc
                 continue

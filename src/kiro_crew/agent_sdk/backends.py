@@ -1563,6 +1563,28 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
     }
 )
 
+#: How a member of the model channel above says it refused a model VALUE, when the
+#: JSON-RPC code alone does not say so. pi-acp answers a ``provider/model`` id that
+#: pi cannot select -- one absent from the operator's ``models.json``, or whose
+#: provider has no key -- with a bare ``-32603 Internal error`` whose details start
+#: with this text: its ``setSessionModel`` wraps pi's own ``set_model`` failure.
+#: Measured on pi-acp 0.0.34 driving pi 0.87.1. Unread, the refusal is taken for a
+#: protocol fault and a stale pin fails the whole session at startup, where every
+#: other member stays on its default.
+_MODEL_REFUSAL_PHRASE_BY_BACKEND: Mapping[str, str] = {
+    ACP_BACKEND_PI: "pi set_model failed:",
+}
+
+
+def model_refusal_phrase(backend: str) -> str:
+    """The text *backend* puts in a refused model write, or ``""`` when it has none.
+
+    Read only for the ``model`` option: the phrase names the adapter's model write,
+    so it cannot describe a refused effort or any other option.
+    """
+    return _MODEL_REFUSAL_PHRASE_BY_BACKEND.get(backend, "")
+
+
 # Backends that take a reasoning-effort change through
 # ``session/set_config_option("effort", ...)``. A SEPARATE set from the model
 # channel above despite identical membership today: the two config options are
