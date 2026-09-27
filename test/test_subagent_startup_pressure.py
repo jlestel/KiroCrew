@@ -1342,6 +1342,185 @@ class TestOnlyThisSessionsFrameIsItsAnswer:
         assert info.streaming_text == "working"
 
 
+# ── Leaving startup wakes the queue: the held spawn starts on that edge alone ─
+#
+# ``_note_startup_progress`` is the only edge that announces a NON-terminal
+# exit from the in-startup population: the slot-release drain fires on a
+# terminal and the pump does not poll, so a spawn held by ``_startup_cap`` with
+# free running slots has nothing else to move it. Losing one of its call sites
+# is a silent hang at any fan-out wider than the bound, and no other test in
+# this file would notice: the hold half of the bound is pinned above, and the
+# resume tests pump the queue themselves. Each case here drives ONE of the
+# three transitions through its real code path with a spawn queued behind a
+# full bound and asserts the queued spawn starts with no pump call of the
+# test's own -- observed while the driven start is still mid-execution, so a
+# terminal's drain cannot be what moved it. One case per call site: removing
+# that call must turn its case red while the other two stay green.
+
+
+class TestLeavingStartupStartsTheHeldSpawn:
+    """Gate width 1 (bound 2), cap 8: a peer fills one place in startup and the
+    driven start the other; ``held`` waits in the queue with six free slots."""
+
+    @staticmethod
+    def _ctx() -> MagicMock:
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("message", None))
+        ctx.hooks.auto_approve_subagent_tools = False
+        ctx.hooks.auto_approve_subagent_spawn = True
+        return ctx
+
+    @staticmethod
+    async def _hold_one_behind_the_bound(
+        mgr: SubagentManager, driven: SubagentInfo
+    ) -> SubagentInfo:
+        """Fill the bound with ``driven`` and a peer, then spawn one more: it is
+        held by the bound -- the cap has room -- and nothing but a start
+        leaving startup can release it."""
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        mgr._spawn_stagger_secs = 0.0
+        mgr._session_start_concurrency = 1  # bound 2
+        _register(mgr, driven, _starting("peer0001"))
+        await asyncio.to_thread(
+            create_agent_folder, driven.id, execution_context=driven.execution_context
+        )
+        await mgr.wait_taskq_ready()
+        held = await _spawn(mgr, "held")
+        assert held.queued and not held.done
+        assert mgr._startup_population() == 2 and len(mgr._queue) == 1
+        assert mgr._admission.capacity_view().any_slot  # held by the bound, not the cap
+        return held
+
+    @pytest.mark.asyncio
+    async def test_the_dedicated_pid_record_starts_the_held_spawn(self) -> None:
+        """The dedicated path records the child's PID before its stream opens,
+        and that record alone starts ``held``: observed while the driven start's
+        stream is open and has produced nothing, so neither a first frame nor a
+        terminal can be what woke the pump."""
+        from kiro_crew.execution_context import execution_for_store
+        from kiro_crew.providers.base import EVENT_COMPLETE
+
+        opened = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _stream(*_a, **_k):
+            opened.set()
+            await release.wait()
+            yield SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn", runtime_global=False)
+
+        sessions = TestStreamOpenIsNotProgress._sessions_with_stream(_stream)
+        sessions.get_pid = MagicMock(return_value=_UNALLOCATABLE_PID)
+        with _StartupRuns() as runs:
+            mgr = SubagentManager(
+                sessions=sessions, ctx_builder=self._ctx(), max_concurrent=8, startup_timeout=120
+            )
+            mgr._should_use_session_sharing = MagicMock(return_value=False)  # type: ignore[method-assign]
+            driven = _starting("f00dd1c0", execution_context=execution_for_store(""))
+            held = await self._hold_one_behind_the_bound(mgr, driven)
+            run = asyncio.ensure_future(mgr._run_inner(driven, f"subagent:{driven.id}"))
+            try:
+                await asyncio.wait_for(opened.wait(), 5.0)
+                assert driven._pid == _UNALLOCATABLE_PID
+                assert driven._first_stream_started is None
+                await _until(
+                    lambda: runs.started == [held.id], "the held spawn starting on the PID record"
+                )
+                assert not mgr._queue
+                assert mgr._startup_population() == 2  # the peer and ``held``
+                release.set()
+                await asyncio.wait_for(run, 10.0)
+            finally:
+                release.set()
+                run.cancel()
+                await asyncio.gather(run, return_exceptions=True)
+                await _close(mgr, runs)
+
+    @pytest.mark.asyncio
+    async def test_the_first_frame_of_its_own_turn_starts_the_held_spawn(self) -> None:
+        """A start that publishes no runtime PID (``get_pid`` answers nothing: a
+        provider that creates its child lazily from ``stream()``) leaves startup
+        on the first frame addressed to its session, and that frame alone starts
+        ``held``. An open, silent stream starts nothing; the frame is observed
+        with the stream still open, before the completion that ends the run."""
+        from kiro_crew.execution_context import execution_for_store
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_SUBAGENT_LIST
+
+        opened = asyncio.Event()
+        send_first = asyncio.Event()
+        first_sent = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _stream(*_a, **_k):
+            opened.set()
+            await send_first.wait()
+            yield SimpleNamespace(kind=EVENT_SUBAGENT_LIST, subagents=[], runtime_global=False)
+            first_sent.set()
+            await release.wait()
+            yield SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn", runtime_global=False)
+
+        sessions = TestStreamOpenIsNotProgress._sessions_with_stream(_stream)
+        assert sessions.get_pid() is None
+        with _StartupRuns() as runs:
+            mgr = SubagentManager(
+                sessions=sessions, ctx_builder=self._ctx(), max_concurrent=8, startup_timeout=120
+            )
+            mgr._should_use_session_sharing = MagicMock(return_value=False)  # type: ignore[method-assign]
+            driven = _starting("f00dd1c1", execution_context=execution_for_store(""))
+            held = await self._hold_one_behind_the_bound(mgr, driven)
+            run = asyncio.ensure_future(mgr._run_inner(driven, f"subagent:{driven.id}"))
+            try:
+                await asyncio.wait_for(opened.wait(), 5.0)
+                await _settle()
+                assert driven._pid is None
+                assert SubagentManager._in_startup(driven) is True
+                assert (
+                    runs.started == [] and len(mgr._queue) == 1
+                )  # an opened stream is not progress
+                send_first.set()
+                await asyncio.wait_for(first_sent.wait(), 5.0)
+                assert driven._first_stream_started is not None
+                await _until(
+                    lambda: runs.started == [held.id], "the held spawn starting on the first frame"
+                )
+                assert not mgr._queue
+                release.set()
+                await asyncio.wait_for(run, 10.0)
+            finally:
+                send_first.set()
+                release.set()
+                run.cancel()
+                await asyncio.gather(run, return_exceptions=True)
+                await _close(mgr, runs)
+
+    @pytest.mark.asyncio
+    async def test_the_shared_runtime_pid_record_starts_the_held_spawn(self) -> None:
+        """The shared path records the runtime's PID as the handle is bound,
+        before any prompt is sent, and that record alone starts ``held``."""
+        from kiro_crew.execution_context import execution_for_store
+
+        with _StartupRuns() as runs:
+            mgr = _manager(max_concurrent=8, gate_width=1)
+            driven = _starting("f00dd1c2", execution_context=execution_for_store(""))
+            held = await self._hold_one_behind_the_bound(mgr, driven)
+            runtime = MagicMock()
+            runtime.pid = _UNALLOCATABLE_PID
+            handle = MagicMock()
+            handle.session_id = "shared-session-1"
+            handle.memory_mode = "persistent"
+            try:
+                await mgr._bind_shared_handle(driven, f"subagent:{driven.id}", runtime, handle)
+                assert driven._pid == _UNALLOCATABLE_PID
+                assert driven._first_stream_started is None
+                await _until(
+                    lambda: runs.started == [held.id],
+                    "the held spawn starting on the shared runtime's PID record",
+                )
+                assert not mgr._queue
+            finally:
+                await _close(mgr, runs)
+
+
 # ── Gate-exit start-clock reset on the DEDICATED-process path ─────────────
 #
 # ``_create_shared_session`` hands ``runtime.create_session`` an
