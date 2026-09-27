@@ -28,10 +28,104 @@ from kiro_crew.mcp_caller import (
 
 
 def test_single_session_identity_preserves_cached_caller(monkeypatch):
+    """A memoised per-process identity is served without re-walking the tree."""
+    monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
+    monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+    monkeypatch.delenv("KIROCREW_STUB_SESSION_TOKEN", raising=False)
     monkeypatch.setattr(
-        kiro_crew.mcp_caller, "_FROM_ENV_CACHE", CallerContext(session_key="single")
+        kiro_crew.mcp_caller,
+        "_FROM_ENV_CACHE",
+        CallerContext(session_key="single"),
     )
+
+    def _must_not_walk():
+        raise AssertionError("the pid walk ran although a memo was present")
+
+    monkeypatch.setattr(kiro_crew.mcp_caller, "_identity_from_pid_mapping", _must_not_walk)
     assert CallerContext.from_env().session_key == "single"
+
+
+def test_an_unresolved_identity_is_not_memoised(monkeypatch):
+    """A memoised absence would outlive the claim that fixes it.
+
+    A warm-pool child resolves before its pidfile exists, so the first answer
+    is legitimately empty; memoising it would leave the process unable to name
+    its session for as long as it lives. The same holds for a co-tenant
+    refusal, which must be re-read -- and re-reported -- rather than frozen.
+    """
+    monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
+    monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+    monkeypatch.delenv("KIROCREW_STUB_SESSION_TOKEN", raising=False)
+    monkeypatch.setattr(kiro_crew.mcp_caller, "_FROM_ENV_CACHE", None)
+
+    answers = iter([kiro_crew.mcp_caller.OwnIdentity(), None])
+
+    def _walk():
+        nxt = next(answers, None)
+        if nxt is not None:
+            return nxt
+        return kiro_crew.mcp_caller.OwnIdentity(
+            session_key="dashboard:chat-claimed",
+            source=kiro_crew.mcp_caller.SOURCE_PIDFILE,
+        )
+
+    monkeypatch.setattr(kiro_crew.mcp_caller, "_identity_from_pid_mapping", _walk)
+    assert CallerContext.from_env().session_key == ""
+    assert kiro_crew.mcp_caller._FROM_ENV_CACHE is None
+    # The pidfile has since appeared: the second call must see it.
+    assert CallerContext.from_env().session_key == "dashboard:chat-claimed"
+    assert kiro_crew.mcp_caller._FROM_ENV_CACHE is not None
+
+
+def test_a_refusing_protected_record_never_reaches_the_memo(monkeypatch):
+    """Rung 1's refusal is an EMPTY key, so emptiness cannot mean "keep going".
+
+    A record that exists and is invalid must stop the ladder: every rung below
+    it -- a token, an env var, a pid mapping -- is writable by the same uid the
+    binding exists to fence. The memo sits below all of them, so reading the
+    refusal as an absence would answer a fenced process from a cached identity.
+    """
+    monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
+    monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+    monkeypatch.delenv("KIROCREW_STUB_SESSION_TOKEN", raising=False)
+    monkeypatch.setattr(
+        kiro_crew.mcp_caller,
+        "_FROM_ENV_CACHE",
+        CallerContext(session_key="someone-elses-session"),
+    )
+    monkeypatch.setattr(
+        "kiro_crew.member_memory_auth.protected_member_session_for_pid",
+        lambda _pid: "",
+    )
+    ctx = CallerContext.from_env()
+    assert ctx.session_key == ""
+    assert ctx.session_type == kiro_crew.mcp_caller.SOURCE_PROTECTED
+
+
+def test_the_memo_never_shadows_a_session_scoped_rung(monkeypatch):
+    """The ordering, not the key, is what keeps a rekey visible.
+
+    A memo consulted in front of the token would answer for the life of the
+    process, and no key can rescue that: a rekey rewrites the token's mapping
+    while the token STRING survives, so every value this process can read is
+    byte-identical before and after. On a runtime hosting several sessions that
+    is how the first co-tenant to resolve becomes every later caller's answer,
+    so the memo is reached only once rungs 1-3 have declined.
+    """
+    monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+    monkeypatch.delenv("KIROCREW_STUB_SESSION_TOKEN", raising=False)
+    monkeypatch.setattr(
+        kiro_crew.mcp_caller,
+        "_FROM_ENV_CACHE",
+        CallerContext(session_key="stale-co-tenant"),
+    )
+    monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:chat-mine")
+    ctx = CallerContext.from_env()
+    assert ctx.session_key == "dashboard:chat-mine"
+    assert ctx.session_type == kiro_crew.mcp_caller.SOURCE_ENV
+    # A session-scoped answer is not written back either: the next call must
+    # re-read the rung rather than inherit this one.
+    assert kiro_crew.mcp_caller._FROM_ENV_CACHE.session_key == "stale-co-tenant"
 
 
 def test_caller_round_trip_needs_no_member_capability():
@@ -131,6 +225,116 @@ def test_from_env_host_pid_missing_file_falls_back_to_walk(tmp_path, monkeypatch
         with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
             ctx = CallerContext.from_env()
     assert ctx.session_key == "walk-session-111"
+
+
+# --- Only an ANSWER stops the walk ------------------------------------------
+#
+# ``session_pid_<pid>.txt`` lives in the same-uid, agent-writable config dir, so
+# any local process can plant one at a NEARER ancestor pid. If an unparseable or
+# proven-stale file stopped the walk there, the caller would end up with no
+# session key -- and ``tools/call`` does not refuse on that (``no_session_key``
+# is not in ``mcp_shared._UNRESOLVED_REFUSES_CALL``), so the operator's tool
+# exclusions would go unenforced for a call the full walk resolves and enforces.
+# These pin that only a named key and a CO-TENANT refusal (a real answer about
+# this pid) stop it.
+
+_MALFORMED_BODY = "planted-key\nplain-one\nplain-two"  # two plain lines -> refused parse
+
+
+def test_a_malformed_nearer_mapping_does_not_stop_the_walk(tmp_path, monkeypatch) -> None:
+    """HEADLINE: a planted unparseable file at the host pid must not strand the
+    walk short of the ancestor holding the real mapping."""
+    monkeypatch.setattr(kiro_crew.mcp_caller, "_FROM_ENV_CACHE", None)
+    (tmp_path / "session_pid_987654.txt").write_text(_MALFORMED_BODY, encoding="utf-8")
+    real = tmp_path / f"session_pid_{os.getppid()}.txt"
+    real.write_text("real-ancestor-session", encoding="utf-8")
+
+    with mock.patch.dict(
+        os.environ,
+        {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": "987654"},
+        clear=False,
+    ):
+        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+            ctx = CallerContext.from_env()
+    assert ctx.session_key == "real-ancestor-session"
+
+
+def test_a_malformed_mapping_mid_chain_does_not_stop_the_walk(tmp_path, monkeypatch) -> None:
+    """Same rule at the WALK site: the planted file sits on the immediate
+    parent, the real mapping one hop further up."""
+    monkeypatch.setattr(kiro_crew.mcp_caller, "_FROM_ENV_CACHE", None)
+    nearer, further = os.getppid(), 424242
+    (tmp_path / f"session_pid_{nearer}.txt").write_text(_MALFORMED_BODY, encoding="utf-8")
+    (tmp_path / f"session_pid_{further}.txt").write_text("further-session", encoding="utf-8")
+
+    with mock.patch.dict(
+        os.environ,
+        {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": ""},
+        clear=False,
+    ):
+        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+            with mock.patch.object(
+                kiro_crew.mcp_caller, "_parent_pid", side_effect=lambda p: further
+            ):
+                ctx = CallerContext.from_env()
+    assert ctx.session_key == "further-session"
+
+
+def test_a_recycled_mapping_does_not_stop_the_walk(tmp_path, monkeypatch) -> None:
+    """The same stop fired on a proven recycle, which needs no planting at all:
+    the sweep deliberately leaves a stale file on disk for every live recycled
+    pid, so a legitimate tree would strand on its own housekeeping."""
+    monkeypatch.setattr(kiro_crew.mcp_caller, "_FROM_ENV_CACHE", None)
+    from kiro_crew import platform_compat
+
+    nearer, further = os.getppid(), 424242
+    # A recorded token that cannot match the live one -> REFUSAL_RECYCLED.
+    (tmp_path / f"session_pid_{nearer}.txt").write_text(
+        "previous-owner-session\nrecorded-token-aaa", encoding="utf-8"
+    )
+    (tmp_path / f"session_pid_{further}.txt").write_text("further-session", encoding="utf-8")
+
+    with mock.patch.dict(
+        os.environ,
+        {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": ""},
+        clear=False,
+    ):
+        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+            with mock.patch.object(
+                platform_compat, "get_process_start_id", return_value="live-token-bbb"
+            ):
+                with mock.patch.object(
+                    kiro_crew.mcp_caller, "_parent_pid", side_effect=lambda p: further
+                ):
+                    ctx = CallerContext.from_env()
+    assert ctx.session_key == "further-session"
+
+
+def test_a_co_tenant_refusal_still_stops_the_walk(tmp_path, monkeypatch) -> None:
+    """The converse, so the narrowing cannot be widened into "walk past
+    everything": a co-tenant refusal IS this pid's answer. Walking past it
+    would reach a different process's mapping and name one of ITS sessions --
+    the misattribution the tenant section exists to make visible."""
+    monkeypatch.setattr(kiro_crew.mcp_caller, "_FROM_ENV_CACHE", None)
+    nearer, further = os.getppid(), 424242
+    (tmp_path / f"session_pid_{nearer}.txt").write_text(
+        "first-tenant\ntenants=2\ntenant=first-tenant\ntenant=second-tenant",
+        encoding="utf-8",
+    )
+    (tmp_path / f"session_pid_{further}.txt").write_text("further-session", encoding="utf-8")
+
+    with mock.patch.dict(
+        os.environ,
+        {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": ""},
+        clear=False,
+    ):
+        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+            with mock.patch.object(
+                kiro_crew.mcp_caller, "_parent_pid", side_effect=lambda p: further
+            ):
+                ctx = CallerContext.from_env()
+    assert ctx.session_key == ""
+    assert ctx.session_key != "further-session"
 
 
 # --- Per-connection tenant nonce --------------------------------------------

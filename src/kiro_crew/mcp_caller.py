@@ -71,8 +71,10 @@ any future KiroCrew-owned MCP server must go through this module.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
+import threading
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -80,6 +82,8 @@ from typing import Any, Mapping
 
 from kiro_crew import platform_compat
 from kiro_crew.session_token_sig import session_key_from_env_token
+
+logger = logging.getLogger(__name__)
 
 # --- Protocol identifiers ---------------------------------------------------
 
@@ -146,14 +150,45 @@ _TENANT_NONCE_BYTES = 8
 #: code on the handshake path.
 POOLING_REQUIRES_TENANT_NONCE: frozenset[str] = frozenset({"kirocrew-computer"})
 
-#: Process-lifetime cache of a RESOLVED ``from_env()`` identity. The env var
-#: and ancestor pidfile chain are immutable once present, so the walk need run
-#: at most once. The walk does not fork ``ps`` per ancestor (``_parent_pid``
-#: delegates to ``platform_compat.get_ppid``), but it is still a chain of file
-#: reads or syscalls on a hot path. Only a non-empty result is cached, so a
-#: warm-pool session claimed after the first call can still resolve once its
-#: pidfile appears (see ``from_env``).
+#: Process-lifetime cache of a resolved PER-PROCESS ``from_env()`` identity —
+#: the env var and the pid mapping only. The pidfile chain is immutable once
+#: present, so that walk need run at most once, and it is a chain of file reads
+#: or syscalls on a hot path (``_parent_pid`` delegates to
+#: ``platform_compat.get_ppid``, so no ``ps`` fork per ancestor).
+#:
+#: The two rungs ABOVE it are deliberately excluded, and no cache key can
+#: substitute for excluding them. A per-session token is rekeyed by rewriting
+#: the mapping body while the token STRING survives, so every value derived
+#: from the environment is byte-identical across the rekey a cache must notice;
+#: keying on the token would therefore serve the pre-rekey session key for the
+#: life of the process, which is the cross-session misattribution this module
+#: exists to prevent. ``session_key_from_env_token`` states the same rule from
+#: its own side: never memoise that answer.
+#:
+#: Only a non-empty result is cached, so a warm-pool session claimed after the
+#: first call can still resolve once its pidfile appears (see ``from_env``).
 _FROM_ENV_CACHE: "CallerContext | None" = None
+
+#: Session sources, in ladder order. ``source`` doubles as
+#: ``CallerContext.session_type``, so these strings are wire-visible.
+SOURCE_PROTECTED = "protected-pid"
+SOURCE_TOKEN = "token"
+SOURCE_ENV = "env"
+SOURCE_PIDFILE = "pidfile"
+
+#: The ``skip_pid_mapping`` sentinel: rungs 1-3 neither answered nor refused.
+#: It is a SOURCE rather than an empty key because rung 1's refusal is itself an
+#: empty key, so emptiness cannot tell "no private binding" from "a binding that
+#: exists and is invalid" — and the second must never fall through to a weaker
+#: source. Never reaches the wire: the only caller replaces it with rung 4's
+#: answer.
+SOURCE_UNRESOLVED = "unresolved"
+
+#: Co-tenant refusals already reported, so a resolver on a hot path (the
+#: recaller poll does not terminate while the key is unresolved) logs the
+#: operator-facing line once per pid per process rather than per call.
+_reported_co_tenancy: set[int] = set()
+_report_lock = threading.Lock()
 
 
 def _parent_pid(pid: int) -> int:
@@ -176,6 +211,222 @@ def _parent_pid(pid: int) -> int:
     """
     ppid = platform_compat.get_ppid(pid)
     return ppid if ppid > 0 else 0
+
+
+# --- The one client-side identity ladder ------------------------------------
+
+
+@dataclass(frozen=True)
+class OwnIdentity:
+    """This process's own session identity, and where it came from.
+
+    ``session_key`` is empty when nothing could name the session.
+    ``source`` names the rung that answered and is what ``CallerContext``
+    reports as ``session_type``. ``failed`` marks the resolution MACHINERY
+    breaking rather than simply finding nothing — a distinction the
+    managed-tool-policy lookup turns into different answers for its caller.
+
+    A pid mapping's own reason for declining is deliberately NOT carried here.
+    It has no consumer: the one action it would drive, the operator-facing
+    co-tenancy warning, is logged where the reason is read, so re-exporting it
+    would be a field every caller ignores.
+    """
+
+    session_key: str = ""
+    source: str = SOURCE_ENV
+    failed: bool = False
+
+
+def resolve_own_identity(
+    *, consult_protected_binding: bool = True, skip_pid_mapping: bool = False
+) -> OwnIdentity:
+    """Resolve the session THIS process belongs to, from its own environment.
+
+    The single client-side ladder. Every client-side consumer shares it —
+    ``mcp_core``'s lenient path, the managed-tool-policy lookup in
+    ``mcp_shared``, and the stub's register block through this module — so the
+    rungs and their order cannot drift between them, and a change to the process
+    tree (a pid namespace, a runtime hosting several sessions) is modelled once
+    rather than in per-file mocks that each encode their author's assumptions.
+
+    Rungs, strongest first. The order is load-bearing, not arbitrary:
+
+    1. The protected member binding for this process, when the caller asks for
+       it. ``None`` means no private binding; an EMPTY string means a record
+       that exists and is invalid, which is a REFUSAL rather than an absence and
+       must never fall through to a token, an env var or a pid file — each is
+       writable by the same uid the binding exists to fence.
+    2. The signed per-SESSION token on this process's own element. Above the env
+       var because a warm-pool rekey makes the env stale, and per SESSION where
+       every rung below answers per PROCESS.
+    3. ``KIROCREW_SESSION_KEY``.
+    4. The ``session_pid_<pid>.txt`` mapping, by the launcher-exported
+       ``KIROCREW_HOST_PID`` and then by ancestor walk.
+
+    Rung 4 is the one that cannot express the tree it reads. A pid names a
+    PROCESS, and one kiro-cli process hosts many ACP sessions, so on a shared
+    runtime the mapping holds one of several keys and the walk SUCCEEDS with
+    whichever session published last. That is why the mapping records its
+    tenant set and why this refuses instead of answering there: a wrong name is
+    worse than no name, because the caller cannot tell it is wrong. Callers
+    that reach rung 4 at all get a warning, since a per-process answer for a
+    per-session question is a degraded result even when it is right.
+
+    ``skip_pid_mapping`` stops after rung 3 and reports an absence instead of
+    walking. It exists so a caller may place a process-lifetime memo UNDER the
+    session-scoped rungs: rung 4 is both the only expensive rung and the only
+    one whose answer is stable for the life of the process, so it is the only
+    one worth memoising — and a memo in FRONT of rung 2 would outlive the rekey
+    rung 2 exists to observe, since a rekey rewrites the token's mapping while
+    the token string itself survives. The absence is reported as
+    :data:`SOURCE_UNRESOLVED`, NOT as an empty key: rung 1's refusal is an empty
+    key as well, and a caller that read emptiness as "keep going" would fall
+    through the one rung that must never be fallen through.
+
+    Never raises: an identity source that can raise turns a resolvable session
+    into a crashed tool call.
+    """
+    try:
+        if consult_protected_binding:
+            # This is an ordinary MCP identity extension only. Memory V2 does
+            # not use PID ancestry, namespaces, or proof records to authorize a
+            # store.
+            try:
+                from kiro_crew.member_memory_auth import protected_member_session_for_pid
+
+                protected = protected_member_session_for_pid(os.getpid())
+            except Exception:
+                # A probe that RAISED is the machinery breaking, not a verdict.
+                # It still stops the ladder rather than falling through to a
+                # weaker source, because the record it could not read may be
+                # the refusal in rung 1.
+                return OwnIdentity(source=SOURCE_PROTECTED, failed=True)
+            if protected is not None:
+                return OwnIdentity(session_key=protected, source=SOURCE_PROTECTED)
+        try:
+            from_token = session_key_from_env_token()
+        except Exception:
+            from_token = ""
+        if from_token:
+            return OwnIdentity(session_key=from_token, source=SOURCE_TOKEN)
+        env_key = os.environ.get("KIROCREW_SESSION_KEY", "")
+        if env_key:
+            return OwnIdentity(session_key=env_key, source=SOURCE_ENV)
+        if skip_pid_mapping:
+            return OwnIdentity(source=SOURCE_UNRESOLVED)
+        return _identity_from_pid_mapping()
+    except Exception:
+        return OwnIdentity(failed=True)
+
+
+def _identity_from_pid_mapping() -> OwnIdentity:
+    """Rung 4: the gateway-published pid mapping, by host pid then by ancestry.
+
+    Reads go through ``session_pid_sig``'s hardened reader (symlink refusal,
+    regular-file check, size bound) — the same read discipline as the strict
+    verifier, minus the signature requirement.
+
+    The sandbox launcher exports its own HOST pid, the exact pid the gateway
+    keys mappings by, so that direct lookup is tried first: it works even when
+    this process's ``/proc`` view of pids diverges from the host's
+    (PID-namespace sandboxing), where the ancestor walk can never match.
+
+    The walk covers the FULL chain rather than ``os.getppid()`` alone: the tree
+    can be gateway -> kiro-cli (has the mapping) -> kiro-cli-chat (forked child)
+    -> MCP server, so the immediate parent usually has no mapping. It stops at
+    the first ancestor whose mapping ANSWERS — see :func:`_mapping_answers` —
+    and walks past one that does not, because only an answer is specific to
+    this process: a co-tenant refusal names this pid's own sessions, while a
+    malformed or recycled file names nobody and would strand the walk short of
+    the ancestor holding the real mapping.
+    """
+    # circular import: config.loader imports mcp_caller top-level for
+    # CallerContext typing; we can only reach config_dir here.
+    from kiro_crew.config.loader import config_dir
+    from kiro_crew.session_pid_sig import read_session_pid_mapping
+
+    cfg_dir = config_dir()
+    host_pid = os.environ.get("KIROCREW_HOST_PID", "")
+    if host_pid.isdigit():
+        mapping = read_session_pid_mapping(host_pid, cfg_dir)
+        if _mapping_answers(mapping):
+            return _identity_from_mapping(int(host_pid), mapping)
+    pid = os.getppid()
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        mapping = read_session_pid_mapping(pid, cfg_dir)
+        if _mapping_answers(mapping):
+            return _identity_from_mapping(pid, mapping)
+        pid = _parent_pid(pid)
+    return OwnIdentity()
+
+
+def _mapping_answers(mapping: Any) -> bool:
+    """True when this pid's mapping answers the identity question AT ALL.
+
+    Only two mappings do: one naming a session, and a co-tenant refusal, which
+    is a real answer about THIS pid ("several sessions live here, so no single
+    key names you") and must stop the walk rather than let it reach a different
+    process's mapping.
+
+    The other refusals answer nothing and MUST NOT stop it. ``.txt`` lives in
+    the same-uid, agent-writable config dir, so any process could otherwise
+    plant a two-line file at a nearer ancestor pid, halt the walk short of the
+    kiro-cli ancestor that holds the real mapping, and leave the caller with no
+    session key — which ``tools/call`` does not refuse on, so the operator's
+    tool exclusions would go unenforced for a call the full walk resolves and
+    enforces. ``REFUSAL_RECYCLED`` is the same shape without the planting: the
+    sweep deliberately leaves a stale file on disk for every live recycled pid.
+    """
+    from kiro_crew.session_pid_sig import REFUSAL_CO_TENANT
+
+    return bool(mapping.session_key) or mapping.refusal == REFUSAL_CO_TENANT
+
+
+def _identity_from_mapping(pid: int, mapping: Any) -> OwnIdentity:
+    """Turn one pid mapping into an identity, reporting what it cost.
+
+    A named session is a DEGRADED answer even when correct — the mapping
+    answers per process for a per-session question — so reaching it at all is
+    worth a debug line naming the pid. A co-tenant refusal is worth an operator
+    line: the element resolving here has no per-session token, which is a
+    configuration fact (a ``fallback_exec``'d third-party backend, a
+    caller-supplied ``mcpServers`` array) rather than a transient one, and
+    without the reason an operator sees only a tool that lost its session.
+    """
+    from kiro_crew.session_pid_sig import REFUSAL_CO_TENANT
+
+    if mapping.session_key:
+        logger.debug(
+            "session identity resolved from the pid mapping for %d; this names the "
+            "PROCESS, so it is correct only while that process hosts one session",
+            pid,
+        )
+        return OwnIdentity(session_key=mapping.session_key, source=SOURCE_PIDFILE)
+    if mapping.refusal == REFUSAL_CO_TENANT:
+        _report_co_tenancy(pid, mapping.tenant_count)
+    return OwnIdentity(source=SOURCE_PIDFILE)
+
+
+def _report_co_tenancy(pid: int, tenants: int) -> None:
+    """Report a co-tenant refusal once per pid per process."""
+    with _report_lock:
+        first = pid not in _reported_co_tenancy
+        _reported_co_tenancy.add(pid)
+    if not first:
+        logger.debug("pid %d still names %d sessions; identity still refused", pid, tenants)
+        return
+    logger.warning(
+        "refusing to resolve a session identity from the pid mapping for %d: that "
+        "process hosts %d ACP sessions, so the mapping names a co-tenant rather "
+        "than this caller. This element carries no per-session token, which is "
+        "what distinguishes sessions on a shared runtime. Tools needing an "
+        "identity are refused here rather than attributed to another session. "
+        "Repeat occurrences log at debug.",
+        pid,
+        tenants,
+    )
 
 
 # --- Typed context ----------------------------------------------------------
@@ -268,87 +519,50 @@ class CallerContext:
         extension. Returns a context with ``from_gateway=False``; tool
         handlers can log or sample this to detect topology regressions.
 
-        Fallback order:
-          1. The signed per-session token on this process's own element
-          2. Cached identity or ``KIROCREW_SESSION_KEY`` env var
-          3. ``config_dir() / session_pid_{parent_pid}.txt`` (warm-pool mode,
-             where kiro-cli is pre-spawned with no key and rekey()+PID file
-             provides the mapping once the session is claimed)
+        The ladder itself is :func:`resolve_own_identity`, shared with every
+        other client-side resolver so the rungs and their order cannot drift
+        between them. This adds only the process-lifetime cache, and the cache
+        is BELOW every session-scoped rung: the ladder is asked for rungs 1-3
+        first, and the cache is reached only once they decline. That ordering,
+        not the cache's key, is what keeps a warm-pool rekey visible — a rekey
+        rewrites the token's mapping while the token STRING survives, so no
+        value this process can read changes, and any cache consulted in front
+        of the token would keep answering the pre-rekey session for the life of
+        the process.
 
-        When neither source provides a key, returns an empty-key context.
+        When no source provides a key, returns an empty-key context.
         Downstream code decides whether to reject (pooled backends should)
         or fall through (session-key-agnostic tools).
         """
         global _FROM_ENV_CACHE
-        # Keep the ordinary host identity extension ahead of token and ambient
-        # fallbacks.  This hook is not a Memory V2 capability: the simplified
-        # memory contract never grants database access from PID ancestry.
-        try:
-            from kiro_crew.member_memory_auth import protected_member_session_for_pid
-
-            protected = protected_member_session_for_pid(os.getpid())
-        except Exception:
-            protected = ""
-        if protected is not None:
-            return cls(session_key=protected, session_type="protected-pid", from_gateway=False)
-        # The signed per-session token is a shared execution identity source,
-        # not a member-memory capability. Read it before the process-lifetime
-        # cache so warm-pool rekeys and session-sharing claims remain visible.
-        try:
-            from_token = session_key_from_env_token()
-        except Exception:
-            from_token = ""
-        if from_token:
-            return cls(session_key=from_token, session_type="token", from_gateway=False)
-        if _FROM_ENV_CACHE is not None:
-            return _FROM_ENV_CACHE
-        sk = os.environ.get("KIROCREW_SESSION_KEY", "")
-        source = "env"
-        if not sk:
-            try:
-                # circular import: config.loader imports mcp_caller top-level
-                # for CallerContext typing; we can only reach config_dir here.
-                from kiro_crew.config.loader import config_dir
-                from kiro_crew.session_pid_sig import read_session_pid_txt
-
-                # Walk the FULL ancestor chain, not
-                # just os.getppid(). The tree can be gateway -> kiro-cli (has
-                # the session_pid file) -> kiro-cli-chat (forked child) -> MCP
-                # server, so the immediate parent usually has no PID file.
-                # Mirrors mcp_core._resolve_session_key; a single-parent check
-                # silently loses caller identity in deep process trees.
-                cfg_dir = config_dir()
-                # Sandbox launcher exports its own HOST pid — the exact pid
-                # the gateway keys session_pid files by. Checking it directly
-                # works even when this process's /proc view of pids diverges
-                # from the host's (PID-namespace sandboxing), where the
-                # ancestor walk below can never match.
-                # Reads go through session_pid_sig's hardened reader (symlink
-                # refusal, regular-file check, size bound) — same read
-                # discipline as the strict verifier, minus the signature
-                # requirement.
-                host_pid = os.environ.get("KIROCREW_HOST_PID", "")
-                if host_pid.isdigit():
-                    sk = read_session_pid_txt(host_pid, cfg_dir)
-                    if sk:
-                        source = "pidfile"
-                if not sk:
-                    pid = os.getppid()
-                    seen: set[int] = set()
-                    while pid > 1 and pid not in seen:
-                        seen.add(pid)
-                        sk = read_session_pid_txt(pid, cfg_dir)
-                        if sk:
-                            source = "pidfile"
-                            break
-                        pid = _parent_pid(pid)
-            except Exception:
-                pass
-        result = cls(session_key=sk, session_type=source, from_gateway=False)
-        if sk:
-            # Cache only a RESOLVED identity: an empty result is left uncached
+        session_scoped = resolve_own_identity(skip_pid_mapping=True)
+        if session_scoped.source != SOURCE_UNRESOLVED:
+            # Rungs 1-3 ANSWERED, or rung 1 refused. Both are session-scoped
+            # and neither is memoised. The test is the source rather than the
+            # key, because rung 1's refusal is an empty key too and must stop
+            # here rather than fall through to the pid mapping.
+            return cls(
+                session_key=session_scoped.session_key,
+                session_type=session_scoped.source,
+                from_gateway=False,
+            )
+        cached = _FROM_ENV_CACHE
+        if cached is not None:
+            return cached
+        identity = _identity_from_pid_mapping()
+        result = cls(
+            session_key=identity.session_key,
+            session_type=identity.source,
+            from_gateway=False,
+        )
+        if identity.session_key:
+            # Cache only a RESOLVED identity. An empty answer is left uncached
             # so a warm-pool session claimed after the first call can still
-            # resolve once its pidfile appears.
+            # resolve once its pidfile appears, and so a co-tenant REFUSAL is
+            # re-read -- and re-reported -- rather than frozen for the life of
+            # the process. Rung 4 is the only rung that reaches here, so what
+            # keeps a session-scoped answer out of the memo is the ordering
+            # above, not a test on this value.
             _FROM_ENV_CACHE = result
         return result
 

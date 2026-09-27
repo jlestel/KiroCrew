@@ -81,8 +81,9 @@ from kiro_crew.dashboard.token_secret import (  # noqa: F401  # re-exports
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self, get_peer_pid
 from kiro_crew.messaging.link import is_channel_session_key
-from kiro_crew.peer_resolve import resolve_peer_identity
+from kiro_crew.peer_resolve import resolve_peer_tenancy
 from kiro_crew.sel import sel as _sel_fn
+from kiro_crew.session_token_sig import verify_session_token
 
 
 def internal_path_matches(path: str, entries: Iterable[str]) -> bool:
@@ -1742,15 +1743,35 @@ async def _verify_unix_peer(
     * peer uid positively ≠ ours (``MISMATCH``) → deny. Cannot normally
       happen (the socket sits in the 0700 data home), so a hit means the
       directory gate failed — exactly when denying matters most.
-    * peer resolved to a session key that DIFFERS from the declared header →
+    * the declared key is one of the sessions the peer's process is attested to
+      host → proceed with ``request["peer_verified"] = True``. On a 1:1 runtime
+      that is the pid's single mapped key, and the kernel's process attestation
+      settles it: one session lives there, so there is no other identity the
+      caller could be mistaken for.
+    * on a SHARED runtime the pid names several sessions, and membership is
+      necessary but NOT sufficient. The mapping's MAC stops an agent ADDING
+      itself to a pid's membership, but every co-tenant can READ the list, so
+      one of them could declare a sibling's recorded key — and the key admitted
+      here is what ``derive_caller_app`` derives app confinement from. So a
+      shared pid additionally requires an ``X-Session-Token`` that verifies to
+      the declared key: it is MAC'd under the agent-unreadable SEL trust root,
+      names ONE session, and every caller that declares a key already sends it.
+      Admitted here the call is SEL-recorded rather than debug-logged, because
+      this is the arm where a cross-session declaration would have landed.
+      The token is required on EVERY shared-pid arm, including the one whose
+      roster the mapping file's size bound truncated: truncation is a normal
+      publisher outcome, so a roster short of the declared key withholds
+      membership evidence without withdrawing the demand for attestation.
+    * the peer's full membership is known and the declared key is NOT in it →
       deny 403 + SEL ``dashboard.peer-identity-mismatch`` (the impersonation
       this check exists to close: a same-uid process declaring another
       session's identity).
-    * peer resolved to the SAME key → proceed with
-      ``request["peer_verified"] = True``.
-    * anything unresolvable (no peer pid mechanism, no ``session_pid_<pid>``
-      file in the ancestry — warm-pool runtimes before claim, cron scripts,
-      pooled MCP backends) → proceed under today's semantics: no new denial.
+    * anything that leaves the pid's tenancy unknown ALTOGETHER → proceed under
+      today's semantics: no new denial. No peer pid mechanism, no
+      ``session_pid_<pid>`` file in the ancestry (warm-pool runtimes before
+      claim, cron scripts, pooled MCP backends), or a pid proven recycled.
+      A truncated roster is NOT one of these: it carries positive evidence of
+      sharing, so it takes the token arm above.
 
     Returns a deny response, or ``None`` to proceed. The /proc ancestry walk
     is blocking I/O and runs on the subprocess executor (mirroring gatewayd's
@@ -1792,26 +1813,101 @@ async def _verify_unix_peer(
         # signed_only: authorization decisions must not trust the bare
         # same-uid-writable .txt mapping — require the HMAC sidecar (pid
         # bound into the MAC, keyed by the agent-unreadable SEL trust root),
-        # or the walk yields "" and this check degrades to status quo.
-        peer_key, _chain = await asyncio.get_running_loop().run_in_executor(
+        # or the walk yields nothing and this check degrades to status quo.
+        # That covers the tenant list too: without the MAC an agent could add
+        # its declared key to a pid's membership and be admitted by it.
+        tenancy = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
-            partial(resolve_peer_identity, peer_pid, signed_only=True),
+            partial(resolve_peer_tenancy, peer_pid, signed_only=True),
         )
     except Exception:
         # Resolution machinery failing is an "unresolvable" outcome, not a
         # denial — the change must never be weaker OR stricter than intended.
         logger.debug("unix peer identity resolution failed", exc_info=True)
         return None
-    if not peer_key:
+
+    async def _attest_shared(shape: str) -> web.StreamResponse | None:
+        """Admit *declared* on a shared pid only against its per-session token.
+
+        The one place a shared-runtime declaration is decided, because every
+        arm that reaches a shared pid owes the same attestation: membership is
+        NECESSARY but not SUFFICIENT when the roster enumerates the key, and it
+        is not even available when the size bound truncated the roster. Both
+        arms hold the same two facts — the pid hosts several sessions, and the
+        kernel cannot say which one holds this socket — so both need the token,
+        which is MAC'd under the agent-unreadable SEL trust root and names ONE
+        session.
+
+        *shape* describes the roster the decision was made against and is
+        recorded on both outcomes, so an investigation can tell a declaration
+        checked against a full membership from one checked against a short one.
+
+        Returns a deny response, or ``None`` having marked the request verified.
+        """
+        attested = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(),
+            partial(verify_session_token, request.headers.get("X-Session-Token", "")),
+        )
+        if attested != declared:
+            _sel_fn().log_api_access(
+                caller=declared,
+                operation="dashboard.peer-identity-unattested",
+                outcome="denied",
+                source="token_auth",
+                resources=path,
+                error=(
+                    f"peer_pid={peer_pid} hosts {tenancy.tenant_count} sessions ({shape}); "
+                    "the declared X-Session-Key needs a per-session token naming it"
+                ),
+            )
+            _log_auth(
+                request,
+                "internal",
+                "denied",
+                f"co-tenant declaration unattested (peer_pid={peer_pid})",
+            )
+            return _deny(request, "Forbidden", "peer_session_unattested")
+        # Recorded, not debug-logged: this is the arm where a cross-session
+        # declaration would have succeeded, so it is the one an investigation
+        # needs a trail for. The 1:1 arm stays at debug because a pid hosting
+        # one session has no other identity to be mistaken for.
+        _sel_fn().log_api_access(
+            caller=declared,
+            operation="dashboard.peer-identity-co-tenant",
+            outcome="allowed",
+            source="token_auth",
+            resources=path,
+            error=shape,
+        )
+        request["peer_verified"] = True
         return None
-    if peer_key != declared:
+
+    if not tenancy.admits(declared):
+        if not tenancy.membership_complete:
+            if tenancy.shared:
+                # Two different unknowns reach this arm, and ``shared`` is the
+                # positive evidence that separates them. Here the pid IS known
+                # to host several sessions and only the roster is short, so the
+                # declared key's absence is not grounds to deny — but it is not
+                # licence to proceed on the caller's word either, which is the
+                # weakest point of the whole check: truncation is a normal
+                # publisher outcome under the size bound, so a caller that can
+                # overflow the roster would otherwise skip attestation
+                # altogether. The token does not depend on the roster, so it
+                # still decides.
+                return await _attest_shared("roster truncated by the size bound")
+            # Nothing resolved at all: no mapping in the ancestry, or one
+            # proven stale. Absence is not evidence, and there is no positive
+            # evidence of sharing to attest against, so this stays the
+            # unresolvable arm and today's semantics hold.
+            return None
         _sel_fn().log_api_access(
             caller=declared,
             operation="dashboard.peer-identity-mismatch",
             outcome="denied",
             source="token_auth",
             resources=path,
-            error=f"peer_pid={peer_pid} resolved session differs from declared X-Session-Key",
+            error=f"peer_pid={peer_pid} hosts no session matching the declared X-Session-Key",
         )
         _log_auth(
             request,
@@ -1820,6 +1916,19 @@ async def _verify_unix_peer(
             f"peer identity mismatch (peer_pid={peer_pid})",
         )
         return _deny(request, "Forbidden", "peer_session_mismatch")
+    if tenancy.shared:
+        # Membership is NECESSARY but not SUFFICIENT here. The tenant list is
+        # MAC-covered, so it cannot be forged — but it is published in a file
+        # the agent can READ, and every session on the pid shares that file, so
+        # one co-tenant can read a sibling's key and declare it. The kernel
+        # attests the PROCESS; on a shared runtime that does not pick out which
+        # of its sessions is speaking on this socket, and the key admitted here
+        # is the same one ``derive_caller_app`` derives app confinement from.
+        #
+        # On a 1:1 pid the mapping's single key already identifies the only
+        # possible speaker, so that path stays exactly as it was and needs no
+        # token.
+        return await _attest_shared("roster complete")
     # Positive kernel attestation. Debug-level on purpose — this fires on
     # every internal call from a claimed session; the SEL trail records the
     # deny arm, which is the permission decision that changes anything.

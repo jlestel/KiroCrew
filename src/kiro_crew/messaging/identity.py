@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 from typing import Any
 
 from kiro_crew.executors import governance_executor, maintenance_executor
@@ -32,6 +33,38 @@ from kiro_crew.session_pid_sig import publish_session_pid
 from kiro_crew.session_token_sig import publish_session_token
 
 logger = logging.getLogger(__name__)
+
+
+def _sessions_on_pid(sessions: Any, pid: int) -> list[str]:
+    """Every session key the manager currently reports on *pid*.
+
+    Read from ``SessionManager.runtime_pids()``, the one snapshot that already
+    pairs each live session with the pid of the runtime serving it (and appends
+    the manager-owned companion runtimes, which is where a parent's subagent
+    sessions live). Nothing here probes the OS.
+
+    Returns an empty list when the answer cannot be obtained, and the publisher
+    then records no tenant section — absence must read as UNKNOWN rather than as
+    "this pid hosts one session", or a manager that cannot answer would make
+    every reader confident about a pid it has no evidence for.
+    """
+    try:
+        rows = sessions.runtime_pids()
+    except Exception:
+        logger.debug("runtime_pids unavailable while publishing identity", exc_info=True)
+        return []
+    keys: list[str] = []
+    try:
+        for row in rows:
+            if row.get("pid") != pid:
+                continue
+            key = row.get("key")
+            if isinstance(key, str) and key and key not in keys:
+                keys.append(key)
+    except Exception:
+        logger.debug("runtime_pids snapshot unreadable", exc_info=True)
+        return []
+    return keys
 
 
 async def publish_turn_identity(sessions: Any, session_key: str) -> None:
@@ -52,13 +85,29 @@ async def publish_turn_identity(sessions: Any, session_key: str) -> None:
     stubs carrying a token nothing names — refused, not resolved from the shared
     process tree — and this is what re-binds it, bounding the outage to the turn
     it happened in.
+
+    The mapping also records WHICH sessions share the pid, because one kiro-cli
+    process hosts several ACP sessions — a ``spawn_run`` subagent on its
+    parent's runtime, a workflow pool worker — while the mapping names one.
+    Without that, a reader on such a pid resolves whichever session published
+    last, and a shared subagent's tool call is attributed to its parent. The
+    count comes from the session manager's own process-identity snapshot, so it
+    is the gateway's view of the runtime rather than anything a reader infers.
     """
     try:
         pid = sessions.get_pid(session_key)
         if isinstance(pid, int):
-            await asyncio.get_running_loop().run_in_executor(
-                maintenance_executor(), publish_session_pid, pid, session_key
+            co_tenants = _sessions_on_pid(sessions, pid)
+            # A pid hosting ONE session is published exactly as it is today,
+            # down to the call's own shape: same two positional arguments, same
+            # file bytes. The tenancy argument appears only for a pid that is
+            # genuinely shared, which is the only case whose record changes.
+            write = (
+                partial(publish_session_pid, pid, session_key, co_tenants=co_tenants)
+                if len(co_tenants) > 1
+                else partial(publish_session_pid, pid, session_key)
             )
+            await asyncio.get_running_loop().run_in_executor(maintenance_executor(), write)
     except Exception:
         logger.debug("publish_turn_identity failed for %s", session_key, exc_info=True)
     # ONE provider lookup for both steps below. Resolving it twice puts a second
