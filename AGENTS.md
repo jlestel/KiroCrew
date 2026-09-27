@@ -228,6 +228,14 @@ Types the PR-title gate in `code-review.yml` accepts: `feat`, `fix`, `docs`,
 `style`, `refactor`, `perf`, `test`, `chore`, `ci`, `build`, `revert`. **One
 logical change per commit**, and at most two commits per PR.
 
+### PR description
+
+`gh pr create --body` / `--body-file` bypasses the GitHub template, so build the
+body from `.github/PULL_REQUEST_TEMPLATE.md` yourself: keep every heading
+verbatim and fill in the `**Goal:**` line. PR Hygiene fails a body missing the
+required sections; check it before opening with
+`out="$(mktemp)"; PR_BODY="$(cat <file>)" GITHUB_OUTPUT="$out" bash .github/scripts/pr-description-check.sh; cat "$out"`.
+
 ### PR goal is frozen
 
 The `**Goal:**` line, `## Why it matters` and `## Not a goal` are written once,

@@ -450,10 +450,14 @@ jobs:
         run: |
           err() { printf '::%s::%s\n' error "$*"; }
           out="$(mktemp)"
-          PR_DRAFT=false GITHUB_OUTPUT="$out" bash .github/scripts/pr-description-check.sh
+          PR_DRAFT=false PR_CALLER=pr-hygiene GITHUB_OUTPUT="$out" bash .github/scripts/pr-description-check.sh
           if grep -qx 'conclusion=failure' "$out"; then
-            err "$(sed -n 's/^title=//p' "$out")"
-            sed -n '/^summary<<__FORK_PR_DESCRIPTION__$/,/^__FORK_PR_DESCRIPTION__$/p' "$out" | sed '1d;$d'
+            # The annotation names the missing parts AND the fix, because it
+            # is the line a coding agent reads first; the full steps go to the
+            # log and the job summary page.
+            err "$(sed -n 's/^annotation=//p' "$out")"
+            sed -n '/^summary<<__FORK_PR_DESCRIPTION__$/,/^__FORK_PR_DESCRIPTION__$/p' "$out" | sed '1d;$d' \
+              | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           echo "PR template sections present."

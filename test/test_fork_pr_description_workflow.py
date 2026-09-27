@@ -125,7 +125,9 @@ def _parse_outputs(path: Path) -> dict[str, str]:
     return result
 
 
-def _evaluate(tmp_path: Path, body: str, draft: bool) -> dict[str, str]:
+def _evaluate(
+    tmp_path: Path, body: str, draft: bool, extra_env: dict[str, str] | None = None
+) -> dict[str, str]:
     output = tmp_path / "github_output"
     output.write_text("", encoding="utf-8")
     env = dict(os.environ)
@@ -137,6 +139,8 @@ def _evaluate(tmp_path: Path, body: str, draft: bool) -> dict[str, str]:
             "GITHUB_REPOSITORY": "kirodotdev/KiroCrew",
         }
     )
+    env.pop("PR_CALLER", None)
+    env.update(extra_env or {})
     proc = subprocess.run(
         ["bash", str(SCRIPT)],
         cwd=tmp_path,
@@ -181,6 +185,81 @@ def test_an_empty_description_reports_every_required_section(tmp_path: Path) -> 
     assert "https://github.com/kirodotdev/KiroCrew/blob/main/.github/PULL_REQUEST_TEMPLATE.md" in (
         outputs["summary"]
     )
+
+
+def test_the_annotation_names_the_missing_parts_and_the_fix(tmp_path: Path) -> None:
+    """The error annotation is what a coding agent reads first, so it must
+    carry the missing parts and the repair, not just a count."""
+    body = COMPLETE_BODY.replace("## Not a goal", "## Scope")
+    outputs = _evaluate(tmp_path, body, False)
+    annotation = outputs["annotation"]
+    assert annotation.startswith("Missing from the PR description: ## Not a goal.")
+    assert ".github/PULL_REQUEST_TEMPLATE.md" in annotation
+    assert "headings kept verbatim" in annotation and "no push needed" in annotation
+    assert "How to fix it:" in outputs["summary"]
+    assert "gh pr edit <number> --body-file <file>" in outputs["summary"]
+
+
+def test_a_missing_goal_line_is_named_in_the_annotation(tmp_path: Path) -> None:
+    body = COMPLETE_BODY.replace("**Goal:** the thing works again.", "")
+    assert body != COMPLETE_BODY
+    outputs = _evaluate(tmp_path, body, False)
+    assert outputs["annotation"].startswith("Missing from the PR description: **Goal:** line.")
+
+
+def test_the_annotation_counts_a_section_and_the_goal_line_together(tmp_path: Path) -> None:
+    """A missing section plus a missing Goal line must not read as '1 missing'."""
+    body = COMPLETE_BODY.replace("**Goal:** the thing works again.", "").replace(
+        "## Tests", "## Testing"
+    )
+    annotation = _evaluate(tmp_path, body, False)["annotation"]
+    assert annotation.startswith("Missing from the PR description: ## Tests, **Goal:** line.")
+    assert "1 required" not in annotation
+
+
+def test_the_printed_self_check_recipe_uses_a_fresh_private_file(tmp_path: Path) -> None:
+    """The recipe is re-run in a fix loop: a reused output file would keep the
+    old failure next to the new success, and a fixed /tmp path can be a
+    symlink someone else planted. A fresh mktemp file per run avoids both."""
+    printed = _evaluate(tmp_path, "", False)["summary"]
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    for text in (printed, agents):
+        assert 'out="$(mktemp)"; PR_BODY=' in text
+        assert "/tmp/pr-check.out" not in text
+
+
+def test_a_passing_description_has_an_empty_annotation(tmp_path: Path) -> None:
+    outputs = _evaluate(tmp_path, COMPLETE_BODY, False)
+    assert outputs["annotation"] == ""
+
+
+def test_only_the_fork_caller_mentions_fork_approval(tmp_path: Path) -> None:
+    """PR Hygiene runs for every PR; telling a same-repo author that fork
+    approval resumes is noise that reads like an instruction."""
+    fork = _evaluate(tmp_path, "", False)
+    assert "fork workflow runs" in fork["summary"]
+    hygiene = _evaluate(tmp_path, "", False, {"PR_CALLER": "pr-hygiene"})
+    assert "fork workflow runs" not in hygiene["summary"]
+    assert "How to fix it:" in hygiene["summary"]
+
+
+def test_the_template_link_survives_without_a_repository(tmp_path: Path) -> None:
+    """The local self-check runs without GITHUB_REPOSITORY; `set -u` must not
+    abort it before the summary is written."""
+    output = tmp_path / "out"
+    output.write_text("", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "GITHUB_REPOSITORY"}
+    env.update({"PR_BODY": "", "GITHUB_OUTPUT": str(output)})
+    proc = subprocess.run(
+        ["bash", str(SCRIPT)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert "unbound variable" not in proc.stderr
+    assert "PULL_REQUEST_TEMPLATE.md" in _parse_outputs(output)["summary"]
 
 
 def test_one_missing_section_is_named_in_the_singular(tmp_path: Path) -> None:
@@ -592,6 +671,9 @@ def test_pr_hygiene_runs_the_same_rules_for_every_pr() -> None:
     step = next(s for s in steps if s.get("name") == "Require the PR template sections")
     assert "bash .github/scripts/pr-description-check.sh" in step["run"]
     assert "conclusion=failure" in step["run"] and "exit 1" in step["run"]
+    assert "PR_CALLER=pr-hygiene" in step["run"]
+    assert "^annotation=" in step["run"], "the error annotation must carry the fix"
+    assert "GITHUB_STEP_SUMMARY" in step["run"]
     assert "head.repo" not in str(step.get("if", "")), "must not be fork- or same-repo-only"
 
 

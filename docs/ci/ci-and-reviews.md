@@ -1360,7 +1360,10 @@ of the AUTOSDE rules; the semantic half is delegated to the line reviewers.
   can stay separable from the change it accompanies. It also runs
   `.github/scripts/pr-description-check.sh`, the same rules `fork-pr-description.yml`
   applies to forks: the template's required headings, `## Not a goal` included, and
-  a filled `**Goal:**` line under Problem / Motivation. All four checks are blocking.
+  a filled `**Goal:**` line under Problem / Motivation. On failure its error
+  annotation names the missing parts and the fix (rebuild from the template,
+  save the description, no push), and the step writes the full steps to the job
+  summary. All four checks are blocking.
 
 Separately, **`dependency-review.yml`** fails a PR that adds or changes a
 dependency whose license is off the curated allowlist in

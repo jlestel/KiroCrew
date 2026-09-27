@@ -7,9 +7,11 @@
 # fails on it, which blocks PR Readiness for every PR.
 #
 # Inputs (environment): PR_BODY (untrusted, read as data only), PR_DRAFT
-# ("true"/"false"), GITHUB_REPOSITORY, GITHUB_OUTPUT. Writes `conclusion`
-# (success | neutral | failure), `title` and a multiline `summary` to
-# $GITHUB_OUTPUT. The PR body is never interpolated into code: it is written to
+# ("true"/"false"), PR_CALLER ("fork-check" by default, "pr-hygiene" from
+# code-review.yml), GITHUB_REPOSITORY, GITHUB_OUTPUT. Writes `conclusion`
+# (success | neutral | failure), `title`, a one-line `annotation` (the
+# missing parts plus the fix, empty on success) and a multiline `summary`
+# to $GITHUB_OUTPUT. The PR body is never interpolated into code: it is written to
 # a file and read by awk.
 #
 # The rules:
@@ -158,12 +160,24 @@ else
   title="Description follows the PR template"
 fi
 
+# One line that carries the whole fix. An error annotation is what a coding
+# agent reads first (`gh`, the checks tab), so it names what is missing and
+# how to repair it, not only how many parts are gone.
+annotation=""
+if [ "$conclusion" = "failure" ]; then
+  parts=("${missing[@]+"${missing[@]}"}")
+  [ "$goal_missing" = "true" ] && parts+=("**Goal:** line")
+  list="$(printf '%s, ' "${parts[@]}")"
+  annotation="Missing from the PR description: ${list%, }. Fix: rebuild the description from .github/PULL_REQUEST_TEMPLATE.md with its headings kept verbatim, then save it; no push needed, this check re-runs on edit."
+fi
+
 {
   echo "conclusion=$conclusion"
   echo "title=$title"
+  echo "annotation=$annotation"
 } >> "$GITHUB_OUTPUT"
 
-template_url="https://github.com/${GITHUB_REPOSITORY}/blob/main/.github/PULL_REQUEST_TEMPLATE.md"
+template_url="https://github.com/${GITHUB_REPOSITORY:-kirodotdev/KiroCrew}/blob/main/.github/PULL_REQUEST_TEMPLATE.md"
 
 # Multiline output via a delimiter that cannot occur in the summary: nothing
 # from the body is echoed into it, only section names from the list above.
@@ -180,9 +194,21 @@ template_url="https://github.com/${GITHUB_REPOSITORY}/blob/main/.github/PULL_REQ
       echo "- a \`**Goal:** <one sentence>\` line under \`## Problem / Motivation\`"
     fi
     echo
-    echo "Add them and save the description — no push needed. This check"
-    echo "re-runs on edit, and automatic approval of fork workflow runs"
-    echo "resumes on the next cycle."
+    echo "How to fix it:"
+    echo
+    echo "1. Start from \`.github/PULL_REQUEST_TEMPLATE.md\`. Keep every"
+    echo "   heading line exactly as written and put your text under it."
+    echo "   Do not rename a heading or swap in your own (\`## Summary\`)."
+    echo "2. Save the description: edit it on the PR page, or run"
+    echo "   \`gh pr edit <number> --body-file <file>\`. No push is needed:"
+    echo "   this check re-runs when the description is edited."
+    echo "3. To check a body before saving it, run"
+    echo "   \`out=\"\$(mktemp)\"; PR_BODY=\"\$(cat <file>)\" GITHUB_OUTPUT=\"\$out\" bash .github/scripts/pr-description-check.sh; cat \"\$out\"\`."
+    if [ "${PR_CALLER:-fork-check}" = "fork-check" ]; then
+      echo
+      echo "Automatic approval of fork workflow runs resumes on the next"
+      echo "cycle after the fix."
+    fi
   fi
   if [ "${PR_DRAFT:-false}" = "true" ]; then
     echo
