@@ -57,7 +57,7 @@ const RELOAD_DEBOUNCE_MS = 400
  *    and no reload.
  *  * One EventSource per mounted surface, and each artifact popout is its own
  *    window with its own JS context. The gateway is HTTP/1.1, so popouts plus
- *    `MarkdownPanel` plus `/api/logs` share the browser's ~6-connections-per
+ *    `MarkdownPanel` share the browser's ~6-connections-per
  *    -origin budget — which is why nothing is watched unless the artifact is
  *    actually file-backed.
  */

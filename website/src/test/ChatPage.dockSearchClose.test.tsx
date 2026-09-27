@@ -16,7 +16,7 @@
  * props) with the find pane open and asserts the find input disappears and the
  * target panel appears.
  *
- * Uses the REAL usePanelState / useDiffPanel / useMessageSearch hooks so the
+ * Uses the REAL useMessageSearch hook so the
  * single-dock precedence + close-on-open wiring is exercised end to end.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -56,8 +56,8 @@ vi.mock('../components/DiffPanel', async () => {
 })
 
 // Everything else ChatPage pulls in that is irrelevant to dock/search wiring.
-// NOTE: usePanelState / useDiffPanel / useMessageSearch are intentionally NOT
-// mocked — the test exercises the real hooks. DetailPanel + SearchBar are also
+// NOTE: useMessageSearch is intentionally NOT
+// mocked — the test exercises the real hook. DetailPanel + SearchBar are also
 // real so the find pane and diff pane actually mount/unmount.
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
 // The real message list uses a custom virtualizer (useVirtualChat) driven by
