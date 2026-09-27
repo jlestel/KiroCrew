@@ -39,6 +39,7 @@ document.documentElement.setAttribute('data-theme', theme === 'light' ? 'kiro-li
 localStorage.setItem('mc-sidebar-lane', 'conductor')
 localStorage.setItem('mc-session-stale-collapse-ms', '0')
 localStorage.removeItem('mc-sidebar-conductor-expanded')
+localStorage.removeItem('mc-sidebar-conductor-collapsed')
 localStorage.setItem('mc-sidebar-width', '520')
 
 const MIN = 60_000

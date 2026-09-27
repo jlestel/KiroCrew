@@ -194,6 +194,9 @@ beforeEach(() => {
   // The stale collapse would fold settled rows behind an expander, which would make a
   // reverse assertion fail for a reason that has nothing to do with folder hiding.
   localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  // The conductor lane folds every crew shut by default, which would hide the nested
+  // child for the same unrelated reason. Open the one crew this fixture nests.
+  localStorage.setItem('mc-sidebar-conductor-expanded', JSON.stringify(['k-hidden-conductor']))
 })
 afterEach(() => vi.clearAllMocks())
 

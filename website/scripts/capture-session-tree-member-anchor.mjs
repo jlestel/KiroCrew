@@ -2,13 +2,15 @@
  * Screenshot harness, and behaviour check, for the conductor lane's CREATOR ANCHOR:
  * a crew whose conductor is a crew member, whose own thread the chat page never lists.
  *
- * Two frames over the same listed rows through the REAL `ChatSidebar`:
+ * Three frames over the same listed rows through the REAL `ChatSidebar`:
  *   before -- the store holds only the listed rows, which is what the lane saw before
  *             the fix: every worker at the top level wearing the "opened by a closed
  *             session" glyph, about a member that was open and dispatching.
  *   after  -- the store also holds the member's row (as it always did in the product;
  *             only `ChatPage`'s surface filter kept it from the sidebar). The lane
- *             borrows it as a dimmed anchor and every worker nests under it.
+ *             borrows it as a dimmed anchor, SHUT by default: one row with the worker
+ *             count and the subtree's needs-you badge on it.
+ *   opened -- one press on that anchor's chevron, and every worker nests under it.
  *
  * Serves the capture page from the DEV server (`/capture/session-tree-member-anchor.html`),
  * with every `/api/**` boot fixture answered by the shared stub.
@@ -97,21 +99,44 @@ console.log('after: ', await keys())
 const member = await rowOf(MEMBER)
 check('after: the member row is drawn as a top-level anchor', member?.depth === '0' && member?.anchor === 'true',
   `depth=${member?.depth} anchor=${member?.anchor}`)
-for (const w of WORKERS) {
-  const r = await rowOf(w)
-  check(`after: ${w} nests one level under the member`, r?.depth === '1', `depth=${r?.depth}`)
-}
+// Collapsed by default: the crew is ONE row carrying its worker count and the
+// subtree's badges, and no worker is on screen until the chevron is pressed.
+for (const w of WORKERS) check(`after: ${w} is behind the chevron by default`, !(await rowOf(w)))
+const count = await page.$eval(`[data-testid="conductor-child-count-${MEMBER}"]`, el => el.textContent)
+check('after: the shut anchor counts its workers', count === String(WORKERS.length), `count=${count}`)
+const needsYou = await page.$eval(`[data-testid="conductor-needs-you-${MEMBER}"]`, el => el.textContent).catch(() => null)
+check('after: the shut anchor carries the worker that needs you', needsYou === '1', `needsYou=${needsYou}`)
 check('after: no orphan glyph remains', (await orphanGlyphs()).length === 0, JSON.stringify(await orphanGlyphs()))
 const opacity = await page.$eval(`[data-slot-key="${MEMBER}"]`, el =>
   getComputedStyle(el.closest('[data-conductor-depth]')).opacity)
 check('after: the anchor is dimmed', opacity !== '1', `opacity=${opacity}`)
 const title = await page.$eval(`[data-session-row="${MEMBER}"]`, el => el.getAttribute('title') || '')
 check('after: the anchor says where it opens', /Members page/.test(title), title)
-await shot('after-member-anchor-nests-workers')
+await shot('after-member-anchor-collapsed-by-default')
 
-// The unrelated chat conductor beside it is unaffected in both frames.
+// ── opened: one press on the anchor's chevron shows the workers under it ─────
+await page.click(`[data-testid="conductor-chevron-${MEMBER}"]`)
+await page.waitForSelector('[data-slot-key="chat-2124"]')
+await page.waitForTimeout(400)
+console.log('opened:', await keys())
+for (const w of WORKERS) {
+  const r = await rowOf(w)
+  check(`opened: ${w} nests one level under the member`, r?.depth === '1', `depth=${r?.depth}`)
+}
+// The child count stays (it says how many the row opened, open or shut); the
+// subtree aggregate leaves, because the worker that needs you is now on screen.
+check('opened: the count stays with the row', !!(await page.$(`[data-testid="conductor-child-count-${MEMBER}"]`)))
+check('opened: the aggregate leaves with the fold', !(await page.$(`[data-testid="conductor-needs-you-${MEMBER}"]`)))
+await shot('after-member-anchor-opened-nests-workers')
+
+// The unrelated chat conductor beside it is unaffected in every frame: shut by
+// default with its one worker counted, and it nests that worker once opened.
+const pairCount = await page.$eval('[data-testid="conductor-child-count-chat-2134"]', el => el.textContent)
+check('control: the chat conductor is shut with its worker counted', pairCount === '1', `count=${pairCount}`)
+await page.click('[data-testid="conductor-chevron-chat-2134"]')
+await page.waitForSelector('[data-slot-key="chat-2135"]')
 const w1 = await rowOf('chat-2135')
-check('control: the chat-conductor pair still nests', w1?.depth === '1', `depth=${w1?.depth}`)
+check('control: the chat-conductor pair nests once opened', w1?.depth === '1', `depth=${w1?.depth}`)
 
 await browser.close()
 console.log(failed ? 'RESULT: FAIL' : 'RESULT: ok')

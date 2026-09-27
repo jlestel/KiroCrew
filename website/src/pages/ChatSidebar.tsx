@@ -2023,7 +2023,9 @@ const SessionRow = memo(function SessionRow({
         )}
         {conductor.childCount > 0 && (
           <span className="text-muted tabular-nums shrink-0"
-            title={i18nT('pages.chatSidebar.sessions_this_one_opened')}
+            role="img"
+            aria-label={i18nT('pages.chatSidebar.opened_sessions_count', { count: conductor.childCount })}
+            title={i18nT('pages.chatSidebar.opened_sessions_count', { count: conductor.childCount })}
             data-testid={`conductor-child-count-${rowIdentity}`}>{conductor.childCount}</span>
         )}
         {/* Each aggregate count carries the SAME glyph its children show on their own
@@ -2935,6 +2937,20 @@ const SessionRow = memo(function SessionRow({
                   title={i18nT('pages.chatSidebar.opens_here_runs_on_instance', { name: peerName || '' })}
                 />
               )}
+              {/* A row that opens on the Members page says so in TEXT, the way a
+                *  peer row wears its peer name above. The hover title alone would
+                *  leave a touch reader with an unexplained page jump. The text names
+                *  the DESTINATION ("Members page", with the leave-this-page glyph),
+                *  not the bare noun "Members", which in this product also means the
+                *  crew's participants and read as "people are in it" on a cold read. */}
+              {!peerId && onOpenElsewhere && (
+                <span
+                  className="shrink-0 inline-flex items-center gap-0.5 text-[10px] px-1 rounded bg-info-subtle text-info border border-info/40"
+                  data-testid="members-page-chip">
+                  <ExternalLink size={9} className="shrink-0" aria-hidden="true" />
+                  {i18nT('pages.chatSidebar.members_page_chip')}
+                </span>
+              )}
               {/* NO destination marker beside the agent name any more. It read
                 *  "· opens the astro dashboard", and it was there because the click
                 *  LEFT this session behind — it went to that crew's pane instead.
@@ -3350,12 +3366,13 @@ interface ConductorRowExtras {
   anchorOnly?: boolean
 }
 
-/** Which conductor rows the user has collapsed, as a JSON array of row keys. A row
- *  absent from it is OPEN, which is what makes the lane match the System page on a
- *  gateway the user has never touched this control on. */
-const CONDUCTOR_COLLAPSED_LS_KEY = 'mc-sidebar-conductor-collapsed'
+/** Which conductor rows the user has OPENED, as a JSON array of row keys. A row absent
+ *  from it is collapsed, which is what makes one crew read as one row: a conductor
+ *  with fourteen workers is a line with a count on it, not fifteen lines, until the
+ *  person asks for the workers. */
+const CONDUCTOR_EXPANDED_LS_KEY = 'mc-sidebar-conductor-expanded'
 /** The key the one above supersedes, kept only so it can be removed from storage. */
-const CONDUCTOR_SUPERSEDED_EXPANDED_LS_KEY = 'mc-sidebar-conductor-expanded'
+const CONDUCTOR_SUPERSEDED_COLLAPSED_LS_KEY = 'mc-sidebar-conductor-collapsed'
 
 /**
  * The persisted lane, migrating the boolean this replaced.
@@ -3372,32 +3389,33 @@ function readStoredLane(): SidebarLane {
   return localStorage.getItem(FLAT_VIEW_LS_KEY) === '1' ? 'flat' : 'tree'
 }
 
-/** The conductor rows the user has COLLAPSED, or an empty set when the value is
- *  unusable. Collapsed rather than expanded is what makes EXPANDED the default: the
- *  lane must show the tree the System page's Sessions tab shows, and a conductor this
- *  build has never seen has no entry here, so it renders open.
+/** The conductor rows the user has OPENED, or an empty set when the value is
+ *  unusable. Opened rather than collapsed is what makes COLLAPSED the default: a
+ *  conductor this build has never seen has no entry here, so it renders as one row
+ *  carrying its child count and its subtree's badges, and nothing under it is on
+ *  screen until the person asks.
  *
  *  The set this supersedes held the OPPOSITE sense, one row per conductor the user had
- *  opened, and there is no reading of it that produces this one: a row it names was
- *  open, which is now the default, and a row it omits was closed only if the user ever
- *  saw it. So it is dropped rather than converted -- left in place it would sit in
- *  storage for the life of the browser profile, meaning nothing to any build. */
-function readConductorCollapsed(): Set<string> {
+ *  closed, and there is no reading of it that produces this one: a row it names was
+ *  closed, which is now the default, and a row it omits was open only because nobody
+ *  had touched it. So it is dropped rather than converted -- left in place it would sit
+ *  in storage for the life of the browser profile, meaning nothing to any build. */
+function readConductorExpanded(): Set<string> {
   try {
-    localStorage.removeItem(CONDUCTOR_SUPERSEDED_EXPANDED_LS_KEY)
+    localStorage.removeItem(CONDUCTOR_SUPERSEDED_COLLAPSED_LS_KEY)
   } catch {
     // Storage that refuses a write still answers reads, so the fold state below is
     // worth reading; an undeletable stale key costs nothing but the bytes.
   }
   try {
-    const raw = localStorage.getItem(CONDUCTOR_COLLAPSED_LS_KEY)
+    const raw = localStorage.getItem(CONDUCTOR_EXPANDED_LS_KEY)
     if (!raw) return new Set()
     const parsed: unknown = JSON.parse(raw)
     if (!Array.isArray(parsed)) return new Set()
     return new Set(parsed.filter((k): k is string => typeof k === 'string' && k !== ''))
   } catch {
-    // Expanded-by-default is the documented default, so an unreadable value costs the
-    // user one re-collapse rather than an error they cannot act on.
+    // Collapsed-by-default is the documented default, so an unreadable value costs the
+    // user one re-open per crew rather than an error they cannot act on.
     return new Set()
   }
 }
@@ -6202,28 +6220,29 @@ function ChatSidebar({
   }, [conductorLaneActive, conductorRows])
 
   /**
-   * Which conductor rows are shut. EXPANDED by default, and the shut ones persist.
+   * Which conductor rows are open. COLLAPSED by default, and the open ones persist.
    *
-   * Expanded is the default because this lane exists to show the same tree the System
-   * page's Sessions tab shows, and that one arrives open: a conductor whose fourteen
-   * workers are behind a chevron the user has to find is not the same view. The set
-   * holds what the user has CLOSED, so it survives a reload -- somebody who folded a
-   * conductor away has not changed their mind -- while a conductor it has never held
-   * renders open.
+   * Collapsed is the default because this lane exists to make a conductor and its
+   * workers read as ONE unit of work: a crew of fourteen is one row with a count and
+   * the subtree's badges on it, and the workers appear when the person asks for them.
+   * The System page's Sessions tab is the place to see every row at once. The set
+   * holds what the user has OPENED, so it survives a reload -- somebody who opened a
+   * crew to watch it has not changed their mind -- while a conductor it has never held
+   * renders shut.
    */
-  const [conductorCollapsed, setConductorCollapsed] = useState<Set<string>>(readConductorCollapsed)
-  const persistConductorCollapsed = useCallback((next: Set<string>) => {
-    safeSetItem(CONDUCTOR_COLLAPSED_LS_KEY, JSON.stringify(Array.from(next)))
+  const [conductorExpanded, setConductorExpanded] = useState<Set<string>>(readConductorExpanded)
+  const persistConductorExpanded = useCallback((next: Set<string>) => {
+    safeSetItem(CONDUCTOR_EXPANDED_LS_KEY, JSON.stringify(Array.from(next)))
   }, [])
   const toggleConductorExpanded = useCallback((key: string) => {
-    setConductorCollapsed(prev => {
+    setConductorExpanded(prev => {
       const next = new Set(prev)
       if (next.has(key)) next.delete(key)
       else next.add(key)
-      persistConductorCollapsed(next)
+      persistConductorExpanded(next)
       return next
     })
-  }, [persistConductorCollapsed])
+  }, [persistConductorExpanded])
 
   /**
    * Open every ancestor of *key* so a nested row becomes visible.
@@ -6240,15 +6259,15 @@ function ChatSidebar({
   const lineageParentsRef = useRef<Map<string, string>>(new Map())
   lineageParentsRef.current = lineage?.parentOf ?? lineageParentsRef.current
   const expandConductorAncestors = useCallback((key: string) => {
-    setConductorCollapsed(prev => {
+    setConductorExpanded(prev => {
       const chain = ancestorsOf(key, lineageParentsRef.current)
-      if (chain.length === 0 || chain.every(k => !prev.has(k))) return prev
+      if (chain.length === 0 || chain.every(k => prev.has(k))) return prev
       const next = new Set(prev)
-      for (const k of chain) next.delete(k)
-      persistConductorCollapsed(next)
+      for (const k of chain) next.add(k)
+      persistConductorExpanded(next)
       return next
     })
-  }, [persistConductorCollapsed])
+  }, [persistConductorExpanded])
 
   /**
    * The creator each row cited on the PREVIOUS frame, so a row that MOVED can be told
@@ -6307,6 +6326,14 @@ function ChatSidebar({
     const current = new Map<string, string | null>(previous)
     const moved: string[] = []
     for (const slot of lanePopulation) {
+      // A provisional row is not a baseline. The cold-start frame ships every row with
+      // `parent: null` and `lineage_pending` while the gateway's projection seeds; the
+      // frame that settles it then carries the real citations. Recording the nulls would
+      // read every null -> key transition as a MOVE and persist every crew open on every
+      // reload, inverting the collapsed default. Skipped, the settling frame is the
+      // row's first sighting -- a creation -- and a row seen settled before keeps the
+      // baseline it already had.
+      if (slot.lineage_pending === true) continue
       const identity = sessionRowIdentity(slot)
       const cited = slot.parent?.slot ?? null
       current.set(identity, cited)
@@ -9929,7 +9956,7 @@ function ChatSidebar({
                 const slot = byKey.get(key)
                 if (!slot) return
                 const kids = keptKids(key)
-                const expanded = !conductorCollapsed.has(key)
+                const expanded = conductorExpanded.has(key)
                 const subtree = kids.length > 0 && !expanded
                   ? descendantsOf(key, tree.children).filter(k => kept.has(k))
                   : []
