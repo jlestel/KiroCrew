@@ -433,14 +433,10 @@ def _sanitize_selection_sources(sel_obj: Any, root: str) -> None:
 
 
 def _read_request(fp: Path) -> dict | None:
-    """Read only after the MAX_RECORD_BYTES st_size gate, before read_text."""
-
     return request_state.read_request(runtime, fp)
 
 
 def _write_request(fp: Path, req: dict) -> None:
-    """Publish through the shared chokepoint with max_bytes=MAX_RECORD_BYTES."""
-
     return request_state.write_request(runtime, fp, req)
 
 
@@ -535,8 +531,6 @@ def _static_response(
     base: str,
     script: str = INJECT_PUBLIC,
 ) -> tuple[int, str, bytes]:
-    """Serve only after containment and the _is_kirocrew_internal policy floor."""
-
     return preview_files.static_response(runtime, root_str, rel, base, script)
 
 
@@ -665,7 +659,6 @@ def _start_inject_proxy(dev_url: str) -> tuple[object | None, str]:
 
 
 def _front_with_proxy(project_id: str, dev_url: str) -> str:
-    # The boundary's bind-failure result is `return ""`; never expose upstream.
     return dev_preview.front_with_proxy(runtime, project_id, dev_url)
 
 

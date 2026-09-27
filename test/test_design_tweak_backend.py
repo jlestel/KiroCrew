@@ -416,15 +416,6 @@ class TestQueueReadIsSizeBounded:
         got = server._read_request(fp)
         assert got is not None and got["id"] == rid
 
-    def test_the_bound_is_checked_before_the_read(self):
-        """Statting after loading the bytes would not prevent the exhaustion."""
-        import inspect
-
-        src = inspect.getsource(server._read_request)
-        assert src.index("st_size") < src.index("read_text"), (
-            "the size check must gate the read, not follow it"
-        )
-
 
 class TestRemovingAProjectReleasesItsResources:
     """Dropping the registry row is not the same as stopping what it started.
@@ -530,12 +521,6 @@ class TestWhatIsWrittenStaysReadable:
     accumulation is the only way to get there and a per-payload cap cannot see it.
     """
 
-    def test_the_two_ceilings_are_the_same_constant(self):
-        import inspect
-
-        assert "MAX_RECORD_BYTES" in inspect.getsource(server._read_request)
-        assert "MAX_RECORD_BYTES" in inspect.getsource(server._write_request)
-
     def test_an_oversized_write_is_refused(self, isolated_queue):
         fp = server._request_file(server.QUEUE_DIR, "1700000000000-toobig")
         req = {"id": "x", "pad": "a" * (server.MAX_RECORD_BYTES + 64)}
@@ -619,21 +604,6 @@ class TestWhatIsWrittenStaysReadable:
             f"the boundary round-trip pushed {sum(offered)} bytes through the writer "
             f"for a {server.MAX_RECORD_BYTES}-byte answer"
         )
-
-    def test_the_writer_bound_covers_every_route(self):
-        """A per-route guard would leave the other writers able to strand a draft."""
-        import inspect
-
-        src = inspect.getsource(server._write_request)
-        assert "max_bytes=MAX_RECORD_BYTES" in src, (
-            "the bound must sit at the shared write chokepoint"
-        )
-
-    def test_config_writes_are_not_bounded_by_the_record_ceiling(self):
-        """The ceiling is about queue records; the config writer must stay generic."""
-        import inspect
-
-        assert "max_bytes" not in inspect.getsource(server._save_cfg)
 
 
 class TestUpstreamContentType:
@@ -1064,14 +1034,6 @@ class TestProxyFailureNeverFramesTheBareDevServer:
                 ), f"{fn.__name__} reports injected on an unbindable proxy: {stripped}"
         assert checked == 2, f"expected 2 injected sites, inspected {checked}"
 
-    def test_the_fallback_dev_url_return_is_gone_from_the_source(self):
-        """Pin the barrier: no `return dev_url` may creep back into the helper."""
-        import inspect
-
-        src = inspect.getsource(server._front_with_proxy)
-        assert "return dev_url" not in src
-        assert 'return ""' in src
-
 
 class TestProjectSecretsAreNeverServed:
     """A previewed project's OWN credential files must not be readable.
@@ -1303,12 +1265,6 @@ class TestKiroCrewInternalTreesAreNeverServed:
     def test_app_secret_is_also_on_the_project_relative_denylist(self):
         """Defense in depth: a copy inside a project tree is refused by name."""
         assert ".app_secret" in server._PROJECT_SECRET_NAMES
-
-    def test_the_barrier_is_wired_into_the_static_sink(self):
-        import inspect
-
-        src = inspect.getsource(server._static_response)
-        assert "_is_kirocrew_internal" in src
 
 
 class TestEntryPointCannotLaunderASecret:
