@@ -7,7 +7,7 @@ actually does. Stdlib only; portable across OSes.
 
 With ``--check-body`` it also reads the PR body the skill writes --
 ``<git-dir>/prepare-pr-body.md``, with ``<git-dir>`` from
-``git rev-parse --absolute-git-dir`` -- and runs two checks on it:
+``git rev-parse --absolute-git-dir`` -- and runs three checks on it:
 
 * **Accounting (hard).** Every changed *area* -- the unit ``pr-scope.yml`` counts,
   a module directory for ``src/kiro_crew/`` and ``website/src/``, the top-level
@@ -25,18 +25,27 @@ With ``--check-body`` it also reads the PR body the skill writes --
   contract's "three short paragraphs at most" come to. Over it is exit 21. The
   accounting check already guarantees nothing is hidden, so a cap cannot cut a
   true fact -- only a restated one: the body says what changed for the reader
-  and why; the diff is the evidence. Both checks run and print before either
-  exit; when both breach, 20 wins.
+  and why; the diff is the evidence.
+* **Template (hard).** The repo's own ``.github/scripts/pr-description-check.sh``
+  -- the script CI's PR Hygiene runs -- is read from ``origin/<base>``, never from
+  the checkout, so a branch cannot weaken its own check, and run on the body.
+  A failure prints that script's message; that is exit 22. A base without the
+  script (another repo) skips it silently.
+
+All checks run and print before any exit; when several breach, the lowest code wins.
 
 Usage:  python3 diff_signals.py [base-branch] [--check-body]
-Exit:   0 printed / body passes | 20 unaccounted area(s) | 21 What changed too long | 2 environment error
+Exit:   0 printed / body passes | 20 unaccounted area(s) | 21 What changed too long |
+        22 template sections missing | 2 environment error
 """
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 SIGNALS = [
     (
@@ -63,6 +72,9 @@ GIT_SEP = "/"
 
 # The one body file --check-body reads, relative to `git rev-parse --absolute-git-dir`.
 BODY_FILENAME = "prepare-pr-body.md"
+
+# CI's template check, read from origin/<base> by --check-body.
+TEMPLATE_CHECK = ".github/scripts/pr-description-check.sh"
 
 # Bare file names that appear in many places at once; naming one of these does
 # not tell the reader WHICH one changed, so it never satisfies the accounting.
@@ -237,6 +249,44 @@ def check_body(body, name_status, word_limit=WORD_LIMIT):
     return 0
 
 
+def template_check(body, base):
+    """Run the base ref's ``TEMPLATE_CHECK`` on ``body``; return 0 or 22.
+
+    Absent on the base (another repo) is a silent skip.
+    """
+    rc, script, _ = run(["git", "show", "origin/{}:{}".format(base, TEMPLATE_CHECK)])
+    if rc != 0:
+        return 0
+    bash = shutil.which("bash")
+    if not bash:
+        print("WARN: bash not found - template check skipped; CI still runs it")
+        return 0
+    with tempfile.TemporaryDirectory() as tmp:
+        script_path = os.path.join(tmp, "check.sh")
+        out_path = os.path.join(tmp, "out")
+        with open(script_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(script)
+        env = dict(os.environ, PR_BODY=body, PR_DRAFT="false", GITHUB_OUTPUT=out_path)
+        env.setdefault("GITHUB_REPOSITORY", "")
+        try:
+            subprocess.run([bash, script_path], env=env, capture_output=True)
+            with open(out_path, encoding="utf-8", errors="replace") as fh:
+                out = fh.read()
+        except OSError as exc:
+            print("WARN: cannot run {} ({}) - template check skipped".format(TEMPLATE_CHECK, exc))
+            return 0
+    if "conclusion=failure" not in out.splitlines():
+        print("PR template: required sections present")
+        return 0
+    m = re.search(r"^title=(.*)$", out, re.MULTILINE)
+    print("TEMPLATE: " + (m.group(1) if m else "the body fails " + TEMPLATE_CHECK))
+    # The summary's bullets name what is missing; its prose addresses a PR page.
+    for line in out.splitlines():
+        if line.startswith("- "):
+            print("    " + line)
+    return 22
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("base", nargs="?", default="")
@@ -300,7 +350,9 @@ def main(argv):
         print("(no notable structural signals - still describe the behavior changes)")
 
     if body is not None:
-        return check_body(body, ns)
+        rc = check_body(body, ns)
+        tpl = template_check(body, base)
+        return rc or tpl
     return 0
 
 

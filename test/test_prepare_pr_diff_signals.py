@@ -432,3 +432,65 @@ def test_skill_has_a_cold_reader_step_after_the_check_and_outside_local_review()
     local_review = (PREPARE_PR / "scripts" / "local_review.py").read_text(encoding="utf-8")
     assert "Cold reader" not in local_review
     assert "two sentences" not in local_review
+
+
+# ------------------------------------------------------ the template check
+
+TEMPLATE_CHECK = ROOT / ".github" / "scripts" / "pr-description-check.sh"
+TEMPLATE_BODY = (
+    "## Problem / Motivation\n\n**Goal:** send once.\n\n## Why it matters\n\nx\n\n"
+    "## Not a goal\n\nx\n\n## What changed\n\nchat/send.py sends once. security.py "
+    "allows it. .github is weakened.\n\n## Tests\n\nx\n"
+)
+
+
+# Same predicate as the repo's other bash-executing suites: on Windows the
+# `bash` on PATH may be the WSL launcher, which is not a shell.
+needs_bash = pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="executes bash; needs a POSIX bash on PATH",
+)
+
+
+@pytest.fixture
+def templated_repo(repo: Path) -> Path:
+    """``repo`` rebased on a base that carries CI's real template check, with a
+    branch commit that weakens its own copy to always pass."""
+    _git(repo, "checkout", "-q", "--detach", "origin/main")
+    (repo / ".github" / "scripts").mkdir(parents=True)
+    shutil.copy(TEMPLATE_CHECK, repo / ".github" / "scripts" / TEMPLATE_CHECK.name)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base with check")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "rebase", "-q", "origin/main")
+    weak = 'echo "conclusion=success" >> "$GITHUB_OUTPUT"\n'
+    (repo / ".github" / "scripts" / TEMPLATE_CHECK.name).write_text(weak)
+    _git(repo, "commit", "-q", "-am", "weaken")
+    return repo
+
+
+@needs_bash
+def test_end_to_end_body_missing_a_template_section_exits_twenty_two(templated_repo: Path) -> None:
+    """The base ref's script runs, not the branch's weakened copy."""
+    _body(templated_repo).write_text(TEMPLATE_BODY.replace("## Not a goal\n", ""))
+    rc, out = _run(templated_repo, "--check-body")
+    assert rc == 22
+    assert "TEMPLATE: 1 required description section is missing" in out
+    assert "- `## Not a goal`" in out
+
+
+@needs_bash
+def test_end_to_end_template_shaped_body_exits_zero(templated_repo: Path) -> None:
+    _body(templated_repo).write_text(TEMPLATE_BODY)
+    rc, out = _run(templated_repo, "--check-body")
+    assert rc == 0, out
+    assert "PR template: required sections present" in out
+
+
+def test_end_to_end_base_without_the_template_check_skips_it(repo: Path) -> None:
+    _body(repo).write_text("## What changed\n\nchat/send.py sends once. security.py allows it.\n")
+    rc, out = _run(repo, "--check-body")
+    assert rc == 0
+    assert "TEMPLATE" not in out
+    assert "PR template" not in out
