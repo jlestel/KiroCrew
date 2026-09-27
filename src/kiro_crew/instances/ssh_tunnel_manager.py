@@ -1181,20 +1181,46 @@ class _SshTunnel:
                 ]
 
     async def stop(self) -> None:
-        """Tear down this tunnel (graceful terminate then kill)."""
+        """Tear down this tunnel (graceful terminate then kill).
+
+        The state leaves CONNECTED before the FIRST await rather than after the last
+        one. Everything that decides whether a credential may be issued for this
+        forward re-reads this same live object -- the token/port pair a pane is
+        answered with, and the mint paths that require CONNECTED -- and the awaits
+        below span seconds (``_terminate`` waits up to 5s per signal). A teardown
+        that reports CONNECTED for that span hands a caller this crew's token
+        paired with a port that is already being released, and nothing revokes a
+        token once the response is sent.
+
+        Narrower than it looks, on purpose. :meth:`_reserved_ports` counts a port by
+        tunnel MEMBERSHIP rather than by state and the caller pops this tunnel only
+        after this returns, so the port stays withheld across the whole window.
+        :meth:`_apply_hop_holds` under-counts ``in_use`` here, which is the direction
+        its own contract calls cheap: the bind loses to a still-live forward and the
+        port is recorded as owed and retried.
+
+        A failed teardown restores the state, because the forward is then still up. A
+        CANCELLED one does not: the child may already be signalled, and refusing to
+        mint for a forward that is half-gone is the safe direction.
+        """
+        previous = self.status.state
+        self.status.state = TunnelState.STOPPED
         self._stopping = True
         self._stop_event.set()
-        if self._probe_task and not self._probe_task.done():
-            self._probe_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._probe_task
-        if self._monitor_task and not self._monitor_task.done():
-            self._monitor_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._monitor_task
-        await self._finish_stdout_drain(timeout=0.5)
-        await self._terminate()
-        self.status.state = TunnelState.STOPPED
+        try:
+            if self._probe_task and not self._probe_task.done():
+                self._probe_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._probe_task
+            if self._monitor_task and not self._monitor_task.done():
+                self._monitor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._monitor_task
+            await self._finish_stdout_drain(timeout=0.5)
+            await self._terminate()
+        except Exception:
+            self.status.state = previous
+            raise
         logger.info("Tunnel stopped for %s", self._id)
 
     async def _terminate(self) -> None:

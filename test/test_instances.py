@@ -4446,6 +4446,77 @@ class TestTunnelStatus:
         d2 = TunnelStatus("cd-1", TunnelState.ERROR, diagnosis=diag).to_dict()
         assert d2["diagnosis"] == diag
 
+    @pytest.mark.asyncio
+    async def test_stop_leaves_connected_before_its_first_await(self):
+        """Every decision to issue a credential for a forward re-reads this live status
+        object, and ``stop()`` awaits for seconds (``_terminate`` waits up to 5s per
+        signal). So the state has to leave CONNECTED at the START of the teardown: while
+        it still reads CONNECTED, a concurrent caller is answered with this crew's token
+        paired with a port that is already being released, and nothing revokes a token
+        once the response is sent.
+        """
+        import asyncio as aio
+
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState, _SshTunnel
+
+        entered = aio.Event()
+        release = aio.Event()
+
+        class _Parked(_SshTunnel):
+            async def _terminate(self):
+                entered.set()
+                await release.wait()
+
+        t = _Parked("cd-1", "h", 7778, 7777)
+        t.status.state = TunnelState.CONNECTED
+        t.status.local_port = 7778
+
+        task = aio.create_task(t.stop())
+        await aio.wait_for(entered.wait(), timeout=5)
+
+        # Mid-teardown, with the port not yet released and the caller still holding a
+        # reference to this object.
+        assert t.status.state is not TunnelState.CONNECTED, (
+            "stop() still reports CONNECTED while tearing down, so a concurrent "
+            "caller can be handed a token paired with a port being released"
+        )
+        assert t.status.state is TunnelState.STOPPED
+
+        release.set()
+        await aio.wait_for(task, timeout=5)
+        assert t.status.state is TunnelState.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_a_failed_teardown_restores_the_previous_state(self):
+        """A teardown that raises leaves the forward up, so the state it reports has to
+        go back to what it was: refusing to mint for a live forward would strand it.
+        A CANCELLED teardown is the other way round -- the child may already be
+        signalled, so that one stays non-connected.
+        """
+        import asyncio as aio
+
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState, _SshTunnel
+
+        class _Boom(_SshTunnel):
+            async def _terminate(self):
+                raise RuntimeError("terminate failed")
+
+        t = _Boom("cd-1", "h", 7778, 7777)
+        t.status.state = TunnelState.CONNECTED
+        with pytest.raises(RuntimeError):
+            await t.stop()
+        assert t.status.state is TunnelState.CONNECTED, "a failed teardown stranded the forward"
+
+        class _Cancelled(_SshTunnel):
+            async def _terminate(self):
+                raise aio.CancelledError()
+
+        t2 = _Cancelled("cd-1", "h", 7778, 7777)
+        t2.status.state = TunnelState.CONNECTED
+        with pytest.raises(aio.CancelledError):
+            await t2.stop()
+        assert t2.status.state is TunnelState.STOPPED, "a cancelled teardown re-opened minting"
+
 
 class TestSelfHealRefreshRestart:
     @pytest.fixture(autouse=True)

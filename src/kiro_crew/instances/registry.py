@@ -133,7 +133,7 @@ _DEFAULT_TTL = "20h"
 #: Enforced by :func:`validate_instance_name` at the WRITE sites (``add``, and
 #: ``update`` only when the patch carries ``name``), not in
 #: :meth:`Instance.validate` -- see that function for why capping the whole
-#: record would silently lose an unrelated hint write on a pre-cap row.
+#: record loses an unrelated hint write on a row already over the cap.
 INSTANCE_NAME_MAX = 200
 
 CONNECTION_METHODS: tuple[str, ...] = ("ssh", "ssm", "fargate")
@@ -196,16 +196,16 @@ def validate_instance_name(name: str) -> None:
     """Reject a name longer than the registry retains.
 
     Checked where a name is WRITTEN rather than in :meth:`Instance.validate`, for
-    the same reason as :func:`validate_ttl`: a legacy row whose stored name
-    predates this cap keeps working. Nothing truncates on the way in -- there was
-    no length check at the handler and none in :meth:`Instance.from_dict` -- so a
-    pre-cap row can be longer than this, and ``validate()`` runs against the WHOLE
-    record on every ``update()``. Capping there would fail the hint writes that
-    carry an unrelated field: ``disconnect`` resets ``was_connected`` and
-    ``local_port`` through ``update()``, and those writes are best-effort, so the
-    refusal is swallowed and the reset is silently lost -- reviving at the next
-    start a crew the user explicitly disconnected, and pinning the freed port.
-    A too-long legacy name is then unfixable except by renaming, which is the one
+    the same reason as :func:`validate_ttl`: a stored name that exceeds this cap
+    keeps working. Nothing truncates on the way in -- no length check at the
+    handler, none in :meth:`Instance.from_dict` -- so a stored row can be longer
+    than this, and ``validate()`` runs against the WHOLE record on every
+    ``update()``. Capping there fails the hint writes that carry an unrelated
+    field: ``disconnect`` resets ``was_connected`` and ``local_port`` through
+    ``update()``, and those writes are best-effort, so the refusal is swallowed and
+    the reset is lost -- reviving at the next start a crew the user explicitly
+    disconnected, and holding a port that is free for anything else to bind.
+    An over-cap stored name is then unfixable except by renaming, which is the one
     write this rule must still refuse.
     """
     if len(name) > INSTANCE_NAME_MAX:

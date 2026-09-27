@@ -2031,13 +2031,13 @@ class TestDepthCap:
         assert resp.status == 201, "refused a name exactly at the cap"
 
     def test_a_pre_cap_name_still_lets_disconnect_persist_its_reset(self, tmp_path):
-        """The cap is new, and nothing truncated on the way in before it, so a stored
-        name can be longer than it. ``update()`` revalidates the WHOLE record, and
-        disconnect's reset rides through ``update()`` as a hint-only patch whose
-        failure is swallowed as best-effort -- so capping in ``Instance.validate``
-        loses that reset silently and the next start revives a crew the user
-        disconnected, on a port it no longer owns. The cap belongs at the write
-        sites, which is where ``ttl`` already puts it for this same reason.
+        """Nothing truncates a name on the way in, so a stored name can be longer than
+        the cap. ``update()`` revalidates the WHOLE record, and disconnect's reset rides
+        through ``update()`` as a hint-only patch whose failure is swallowed as
+        best-effort -- so capping in ``Instance.validate`` loses that reset silently and
+        the next start revives a crew the user disconnected, holding a port that is free
+        for anything else to bind. The cap belongs at the write sites, which is where
+        ``ttl`` already puts it for this same reason.
         """
         from kiro_crew.instances.registry import validate_instance_name
 
@@ -2045,8 +2045,8 @@ class TestDepthCap:
         reg = InstancesRegistry(path=path)
         reg.add(name="B", ssh_host="b-host", instance_id="b")
 
-        # A pre-cap row, as one is found on disk after upgrading: over the cap, and
-        # mid-session, so the reset below is the write that must not be lost.
+        # A stored row over the cap, mid-session, so the reset below is the write that
+        # must not be lost.
         legacy = "x" * (INSTANCE_NAME_MAX + 50)
         doc = json.loads(path.read_text())
         doc["instances"][0]["name"] = legacy
@@ -2075,7 +2075,7 @@ class TestDepthCap:
         with pytest.raises(InvalidInstanceError):
             validate_instance_name("y" * (INSTANCE_NAME_MAX + 1))
 
-        # And renaming is the legacy row's exit, so it has to work.
+        # And renaming is that row's only exit, so it has to work.
         InstancesRegistry(path=path).update("b", name="short")
         assert json.loads(path.read_text())["instances"][0]["name"] == "short"
 
