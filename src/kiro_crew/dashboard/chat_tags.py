@@ -18,7 +18,7 @@ import math
 import re
 import uuid
 import weakref
-from typing import Any, Callable, TypeVar
+from typing import Any
 
 from aiohttp import web
 
@@ -63,8 +63,6 @@ _VALID_SOURCES = {"tags", "state"}
 # and render an eternally-empty column: the lanes are exhaustive and mutually
 # exclusive by construction, and a card that matched nothing would vanish.
 _VALID_STATE_KEYS = {"needs_approval", "waiting", "working", "idle"}
-
-_T = TypeVar("_T")
 
 # Valid values for a tag's optional ``agent`` policy field.
 _AGENT_TAG_POLICIES: frozenset[str] = frozenset({"add-remove", "add-only", "none"})
@@ -208,30 +206,6 @@ def _tags_write_lock(state: Any) -> LoopBoundLock:
 # chat_auto_tag.maybe_auto_tag to hold the lock across an entire
 # resolve→merge→persist critical section.
 tags_write_lock = _tags_write_lock
-
-
-async def _mutate_tags_locked(state: DashboardState, mutate: Callable[[], _T]) -> _T:
-    """Serialize a tag mutation + persistence under a shared async lock.
-
-    ``mutate`` is a sync callable that modifies ``state._tags`` in place and
-    returns a result. After it runs, an immutable snapshot is atomically written
-    to disk inside a worker thread (mirrors DashboardState._atomic_write_json).
-    The lock is NON-REENTRANT — callers must never nest.
-
-    Raises on persist failure (caller must catch to surface HTTP 5xx).
-    The in-memory state is rolled back to the pre-mutate snapshot on failure.
-    """
-    async with _tags_write_lock(state):
-        pre_snapshot = [dict(t) for t in state._tags]
-        result = mutate()
-        snapshot = [dict(t) for t in state._tags]
-        try:
-            await asyncio.to_thread(_write_tags_snapshot, state, snapshot)
-        except Exception:
-            # Roll back to pre-mutate state.
-            state._tags = pre_snapshot
-            raise
-        return result
 
 
 def _write_tags_snapshot(state: DashboardState, snapshot: list[dict]) -> None:

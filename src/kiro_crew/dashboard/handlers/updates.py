@@ -157,10 +157,6 @@ _last_update_check: float = 0.0
 _check_task: asyncio.Task[None] | None = None
 _check_task_generation: int | None = None
 
-#: Release channels the installer publishes. Anything else in the channel file (a
-#: hand-edit, junk, a lane this build predates) falls back to ``stable``.
-_RELEASE_CHANNELS = ("stable", "insider", "nightly")
-
 #: ``schema`` every CLI artifact manifest carries. A payload without it is not a
 #: manifest and must not be read as one.
 _CLI_MANIFEST_SCHEMA = "kirocrew-cli-artifact-manifest-v1"

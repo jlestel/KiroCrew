@@ -557,7 +557,6 @@ def _classify_theme_file(rel: str) -> tuple[str | None, int]:
 # elements are exempt from the interaction/viewport-cover rejections — this is
 # the decorative-scanline idiom (``body::before,body::after{position:fixed;
 # inset:0;pointer-events:none}``), inert decoration that MUST still validate.
-_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _THEME_DECORATIVE_PSEUDO = frozenset(
     {"body::before", "body::after", "body:before", "body:after"}
 )

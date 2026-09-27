@@ -92,10 +92,6 @@ def internal_path_matches(path: str, entries: Iterable[str]) -> bool:
 
 logger = logging.getLogger(__name__)
 
-# Alias of bump_revocation_gen: callers elsewhere import the private name
-# from this module.
-_bump_revocation_gen = bump_revocation_gen
-
 
 # -- Per-session access-cookie revocation -------------------------------------
 
