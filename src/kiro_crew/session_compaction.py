@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.messaging.queue_drain import entry_channel, wake_other_drains
 from kiro_crew.metrics.events import CONTEXT_COMPACTIONS, emit_counter
 from kiro_crew.metrics.sessions import END_REASON_RECYCLED, record_session_ended
 
@@ -167,6 +168,12 @@ class _CompactionOwner(Protocol):
     def mark_needs_reinjection(self, key: str) -> None: ...
 
     def _lifecycle_boundary(self) -> Any: ...
+
+    async def get_or_create(self, key: str, **kwargs: Any) -> Any: ...
+
+    def release(self, key: str) -> None: ...
+
+    def get_channel(self, key: str) -> str | None: ...
 
     async def reset(
         self,
@@ -767,6 +774,88 @@ class CompactionCoordinator:
                 return
             await asyncio.sleep(min(remaining, self._deps.cotenant_poll_secs))
 
+    async def _restart_held(self, key: str, session: Any, pct: float) -> str:
+        """Start the successor first and hand it the held session's queue, then recycle.
+
+        The queued messages land in its real queue, behind its lease until their drain
+        is scheduled. If it cannot start, the old session keeps its queue and key.
+        Taken even with an empty queue: a message can still queue during the teardown.
+        """
+        owner = self._owner
+        if owner._sessions.get(key) is not session:
+            # Superseded by another teardown: its queue was discarded there.
+            await owner._recycle_held(key, session, pct)
+            return "recycled"
+        owner._recycling[key] = session  # get_or_create builds past a recycling entry
+        dropped_sid = owner._session_map.mapped_sid(key)
+        owner._session_map.clear_sid(key)  # the overflowed conversation must not resume
+        started = False
+        try:
+            await owner.get_or_create(
+                key,
+                agent=getattr(session, "agent", "") or None,
+                approval_policy=getattr(session, "approval_policy", ""),
+                cwd=getattr(session.provider, "cwd", None) or None,
+                channel_id=owner.get_channel(key) or None,
+                model=getattr(session, "requested_model", "") or None,
+                crew_agent=getattr(session, "capability_member", "") or None,
+                speculative=True,
+            )
+            started = True
+        except Exception:
+            self._deps.logger.exception("Session %s successor did not start; kept", key)
+            self.state.cooldown_until[key] = (
+                time.monotonic() + self._deps.compact_failure_cooldown_secs
+            )
+            await owner._fire_compact_callback(key, pct, success=False)
+            # Nothing else drains the kept queue; no await follows, so it reads it
+            # once the old lease is released.
+            self._wake_drains(key)
+            return "failed"
+        finally:
+            if not started:  # failed or cancelled: the old session keeps the key
+                if owner._recycling.get(key) is session:
+                    owner._recycling.pop(key, None)
+                self._keep_resume_sid(key, session, dropped_sid)
+        try:
+            successor = owner._sessions.get(key)
+            live = [e for e in session.queue if e[0] not in session.cancelled]
+            if successor is not None and successor is not session:
+                for entry in live:
+                    session.queue.remove(entry)
+                successor.queue.extendleft(reversed(live))
+            # The successor holds the key now, so this records no end of its own.
+            await owner._recycle_held(key, session, pct)
+        finally:
+            # Even when the teardown raises, the handed-off queue needs its drain.
+            self._wake_drains(key)
+            owner.release(key)
+        return "recycled"
+
+    def _keep_resume_sid(self, key: str, session: Any, sid: str) -> None:
+        """Point *key* back at *session*'s conversation if it still holds the key."""
+        if self._owner._sessions.get(key) is not session:
+            return  # a racing successor owns the key's resume pointer now
+        if session.retire_on_identity_change:
+            return  # a retiring session must not re-point the key at itself
+        if sid:
+            self._owner._session_map.set(key, sid)
+
+    def _wake_drains(self, key: str) -> None:
+        """Wake each channel with a message queued on *key*, read after the release.
+
+        Call it with no await before the lease is released.
+        """
+        async def _wake() -> None:
+            live = self._owner._sessions.get(key)
+            channels = [entry_channel(e[2]) for e in getattr(live, "queue", ())]
+            if any(channels):
+                await wake_other_drains(waker="", session_key=key, channels=channels)
+
+        task = asyncio.ensure_future(_wake())
+        self._owner._background_tasks.add(task)
+        task.add_done_callback(self._owner._background_tasks.discard)
+
     async def _recycle_unmanaged(self, key: str, session: Any, pct: float) -> str:
         """Recycle a session no compaction path can reach, turn-exclusive.
 
@@ -861,10 +950,7 @@ class CompactionCoordinator:
                 exc_info=True,
             )
             await self._await_cotenants(key, pct)
-            # This owner-facade hop is load-bearing for both monkeypatches and
-            # the lifecycle boundary's exact-identity recycling marker.
-            await self._owner._recycle_held(key, session, pct)
-            return "recycled"
+            return await self._restart_held(key, session, pct)
         finally:
             session.semaphore.release()
 
