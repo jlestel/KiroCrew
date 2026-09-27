@@ -129,6 +129,11 @@ _DEFAULT_TTL = "20h"
 #: what makes the bound a property of the STORE rather than of one caller, which
 #: is the only place it holds for a caller that does not go through the relay.
 #: `test_the_backend_name_cap_matches_the_relays` pins the two together.
+#:
+#: Enforced by :func:`validate_instance_name` at the WRITE sites (``add``, and
+#: ``update`` only when the patch carries ``name``), not in
+#: :meth:`Instance.validate` -- see that function for why capping the whole
+#: record would silently lose an unrelated hint write on a pre-cap row.
 INSTANCE_NAME_MAX = 200
 
 CONNECTION_METHODS: tuple[str, ...] = ("ssh", "ssm", "fargate")
@@ -184,6 +189,28 @@ def validate_ttl(ttl: str) -> None:
         raise InvalidInstanceError(
             f"invalid ttl {ttl!r}: expected a positive integer of at most four "
             f"digits followed by 'h' or 'm' (e.g. 20h, 30m)"
+        )
+
+
+def validate_instance_name(name: str) -> None:
+    """Reject a name longer than the registry retains.
+
+    Checked where a name is WRITTEN rather than in :meth:`Instance.validate`, for
+    the same reason as :func:`validate_ttl`: a legacy row whose stored name
+    predates this cap keeps working. Nothing truncates on the way in -- there was
+    no length check at the handler and none in :meth:`Instance.from_dict` -- so a
+    pre-cap row can be longer than this, and ``validate()`` runs against the WHOLE
+    record on every ``update()``. Capping there would fail the hint writes that
+    carry an unrelated field: ``disconnect`` resets ``was_connected`` and
+    ``local_port`` through ``update()``, and those writes are best-effort, so the
+    refusal is swallowed and the reset is silently lost -- reviving at the next
+    start a crew the user explicitly disconnected, and pinning the freed port.
+    A too-long legacy name is then unfixable except by renaming, which is the one
+    write this rule must still refuse.
+    """
+    if len(name) > INSTANCE_NAME_MAX:
+        raise InvalidInstanceError(
+            f"instance name is {len(name)} characters: at most " f"{INSTANCE_NAME_MAX} are kept"
         )
 
 
@@ -283,11 +310,6 @@ class Instance:
             )
         if not self.name or not self.name.strip():
             raise InvalidInstanceError("instance name must be non-empty")
-        if len(self.name) > INSTANCE_NAME_MAX:
-            raise InvalidInstanceError(
-                f"instance name is {len(self.name)} characters: at most "
-                f"{INSTANCE_NAME_MAX} are kept"
-            )
         if self.connection_method not in CONNECTION_METHODS:
             raise InvalidInstanceError(
                 f"invalid connection_method {self.connection_method!r}: "
@@ -844,6 +866,7 @@ class InstancesRegistry:
             )
             inst.validate()
             validate_ttl(inst.ttl)
+            validate_instance_name(inst.name)
             doc.instances.append(inst)
             self._write(doc)
             logger.info(
@@ -899,6 +922,8 @@ class InstancesRegistry:
             raise InvalidInstanceError(f"unknown fields: {sorted(unknown)}")
         if "ttl" in changes:
             validate_ttl(str(changes["ttl"]))
+        if "name" in changes:
+            validate_instance_name(str(changes["name"]))
         with self._lock:
             doc = self._read()
             target = _find(doc, instance_id)
