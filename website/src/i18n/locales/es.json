@@ -16098,6 +16098,8 @@
         "stop_waiting": "Dejar de esperar",
         "stopping": "Deteniendo…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "ID de subred (opcional)",
+        "subnet_hint": "Lanza en esta subred; se usa su VPC. Déjalo vacío para elegir una automáticamente. La subred necesita salida a internet.",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

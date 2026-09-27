@@ -15668,6 +15668,8 @@
         "stop_waiting": "停止等待",
         "stopping": "正在停止…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "子网 ID（可选）",
+        "subnet_hint": "在此子网中启动，并使用其所属 VPC。留空则自动选择。该子网需要能访问互联网。",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

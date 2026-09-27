@@ -636,7 +636,8 @@ async def api_cloud_launch_task(request: web.Request) -> web.Response:
 async def api_cloud_launch_create(request: web.Request) -> web.Response:
     """POST /api/cloud/launch — start a launch job.
 
-    Body: ``{provider_id?, profile, region, size_key, login_target?, confirm_recipient?}``.
+    Body: ``{provider_id?, profile, region, size_key, subnet_id?, login_target?,
+    confirm_recipient?}``. ``subnet_id`` pins a built-in EC2 launch to that subnet.
     ``confirm_recipient`` is the credential recipient the operator confirmed, required by any
     lane whose launch delivers a credential to something its own configuration names (the
     Fargate lane refuses an empty or stale one and names both values); the built-in EC2 lane
@@ -690,6 +691,13 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
     except LoginTargetError as e:
         _audit("launch_create", "denied", error=f"invalid login target: {e}")
         return web.json_response({"error": str(e), "code": "invalid_login_target"}, status=400)
+    try:
+        subnet_id = ec2.validate_subnet_id(str(body.get("subnet_id") or "").strip())
+        if subnet_id and provider_id != BUILTIN_PROVISIONER_ID:
+            raise ValidationError("subnet_id", "only the built-in EC2 launch takes a subnet")
+    except ValidationError as e:
+        _audit("launch_create", "denied", error=f"invalid subnet: {e}")
+        return web.json_response({"error": str(e), "code": "invalid_subnet"}, status=400)
     provisioner = next((p for p in await _in_executor(_provisioners) if p.id == provider_id), None)
     if provisioner is None:
         _audit("launch_create", "denied", error=f"unknown provisioner {provider_id!r}")
@@ -791,6 +799,7 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
                     provider_id=provider_id,
                     step_labels=dict(provisioner.step_labels or ()),
                     login_target=login_target,
+                    subnet_id=subnet_id,
                 )
             )
         except KeyError as e:  # unknown size

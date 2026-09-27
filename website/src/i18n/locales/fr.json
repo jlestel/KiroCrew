@@ -16098,6 +16098,8 @@
         "stop_waiting": "Arrêter d’attendre",
         "stopping": "Arrêt…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "ID de sous-réseau (facultatif)",
+        "subnet_hint": "Lance la crew dans ce sous-réseau, avec son VPC. Laisse vide pour un choix automatique. Le sous-réseau doit avoir un accès sortant à internet.",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

@@ -939,6 +939,25 @@ describe('RemoteCrewPanel', () => {
     expect(await screen.findByText('Installing Kiro Crew')).toBeInTheDocument()
   })
 
+  it('sends a typed subnet ID with the launch', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    vi.mocked(api.cloudPreflight).mockResolvedValue(PREFLIGHT_OK)
+    vi.mocked(api.cloudLaunch).mockResolvedValue(RUNNING_JOB)
+    vi.mocked(api.cloudLaunchStatus).mockResolvedValue(RUNNING_JOB)
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+    await u.type(await screen.findByRole('textbox', { name: 'Subnet ID (optional)' }), ' subnet-0123abcd ')
+    const launch = await screen.findByRole('button', { name: /^Launch$/ })
+    await waitFor(() => expect(launch).not.toBeDisabled())
+    await u.click(launch)
+    await waitFor(() => expect(api.cloudLaunch).toHaveBeenCalledWith({
+      provider_id: 'aws_ec2', profile: '', region: 'us-east-1', size_key: 'balanced', subnet_id: 'subnet-0123abcd',
+    }))
+  })
+
   it('preselects the inherited Identity Center sign-in, gates launch on the region, and sends the target', async () => {
     vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })

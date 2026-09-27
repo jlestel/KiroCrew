@@ -197,11 +197,11 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'primitive (manual: notifications.volume)',
   },
   'RemoteCrewPanel.tsx': {
-    counts: { input: 6 },
+    counts: { input: 7 },
     reason:
       'setup-wizard AWS profile/region convenience fields (localStorage) behind a ' +
       'non-URL sub-tab a deep link cannot mount; plus the launch form\'s identity ' +
-      'choice (2 radios) and Identity Center start-URL/region fields — per-launch ' +
+      'choice (2 radios), Identity Center start-URL/region and subnet ID fields — per-launch ' +
       'arguments sent with the launch request, not persistent settings',
   },
   'SecretsPanel.tsx': {

@@ -15668,6 +15668,8 @@
         "stop_waiting": "대기 중지",
         "stopping": "중지 중…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "서브넷 ID (선택)",
+        "subnet_hint": "이 서브넷에서 시작하며 해당 VPC를 사용합니다. 비워 두면 자동으로 선택합니다. 서브넷에 인터넷 송신 경로가 필요합니다.",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

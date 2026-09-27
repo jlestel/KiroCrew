@@ -15668,6 +15668,8 @@
         "stop_waiting": "待機をやめる",
         "stopping": "停止中…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "サブネット ID (任意)",
+        "subnet_hint": "このサブネットで起動し、その VPC を使います。空欄なら自動で選びます。サブネットにはインターネットへの出口が必要です。",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

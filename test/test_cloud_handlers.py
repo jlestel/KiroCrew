@@ -301,6 +301,35 @@ class TestLaunch:
         lst = await hc.api_cloud_launch_list(_req("GET", "/api/cloud/launch", state=state))
         assert any(x["id"] == job_id for x in _body(lst)["jobs"])
 
+    async def test_create_passes_the_subnet_to_the_job_and_engine(self, tmp_path):
+        seen: dict = {}
+
+        class SubnetEngine(FakeEngine):
+            def provision(self, *, tag, size_key, profile, region, subnet_id=""):
+                seen["subnet_id"] = subnet_id
+                return "i-0abc123456789def0"
+
+        state = _state(tmp_path)
+        state.cloud_launch_engine = SubnetEngine()
+        body = {"region": "us-east-1", "size_key": "balanced", "subnet_id": " subnet-0123abcd "}
+        resp = await hc.api_cloud_launch_create(
+            _req("POST", "/api/cloud/launch", state=state, body=body)
+        )
+        assert resp.status == 202
+        job = state.cloud_launch_store.get(_body(resp)["id"])
+        assert job.subnet_id == "subnet-0123abcd"
+        assert seen["subnet_id"] == "subnet-0123abcd"
+
+    async def test_create_refuses_an_invalid_subnet(self, tmp_path):
+        state = _state(tmp_path)
+        body = {"region": "us-east-1", "size_key": "balanced", "subnet_id": "subnet-x; id"}
+        resp = await hc.api_cloud_launch_create(
+            _req("POST", "/api/cloud/launch", state=state, body=body)
+        )
+        assert resp.status == 400
+        assert _body(resp)["code"] == "invalid_subnet"
+        assert state.cloud_launch_store.list() == []
+
     async def test_create_persists_off_the_event_loop(self, tmp_path):
         # The blocking mkdir/write/replace in create() must run in an executor, not
         # on the loop thread, so a slow disk can't stall the gateway + its heartbeat.

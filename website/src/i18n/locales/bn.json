@@ -15883,6 +15883,8 @@
         "stop_waiting": "অপেক্ষা বন্ধ করুন",
         "stopping": "বন্ধ করা হচ্ছে…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "সাবনেট ID (ঐচ্ছিক)",
+        "subnet_hint": "এই সাবনেটে চালু করে; এর VPC ব্যবহার হয়। নিজে থেকে বাছতে ফাঁকা রাখুন। সাবনেটের ইন্টারনেটে বাইরে যাওয়ার পথ লাগবে।",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

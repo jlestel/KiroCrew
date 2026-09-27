@@ -16098,6 +16098,8 @@
         "stop_waiting": "Parar de esperar",
         "stopping": "Parando…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "ID da sub-rede (opcional)",
+        "subnet_hint": "Inicia nesta sub-rede; o VPC dela é usado. Deixe vazio para escolher uma automaticamente. A sub-rede precisa de saída para a internet.",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

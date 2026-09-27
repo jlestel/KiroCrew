@@ -16313,6 +16313,8 @@
         "stop_waiting": "Перестать ждать",
         "stopping": "Остановка…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "ID подсети (необязательно)",
+        "subnet_hint": "Запуск в этой подсети; используется её VPC. Оставь пустым, чтобы выбрать автоматически. Подсети нужен выход в интернет.",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

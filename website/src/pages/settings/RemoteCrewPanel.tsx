@@ -1407,6 +1407,7 @@ export function RemoteCrewPanel() {
   const [identityMode, setIdentityMode] = useState<'builder_id' | 'identity_center'>('builder_id')
   const [identityStartUrl, setIdentityStartUrl] = useState('')
   const [identityRegion, setIdentityRegion] = useState('')
+  const [subnetId, setSubnetId] = useState('')
   const identityTouched = useRef(false)
   // Render-visible twin of the ref: an explicit choice must re-render the
   // Launch gate even when it re-selects the already-checked default.
@@ -1922,7 +1923,7 @@ export function RemoteCrewPanel() {
   // registered provisioner's form owns its own inputs, and the core cannot read
   // them. The built-in call site passes the panel's own profile/region/size.
   const launchMutation = useMutation({
-    mutationFn: (body: { provider_id?: string; profile: string; region: string; size_key: string }) =>
+    mutationFn: (body: { provider_id?: string; profile: string; region: string; size_key: string; subnet_id?: string }) =>
       api.cloudLaunch(body),
     onMutate: () => setActionErr(null),
     onSuccess: job => { setActiveLaunchId(job.id); reloadLaunches() },
@@ -2502,6 +2503,20 @@ export function RemoteCrewPanel() {
               )}
             </div>
 
+            <label className="mt-4 block text-[13px] text-muted">
+              {i18nT('pages.settings.remoteCrewPanel.subnet')}
+              <input
+                type="text"
+                value={subnetId}
+                aria-label={i18nT('pages.settings.remoteCrewPanel.subnet')}
+                onChange={e => setSubnetId(e.target.value)}
+                placeholder="subnet-0123456789abcdef0"
+                spellCheck={false}
+                className="mt-1 w-full px-2 py-1.5 text-[13px] font-mono bg-bg border border-border rounded text-text outline-hidden focus-visible:border-accent"
+              />
+              <span className="block mt-1 text-[12px]">{i18nT('pages.settings.remoteCrewPanel.subnet_hint')}</span>
+            </label>
+
             <div className="mt-4">
               <div className="text-[13px] text-muted mb-2">{i18nT('pages.settings.remoteCrewPanel.identity')}</div>
               {identityQuery.isError ? (
@@ -2625,7 +2640,7 @@ export function RemoteCrewPanel() {
                   behind a different engine; omitting the id would let the server
                   default to the built-in and provision on the wrong lane. Only
                   an UNKNOWN list (loading or failed) sends the pre-seam body. */}
-              <Btn primary onClick={() => launchMutation.mutate({ ...(selectedProvisioner ? { provider_id: selectedProvisioner.id } : {}), profile, region, size_key: sizeKey, ...loginTargetBody })} disabled={!blockingOk || !identityOk || launchMutation.isPending}>
+              <Btn primary onClick={() => launchMutation.mutate({ ...(selectedProvisioner ? { provider_id: selectedProvisioner.id } : {}), profile, region, size_key: sizeKey, ...(subnetId.trim() ? { subnet_id: subnetId.trim() } : {}), ...loginTargetBody })} disabled={!blockingOk || !identityOk || launchMutation.isPending}>
                 <Rocket className="lucide-inline" /> {launchMutation.isPending ? i18nT('pages.settings.remoteCrewPanel.launching') : i18nT('pages.settings.remoteCrewPanel.launch')}
               </Btn>
               <span className="text-[12px] text-muted">

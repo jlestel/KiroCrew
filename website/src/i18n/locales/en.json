@@ -9343,6 +9343,8 @@
         "stop_waiting": "Stop waiting",
         "stopping": "Stopping…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "Subnet ID (optional)",
+        "subnet_hint": "Launch into this subnet; its VPC is used. Leave empty to pick one automatically. The subnet needs internet egress.",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

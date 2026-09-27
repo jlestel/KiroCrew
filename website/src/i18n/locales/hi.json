@@ -15883,6 +15883,8 @@
         "stop_waiting": "इंतज़ार बंद करो",
         "stopping": "रोका जा रहा है…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "सबनेट ID (वैकल्पिक)",
+        "subnet_hint": "इस सबनेट में लॉन्च करता है; उसका VPC इस्तेमाल होता है। अपने-आप चुनने के लिए खाली छोड़ें। सबनेट को इंटरनेट तक बाहर जाने का रास्ता चाहिए।",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",

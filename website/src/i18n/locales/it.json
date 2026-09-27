@@ -16098,6 +16098,8 @@
         "stop_waiting": "Smetti di aspettare",
         "stopping": "Arresto in corso…",
         "subagents": "~{{n}} parallel sub-agents",
+        "subnet": "ID subnet (facoltativo)",
+        "subnet_hint": "Avvia in questa subnet; viene usato il suo VPC. Lascia vuoto per sceglierne una automaticamente. La subnet deve avere accesso in uscita a internet.",
         "tier_development": "Development",
         "tier_development_why": "The normal working setup — non-burstable CPU for steady parallel work.",
         "tier_light": "Light",
