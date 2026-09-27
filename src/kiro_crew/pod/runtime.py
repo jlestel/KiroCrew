@@ -1575,6 +1575,42 @@ def resolved_pod_home(cfg: PodConfig, name: str) -> Path:
         return pod_home(cfg, name)
 
 
+def halt_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
+    """Stop pod *name*'s service and KEEP its isolated HOME.
+
+    The non-destructive half of :func:`stop_pod`, for the one caller that owes a
+    stop but not a reclamation: a failed ``pod up`` that started the unit itself
+    over a home which already held state. Stopping is owed because this invocation
+    started the gateway and the unit is ``Restart=on-failure`` with ``RestartSec=5``
+    and no ``StartLimit`` override, so a crash that is not in
+    ``RestartPreventExitStatus`` respawns every five seconds indefinitely -- the
+    5s gap never fills systemd's default ten-second burst window, so the rate
+    limiter never retires it. Reclaiming is NOT owed, because ``cleanup_home``
+    rmtree's state that predates the invocation and nothing restores it.
+
+    Each backend's own stop is authoritative about the process and nothing here
+    touches the reclamation those paths perform after it, which is why this is a
+    sibling rather than a flag threaded through them.
+
+    The Linux hook refresh is load-bearing rather than copied: a unit installed by
+    an older build still carries the destructive ``ExecStopPost``, and
+    ``systemctl stop`` runs it -- so on that host a "keep the home" stop would
+    delete the home, which is the one thing this function exists not to do. An
+    unanswerable query counts as "hook present", and a failed reload refuses
+    instead of stopping, exactly as :func:`stop_pod` does.
+    """
+    with pod_name_mutex(cfg, name):
+        if IS_MACOS:
+            return launchd.stop(cfg, name)
+        if IS_WINDOWS:
+            return win_backend.stop(cfg, name)
+        if loaded_teardown_hook(cfg, name) is not False:
+            refused = _refresh_stale_unit(cfg)
+            if refused is not None:
+                return refused
+        return systemctl("stop", pod_unit(cfg, name))
+
+
 def stop_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
     """Stop pod *name* and reclaim its isolated HOME, or say why it could not.
 
@@ -2416,6 +2452,70 @@ def _mint_403_cause(exc: urllib.error.HTTPError, name: str) -> str:
     )
 
 
+def _pod_secret_candidates(cfg: PodConfig, name: str, port: int) -> tuple[Path, Path]:
+    """The two files a pod's internal-API credential can live in, in read order.
+
+    ONE definition, because two callers must agree about it: the mint below reads
+    these paths, and :func:`published_credential` reports what a caller would find
+    there. A reader that checked a different pair than the mint uses would report a
+    pod ready whose credential the mint cannot find, which is the exact failure that
+    reader exists to prevent.
+    """
+    return (_pod_secret_path(cfg, name, port), cfg.home_dir(name) / ".local_secret")
+
+
+def _read_pod_secret_file(path: Path) -> str:
+    """The credential recorded at *path*, or ``""`` when it cannot be read there.
+
+    Explicit ``utf-8``, never the locale default, because ``read_text()`` without
+    an encoding decodes with whatever the host prefers: a Windows runner reading
+    cp1252 accepts byte sequences a UTF-8 host rejects, so the same corrupt file
+    would be a credential on one machine and an error on another. The gateway
+    writes ASCII, so pinning the encoding changes nothing about a healthy file and
+    makes an unhealthy one behave the same everywhere.
+
+    ``ValueError`` is caught beside ``OSError`` because ``UnicodeDecodeError`` is a
+    ``ValueError``, NOT an ``OSError``. Both mean the same thing to every caller --
+    "no credential HERE" -- so both fall through to the next candidate, and a
+    corrupt per-listener file lets the shared ``.local_secret`` still answer
+    instead of turning into a traceback out of a mint or a boot poll.
+    """
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def published_credential(cfg: PodConfig, name: str, port: int) -> str:
+    """Pod *name*'s currently published credential for *port*, or ``""``.
+
+    The VALUE, not a boolean, because a caller that just started a gateway has to
+    tell one GENERATION's credential from another's and a predicate cannot express
+    that. Presence is not proof of a live pod: ``clear_marker`` runs only on a
+    graceful shutdown and the stale-marker prune deliberately never removes the
+    credential, so a pod home that survived a crash still holds the PREVIOUS
+    generation's ``run/gateway-<port>.secret``. A boot that read that as
+    "published" would call the pod ready the instant it looked, and be handed a
+    secret the new gateway never minted.
+
+    A pod's gateway publishes this only AFTER its listener is bound, so an
+    answering ``/api/health`` does NOT imply the credential exists yet: the
+    listener is already accepting while the remaining post-bind startup work runs,
+    and the credential write sits at the end of it. A caller that treats health as
+    the whole readiness signal races that write and reads nothing.
+
+    Reads through the same helper and the same path pair as the mint, so a
+    non-empty return means exactly "the mint would find this" -- including the
+    emptiness test, because the file is created and then written, and a caller that
+    stopped at presence could report a pod ready whose credential is still blank.
+    """
+    for candidate in _pod_secret_candidates(cfg, name, port):
+        secret = _read_pod_secret_file(candidate)
+        if secret:
+            return secret
+    return ""
+
+
 def _pod_mint_secret(cfg: PodConfig, name: str, port: int) -> str:
     """Pod *name*'s internal-API credential for the gateway on *port*.
 
@@ -2434,13 +2534,9 @@ def _pod_mint_secret(cfg: PodConfig, name: str, port: int) -> str:
 
     Raises :class:`PodError` when neither file can be read, naming both.
     """
-    per_port = _pod_secret_path(cfg, name, port)
-    shared = cfg.home_dir(name) / ".local_secret"
+    per_port, shared = _pod_secret_candidates(cfg, name, port)
     for candidate in (per_port, shared):
-        try:
-            secret = candidate.read_text().strip()
-        except OSError:
-            continue
+        secret = _read_pod_secret_file(candidate)
         if secret:
             return secret
     raise PodError(

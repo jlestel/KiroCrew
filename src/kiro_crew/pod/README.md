@@ -224,8 +224,10 @@ response text and transport failures never include the authenticated URL.
 - **Payload** — the booted pod *is* the worktree's `.venv/bin/kirocrew gateway`. If
   the worktree's gateway can't start (bad import, broken config, unbuilt dist), the
   pod can't come up — **and that is correct**. `pod up` detects the crash fast,
-  prints the gateway's own journal, stops the half-started unit, and tells you this
-  is the worktree build failing — not the pod tool.
+  prints the gateway's own journal, and tells you this is the worktree build failing
+  — not the pod tool. It stops a unit it started itself, so a crash-looping gateway
+  is not left respawning; it reclaims the isolated home only when it created that
+  home too, and a pod it did not start is left alone for `pod down` to retire.
 
 ## Mechanism (Linux `systemd --user`)
 
