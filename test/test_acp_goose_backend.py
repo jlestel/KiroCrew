@@ -1525,3 +1525,86 @@ def test_the_drift_refusals_run_on_both_answering_sites() -> None:
     stream = inspect.getsource(AcpClient.send_message_stream)
     assert "if self._judges_permission_requests:" in stream
     assert "self._extract_tool_event(msg)" in stream
+
+
+# ── An unconfigured harness: the declared message, and no retry ──
+
+#: The ``session/new`` error goose 1.50.1 and 1.52.0 return when no provider is
+#: configured, copied off the live wire (``goose acp``, empty config home).
+_GOOSE_NO_PROVIDER_ERROR = {
+    "code": -32603,
+    "message": "Internal error",
+    "data": "Failed to resolve provider: Configuration value not found: GOOSE_PROVIDER",
+}
+
+
+def _startup_client(backend: str, spawns: list[int]) -> AcpClient:
+    """A client whose every ``session/new`` answers the live no-provider error.
+
+    Shaped the way ``_send_request`` raises it, so the startup ladder sees the same
+    ``AcpError`` text a real goose child produces.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.acp.client import AcpError
+
+    client = AcpClient(acp_backend=backend)
+    client._process = None
+    client._session_id = None
+    client._kill_process = AsyncMock()
+    client._cleanup_failed_live_spawn = AsyncMock()
+    client._snapshot_process_tree = AsyncMock()
+
+    def _reset():
+        # The real reset drops the process handle, which is what makes the next
+        # pass spawn again; without it a retry would silently be a no-op.
+        client._process = None
+        client._session_id = None
+
+    client._reset_state = _reset
+
+    async def _spawn():
+        spawns.append(1)
+        client._process = MagicMock()
+        client._process.returncode = None
+
+    async def _session_new():
+        raise AcpError(f"JSON-RPC error: {_GOOSE_NO_PROVIDER_ERROR}")
+
+    client._spawn = _spawn
+    client._initialize_session = _session_new
+    return client
+
+
+def test_an_unconfigured_goose_names_the_fix_and_is_not_retried() -> None:
+    import asyncio
+
+    from kiro_crew.acp.client import AcpAuthRequired, AcpError
+    from kiro_crew.agent_sdk import host_auth
+
+    spawns: list[int] = []
+    client = _startup_client(GOOSE, spawns)
+    with pytest.raises(AcpError) as info:
+        asyncio.run(client.ensure_ready())
+    assert str(info.value) == host_auth.signed_out_message(GOOSE)
+    # One spawn: a fresh process reads the same missing provider.
+    assert spawns == [1]
+    assert info.value.transient is False
+    # Not the Kiro sign-in type: the dashboard would mark a valid kiro-cli login
+    # as signed out over a goose setup gap.
+    assert not isinstance(info.value, AcpAuthRequired)
+    assert info.value.auth_required is False
+
+
+def test_the_goose_phrase_does_not_classify_another_harness() -> None:
+    """Scoped per harness: kiro-cli meeting the same words keeps its retry."""
+    import asyncio
+
+    from kiro_crew.acp.client import AcpAuthRequired, AcpError
+
+    spawns: list[int] = []
+    client = _startup_client(acp_backends.ACP_BACKEND_KIRO, spawns)
+    with pytest.raises(AcpError) as info:
+        asyncio.run(client.ensure_ready())
+    assert not isinstance(info.value, AcpAuthRequired)
+    assert spawns == [1, 1]

@@ -2889,3 +2889,64 @@ def test_the_injection_is_inside_the_arm_and_the_probe_is_never_handed_a_key() -
     assert "_deepseek_vault_env)" not in arm
     assert "_deepseek_vault_env_names" in arm
     assert "resolve_secret_uris" not in arm
+
+
+# ── A harness with no provider key: the declared message, not the raw frame ──
+
+#: The ``session/prompt`` error dsh 0.1.5-rc.3 returns when no provider key
+#: reaches it, copied off the live wire. It carries no ``data`` field.
+_DSH_NO_KEY_ERROR = {
+    "code": -32603,
+    "message": (
+        'Internal error: turn failed: llm-deepseek: no API key for provider route "'
+        'deepseek-official"; store DEEPSEEK_API_KEY through the credentials service '
+        "(the web Models page writes it), or export DEEPSEEK_API_KEY in the launching "
+        "environment"
+    ),
+}
+
+
+def test_a_missing_provider_key_gets_the_declared_message() -> None:
+    from kiro_crew.acp.client import _format_acp_error
+    from kiro_crew.agent_sdk import host_auth
+
+    formatted = _format_acp_error(_DSH_NO_KEY_ERROR, backend=ACP_BACKEND_DEEPSEEK)
+    assert formatted == host_auth.signed_out_message(ACP_BACKEND_DEEPSEEK)
+
+
+def test_the_request_id_survives_the_rewrite() -> None:
+    from kiro_crew.acp.client import _format_acp_error
+    from kiro_crew.agent_sdk import host_auth
+
+    error = dict(_DSH_NO_KEY_ERROR, data="request_id: 0f1e2d3c-4b5a")
+    formatted = _format_acp_error(error, backend=ACP_BACKEND_DEEPSEEK)
+    assert formatted == (
+        f"{host_auth.signed_out_message(ACP_BACKEND_DEEPSEEK)} (request_id: 0f1e2d3c-4b5a)"
+    )
+
+
+def test_a_missing_provider_key_is_not_retried() -> None:
+    from kiro_crew.acp.client import AcpError, _raise_acp_error
+
+    with pytest.raises(AcpError) as info:
+        _raise_acp_error(_DSH_NO_KEY_ERROR, backend=ACP_BACKEND_DEEPSEEK)
+    assert info.value.transient is False
+
+
+def test_the_deepseek_phrase_does_not_classify_another_harness() -> None:
+    from kiro_crew.acp.client import _format_acp_error
+    from kiro_crew.agent_sdk import host_auth
+
+    formatted = _format_acp_error(_DSH_NO_KEY_ERROR, backend="goose")
+    assert host_auth.signed_out_message(ACP_BACKEND_DEEPSEEK) not in formatted
+    assert host_auth.signed_out_message("goose") not in formatted
+
+
+def test_a_blank_signed_out_signature_is_refused() -> None:
+    import dataclasses
+
+    from kiro_crew.agent_sdk import host_auth
+
+    declaration = host_auth.declaration_for(ACP_BACKEND_DEEPSEEK)
+    with pytest.raises(ValueError, match="blank signed-out signature"):
+        dataclasses.replace(declaration, signed_out_signature="  ")

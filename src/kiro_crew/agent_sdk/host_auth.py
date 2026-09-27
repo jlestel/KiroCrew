@@ -255,6 +255,19 @@ class AgentAuthDeclaration:
     #: re-spell where its file lands, never name a different file.
     override_relative_leaves: Tuple[str, ...] = ()
 
+    #: The phrase in this harness's OWN error text that means it cannot reach a
+    #: model until the operator signs it in or configures a provider.
+    #:
+    #: Matched case-insensitively as a substring of a JSON-RPC error's ``data`` and
+    #: ``message``. A match is the evidence :attr:`signed_out_message` needs, so the
+    #: client shows that message and does not retry: a respawn meets the same
+    #: missing configuration. The phrase is copied from a live capture of the
+    #: harness, never guessed, because a phrase that also appears in a transient
+    #: failure would turn a retryable error into a terminal one. Empty means the
+    #: harness's signed-out answers are already read by the shared auth vocabulary
+    #: (or have not been captured yet).
+    signed_out_signature: str = ""
+
     # There is deliberately NO field for re-exposing a file the mask hides.
     #
     # A re-exposure is an EDIT to the mask, and the rule this class exists to
@@ -285,6 +298,10 @@ class AgentAuthDeclaration:
             raise ValueError(f"{self.backend!r} declares no sign-in remedy")
         if not self.signed_out_message.strip():
             raise ValueError(f"{self.backend!r} declares no signed-out message")
+        if self.signed_out_signature and not self.signed_out_signature.strip():
+            # A blank phrase is a substring of every error, so it would make every
+            # failure of this harness terminal and hide its real cause.
+            raise ValueError(f"{self.backend!r} declares a blank signed-out signature")
         stray = tuple(
             leaf for leaf in self.adapter_own_leaves if leaf not in self.credential_leaves
         )
@@ -567,6 +584,11 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # still reach its model.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        # goose 1.50.1 and 1.52.0, driven live with no provider configured, answer
+        # ``session/new`` with -32603 and ``Failed to resolve provider:
+        # Configuration value not found: GOOSE_PROVIDER``. No session opens, so no
+        # retry can help until ``goose configure`` has run.
+        signed_out_signature="Failed to resolve provider",
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_PI,
@@ -694,6 +716,11 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # logout does not touch either.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_HOST_VAULT,
+        # dsh 0.1.5-rc.3, driven live with no key in its environment and an empty
+        # ``DSH_HOME``, opens the session and then answers the first
+        # ``session/prompt`` with -32603 ``... no API key for provider route
+        # "deepseek-official"; store DEEPSEEK_API_KEY ...``.
+        signed_out_signature="no API key for provider route",
     ),
 )
 
@@ -809,6 +836,18 @@ def signed_out_message(backend: str) -> str:
     return declaration_for(backend).signed_out_message
 
 
+def reports_signed_out(backend: str, text: str) -> bool:
+    """Whether *text* is *backend*'s own answer for "not signed in / not configured".
+
+    Reads only the phrase *backend* declares in
+    :attr:`AgentAuthDeclaration.signed_out_signature`, so one harness's wording
+    can never classify another harness's error. A True answer is the evidence
+    :func:`signed_out_message` asks for.
+    """
+    signature = declaration_for(backend).signed_out_signature
+    return bool(signature) and signature.casefold() in text.casefold()
+
+
 def entitlement_label(backend: str) -> str:
     """What to call *backend*'s entitlement source in front of an operator.
 
@@ -889,6 +928,7 @@ __all__ = [
     "home_override_env_vars",
     "missing_declarations",
     "override_anchored_leaves",
+    "reports_signed_out",
     "signed_out_message",
     "signs_in_separately",
 ]

@@ -5070,6 +5070,12 @@ def _format_acp_error(
                 "and try again; it clears on its own once the stale turn "
                 "expires. If it persists, start a new conversation."
             )
+        elif host_auth.reports_signed_out(backend, haystack):
+            # The harness's OWN words for "no provider / no key", declared per
+            # harness in ``host_auth``. Without this the answer fell through to the
+            # branch below and reached the user as a raw -32603 frame that names
+            # no fix; the declared message names the one that works.
+            formatted = f"{host_auth.signed_out_message(backend)}{req_id_suffix}"
         else:
             # Unrecognised failure mode. Show the PROVIDER'S OWN message when
             # there is one — it is the true error, and the same words the CLI
@@ -10855,6 +10861,23 @@ class AcpClient:
                         await self._cleanup_failed_live_spawn()
                         self._reset_state()
                         raise sandbox_failure from exc
+                    # The harness answered with its OWN "no provider / not signed
+                    # in" words (declared in ``host_auth``). Deterministic like the
+                    # sandbox refusal above: a fresh process reads the same missing
+                    # configuration, so fail fast with the message that names the
+                    # fix instead of a retry and then a raw JSON-RPC frame. A plain
+                    # non-transient ``AcpError`` rather than ``AcpAuthRequired``: the
+                    # dashboard reads that type as "Kiro is signed out" and would
+                    # mark a valid kiro-cli login as not ready.
+                    if isinstance(exc, AcpError) and host_auth.reports_signed_out(
+                        self.backend, str(exc)
+                    ):
+                        _startup_outcome = "auth_required"
+                        await self._cleanup_failed_live_spawn()
+                        self._reset_state()
+                        raise AcpError(
+                            host_auth.signed_out_message(self.backend), transient=False
+                        ) from exc
                     if attempt == 0:
                         logger.warning("ACP init failed (%s), retrying with fresh process...", exc)
                         await self._cleanup_failed_live_spawn()
@@ -10869,8 +10892,8 @@ class AcpClient:
                         _throttled = await self._registration_throttle_line()
                         # AcpAuthRequired subclasses AcpError; label it distinctly
                         # so a not-logged-in exit is never counted as a generic
-                        # startup error. (The fork has no separate auth fail-fast
-                        # branch — retry semantics stay unchanged.)
+                        # startup error. (Only a harness's declared signed-out
+                        # phrase fails fast, above; other auth answers keep the retry.)
                         if isinstance(exc, AcpAuthRequired):
                             _startup_outcome = "auth_required"
                         elif _throttled is not None:
