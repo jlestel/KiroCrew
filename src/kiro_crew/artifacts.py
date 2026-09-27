@@ -3881,65 +3881,73 @@ class ArtifactStore:
 
     @staticmethod
     def _rmtree(path: Path) -> None:
-        """Remove *path* and everything under it, holding each directory PINNED.
+        """Remove *path* and everything under it, anchored to PINNED directories.
 
-        Stdlib-only (no ``shutil``), and deliberately not an ``os.walk``. Screening a
-        name for a link and then letting a walker descend that name are two
-        operations on two objects: ``os.walk``'s own descent-time re-check is
-        ``os.path.islink``, which answers False for a Windows junction, so a junction
-        planted at a child AFTER it screened clean is still descended -- and this
-        function then unlinks the link target's files, outside the artifact store.
-        Creating a junction needs no elevation and the agent both triggers a delete
-        and can retry it, so that window is ordinary rather than exotic.
+        Stdlib-only (no ``shutil``), and deliberately not a walker. Screening a name
+        for a link and then acting on that name are two operations on two objects,
+        and every walker in the stdlib re-resolves the name in between:
+        ``os.walk``'s own descent-time re-check is ``os.path.islink``, which answers
+        False for a Windows junction, and ``rglob`` descends one unconditionally. A
+        junction planted at a child that screened clean was therefore still
+        descended, and this function unlinked the link target's files -- outside the
+        artifact store. Creating a junction needs no elevation, and the agent both
+        triggers a delete and can retry it, so the window is ordinary.
 
-        :func:`platform_compat.pin_directory` is what closes it, and it is the same
-        object twice rather than a tighter re-check: the open REFUSES a reparse point
-        at the name instead of following it, and on Windows the handle is opened
-        without ``FILE_SHARE_DELETE``, so while it lives this directory and every
-        ancestor can be neither renamed nor deleted. On POSIX it is
-        ``O_DIRECTORY | O_NOFOLLOW`` and the descriptor lists the directory it
-        inspected. The pin is released only once the directory is empty, because a
-        pinned directory on Windows cannot itself be removed.
-
-        A link found among the entries is removed with
-        :func:`platform_compat.unlink_link_or_junction`, which unlinks the link and
-        never what it points at.
+        :class:`platform_compat.PinnedDirectory` is what closes it, and it closes
+        BOTH halves: the descent refuses a link in the open itself rather than in a
+        check before it, and each removal is anchored to the directory that was
+        inspected -- ``dir_fd``-relative on POSIX, and by a path the Windows pin
+        holds still. A parent stays pinned while its child is being emptied, so the
+        whole chain is pinned for the length of the sweep.
 
         Failures: each entry that will not go is logged and the sweep continues, so
-        the warnings name every residual rather than stopping at the first. The final
-        removal of *path* is NOT guarded -- a residual anywhere keeps it non-empty, so
-        it fails, and the caller must see that: it logs a successful delete and fires
-        its ``"delete"`` event unconditionally, and a Windows sharing violation on a
-        store file is an ordinary occurrence, not an exotic one.
+        the warnings name every residual rather than stopping at the first. The
+        removal of *path* itself is NOT guarded -- a residual anywhere keeps it
+        non-empty, so it fails, and the caller must see that: it logs a successful
+        delete and fires its ``"delete"`` event unconditionally, and a Windows
+        sharing violation on a store file is an ordinary occurrence.
         """
-        list_takes_fd = os.listdir in getattr(os, "supports_fd", set())
 
-        def _purge(directory: Path) -> None:
-            try:
-                fd = platform_compat.pin_directory(directory)
-            except NotADirectoryError:
-                # A reparse point arrived at this name after the caller screened it.
-                # It is a link, so remove the link itself and leave its target alone.
-                platform_compat.unlink_link_or_junction(directory)
-                return
-            try:
-                names = sorted(os.listdir(fd) if list_takes_fd else os.listdir(directory))
-                for name in names:
-                    entry = directory / name
+        def _empty(pinned: platform_compat.PinnedDirectory) -> None:
+            for name in sorted(pinned.names()):
+                try:
+                    if pinned.is_link(name) or not pinned.is_dir(name):
+                        pinned.unlink(name)
+                        continue
                     try:
-                        if platform_compat.is_link_or_junction(entry):
-                            platform_compat.unlink_link_or_junction(entry)
-                        elif entry.is_dir():
-                            _purge(entry)
-                        else:
-                            os.unlink(entry)
-                    except OSError as exc:
-                        logger.warning("rmtree partial failure at %s: %s", entry, exc)
-            finally:
-                os.close(fd)
-            os.rmdir(directory)
+                        child = pinned.child(name)
+                    except OSError:
+                        # The open REFUSING is the protection working: something
+                        # replaced the name between the screen above and this open.
+                        # Dispatch on what is at the name NOW, never on the exception
+                        # class -- Linux answers ENOTDIR for O_DIRECTORY|O_NOFOLLOW on
+                        # a symlink but ELOOP is equally permitted (``pin_directory``
+                        # says "whichever of ENOTDIR / ELOOP the kernel reports"), and
+                        # the Windows open raises NotADirectoryError for a reparse
+                        # point. Keying on one class leaves the entry behind wherever
+                        # the kernel picks another, and the unguarded removal of the
+                        # root then fails with ENOTEMPTY out of ``delete()``. Asking
+                        # what is there also keeps a plain FILE that arrived at the
+                        # name from being removed as though it were a link.
+                        if pinned.is_link(name) or not pinned.is_dir(name):
+                            pinned.unlink(name)
+                            continue
+                        raise
+                    with child:
+                        _empty(child)
+                    pinned.rmdir(name)
+                except OSError as exc:
+                    logger.warning(
+                        "rmtree partial failure at %s: %s", os.path.join(pinned.path, name), exc
+                    )
 
-        _purge(path)
+        # The PARENT is pinned too, so even the root's own removal is anchored
+        # rather than a by-name ``rmdir`` the pinning above would leave as the one
+        # unprotected step.
+        with platform_compat.pinned_directory(path.parent) as parent:
+            with parent.child(path.name) as root:
+                _empty(root)
+            parent.rmdir(path.name)
 
 
 # ── Artifact folders ────────────────────────────────────────────

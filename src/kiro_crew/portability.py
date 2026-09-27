@@ -761,43 +761,72 @@ def _strip_host_local_store_state(snap: Path) -> None:
 
     The export's own filter (`_keep_store_for_export`) keeps these out on the way out; this
     is the same predicate applied on the way in, so an import is not the one direction in
-    which a hand-built archive can plant them. Walked top-down and pruned at the first
-    matching component, so a whole ``.execution-logs/`` or ``<store>/backups/`` goes as
-    one removal.
+    which a hand-built archive can plant them. Pruned at the first matching component, so a
+    whole ``.execution-logs/`` or ``<store>/backups/`` goes as one removal.
     """
     root = snap / MEMORY_STORES_DIR_NAME
     if not root.is_dir():
         return
-    # ``os.walk`` with the link prune below rather than ``rglob``: a Windows
-    # directory junction answers False to ``Path.is_symlink()`` and True to
-    # ``is_dir()``, and BOTH walkers descend through one. A junction in a
-    # hand-built archive therefore had its target's tree enumerated here, and any
-    # entry out there whose relative name matched the predicate was unlinked -- a
-    # delete outside the extracted archive entirely. The same link also reached
-    # ``shutil.rmtree``, which refuses a reparse point and raised out of the
-    # import. A link is removed when the predicate matches it and is never
-    # descended either way, because what it points at is not in this archive.
-    for dirpath, dirnames, filenames in os.walk(str(root), topdown=True):
-        here = Path(dirpath)
-        for name in list(dirnames):
-            entry = here / name
-            rel = (MEMORY_STORES_DIR_NAME, *entry.relative_to(root).parts)
-            if platform_compat.is_link_or_junction(entry):
-                dirnames.remove(name)
-                if is_host_local_store_state(rel):
-                    platform_compat.unlink_link_or_junction(entry)
+
+    # Every directory is PINNED before its entries are judged, and each entry is acted
+    # on through that pin. ``os.walk`` could not be made safe here: its own descent
+    # re-check is ``os.path.islink``, which a Windows directory junction answers False
+    # to, so a junction planted after the screen below was still descended and an entry
+    # OUT THERE whose relative name matched the predicate was unlinked -- a delete
+    # outside the extracted archive entirely. The extraction directory is only
+    # owner-restricted, which does not exclude a same-UID agent process, so the swap
+    # needs no cooperation from the archive. A link is removed when the predicate
+    # matches it and is never descended either way, because what it points at is not in
+    # this archive.
+    def _empty(pinned: platform_compat.PinnedDirectory) -> None:
+        """Remove every entry under *pinned*, through pins the whole way down."""
+        for name in sorted(pinned.names()):
+            if pinned.is_link(name) or not pinned.is_dir(name):
+                pinned.unlink(name)
                 continue
-            if is_host_local_store_state(rel):
-                # Pruned from the walk as well as removed, so a whole
-                # ``.execution-logs/`` or ``<store>/backups/`` goes as one removal
-                # and its contents are never judged individually.
-                dirnames.remove(name)
-                shutil.rmtree(str(entry))
-        for name in filenames:
-            entry = here / name
-            rel = (MEMORY_STORES_DIR_NAME, *entry.relative_to(root).parts)
-            if is_host_local_store_state(rel):
-                entry.unlink()
+            _remove_dir(pinned, name)
+
+    def _remove_dir(pinned: platform_compat.PinnedDirectory, name: str) -> None:
+        """Remove the real directory *name* and its whole subtree."""
+        try:
+            sub = pinned.child(name)
+        except OSError:
+            # The open REFUSING is the protection working. Dispatch on what is at the
+            # name now, never on the exception class: the errno reported for a link
+            # differs by kernel, and this entry is being removed either way.
+            if pinned.is_link(name) or not pinned.is_dir(name):
+                pinned.unlink(name)
+                return
+            raise
+        with sub:
+            _empty(sub)
+        pinned.rmdir(name)
+
+    def _strip(pinned: platform_compat.PinnedDirectory, rel: tuple[str, ...]) -> None:
+        for name in sorted(pinned.names()):
+            here = (*rel, name)
+            matched = is_host_local_store_state((MEMORY_STORES_DIR_NAME, *here))
+            if pinned.is_link(name) or not pinned.is_dir(name):
+                if matched:
+                    pinned.unlink(name)
+                continue
+            if matched:
+                # Removed whole, so its contents are never judged individually.
+                _remove_dir(pinned, name)
+                continue
+            try:
+                sub = pinned.child(name)
+            except OSError:
+                if pinned.is_link(name) or not pinned.is_dir(name):
+                    # Replaced since the screen. Not descended, and NOT removed: the
+                    # predicate did not match it, so it is not this function's to delete.
+                    continue
+                raise
+            with sub:
+                _strip(sub, here)
+
+    with platform_compat.pinned_directory(root) as pinned:
+        _strip(pinned, ())
 
 
 def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:

@@ -7181,6 +7181,200 @@ def pin_directory(path: str | os.PathLike) -> int:
     return fd
 
 
+class PinnedDirectory:
+    """Act on the ENTRIES of the directory this was opened on, never on its name.
+
+    :func:`pin_directory` hands back a descriptor; this is the operations that go
+    with it, because holding the descriptor is only half of what a caller needs. A
+    screen and the act that follows it must reach the same object, and the two
+    platforms reach that property by OPPOSITE routes:
+
+    * POSIX: every call is ``dir_fd=``-relative, so the descriptor IS the
+      directory whatever its name now resolves to. It must be that way, because
+      the pin does NOT stop a rename here -- a name re-resolved after the screen
+      is exactly the hole.
+    * Windows: there are no ``dir_fd`` operations at all (``os.open``,
+      ``os.listdir``, ``os.unlink`` and ``os.rmdir`` are in neither
+      ``os.supports_fd`` nor ``os.supports_dir_fd``), so every call goes by path
+      -- and that is sound only because the pin makes the path stable: the handle
+      is opened without ``FILE_SHARE_DELETE``, so while it lives this directory
+      and every ancestor refuse a rename and a delete.
+
+    So neither route works on the other platform, and a caller written in terms of
+    one of them is broken on the other. That asymmetry is the whole reason this
+    exists rather than each site branching on ``IS_POSIX`` itself.
+
+    A child is opened THROUGH the parent, and the parent stays pinned while the
+    child is in use, so a chain of these pins the whole path. :meth:`child`
+    refuses a link at the name on both platforms, which is what makes a
+    screen-then-descend sequence safe: the refusal happens in the open, not in a
+    check before it.
+
+    Use it as a context manager; the descriptor is closed on exit. Removing the
+    directory ITSELF is the parent's job (``parent.rmdir(name)``), both because a
+    pinned directory on Windows cannot be removed while the handle lives and
+    because a by-name removal is the thing this class exists to avoid.
+    """
+
+    __slots__ = ("_fd", "_path")
+
+    def __init__(self, fd: int, path: str) -> None:
+        self._fd = fd
+        self._path = path
+
+    @property
+    def fd(self) -> int:
+        """The pinned descriptor, for a caller that needs it directly."""
+        return self._fd
+
+    @property
+    def path(self) -> str:
+        """The path this was opened on -- for MESSAGES, not for operations."""
+        return self._path
+
+    def __enter__(self) -> PinnedDirectory:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        os.close(self._fd)
+
+    def names(self) -> list[str]:
+        """The entry names, read through the pin."""
+        if IS_POSIX:
+            return os.listdir(self._fd)
+        return os.listdir(self._path)
+
+    def lstat(self, name: str) -> os.stat_result | None:
+        """``lstat`` of *name* in this directory, or None if it cannot be read."""
+        try:
+            if IS_POSIX:
+                return os.stat(name, dir_fd=self._fd, follow_symlinks=False)
+            return os.lstat(os.path.join(self._path, name))
+        except OSError:
+            return None
+
+    def is_link(self, name: str) -> bool:
+        """Whether *name* is a symlink or (on Windows) a directory junction."""
+        if IS_POSIX:
+            info = self.lstat(name)
+            return info is not None and stat.S_ISLNK(info.st_mode)
+        return is_link_or_junction(os.path.join(self._path, name))
+
+    def is_dir(self, name: str) -> bool:
+        """Whether *name* is a real directory -- a link answers False, not its target's shape."""
+        if self.is_link(name):
+            return False
+        info = self.lstat(name)
+        return info is not None and stat.S_ISDIR(info.st_mode)
+
+    def unlink(self, name: str) -> None:
+        """Remove the non-directory *name*. A link is removed, never its target."""
+        if IS_POSIX:
+            os.unlink(name, dir_fd=self._fd)
+            return
+        unlink_link_or_junction(os.path.join(self._path, name))
+
+    def rmdir(self, name: str) -> None:
+        """Remove the EMPTY directory *name* in this directory."""
+        if IS_POSIX:
+            os.rmdir(name, dir_fd=self._fd)
+            return
+        os.rmdir(os.path.join(self._path, name))
+
+    def child(self, name: str) -> PinnedDirectory:
+        """Pin the child directory *name*, reached through this pin.
+
+        Raises ``NotADirectoryError`` for a link or a non-directory at the name --
+        the refusal is the open itself, so there is no window between deciding the
+        name is a real directory and having it open.
+        """
+        if IS_POSIX:
+            fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._fd,
+            )
+            return PinnedDirectory(fd, os.path.join(self._path, name))
+        child_path = os.path.join(self._path, name)
+        return PinnedDirectory(pin_directory(child_path), child_path)
+
+    def open_file(self, name: str) -> int:
+        """Open the regular file *name* in this directory for reading.
+
+        The leaf counterpart to :meth:`child`, and the reason a caller can both
+        JUDGE and READ an entry in one traversal instead of screening names and
+        re-resolving them afterwards. A link at the name is refused by the open
+        itself, so there is no check-to-read window for an adversary to aim at.
+
+        ``O_NONBLOCK`` is set so the OPEN cannot block: a FIFO at the name would
+        otherwise wait for a writer, and a hung read is a lost test RUN rather than
+        a failed one. It has no effect on a regular file. What was opened is then a
+        question for ``fstat`` on the descriptor, which is why :meth:`read_bytes`
+        asserts there rather than predicting here.
+
+        Raises ``OSError``/``NotADirectoryError`` for a link, ``IsADirectoryError``
+        for a directory. Release the descriptor with ``os.close``.
+        """
+        if IS_POSIX:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            return os.open(name, flags, dir_fd=self._fd)
+        return open_file_no_reparse(os.path.join(self._path, name), nonblocking=True)
+
+    def read_bytes(self, name: str) -> bytes:
+        """The bytes of the regular file *name*, read through this pin.
+
+        Refuses a link at the name, as :meth:`open_file` does, so the bytes come
+        from the entry that was inspected rather than from wherever its name points
+        by the time the read happens. Every further question is asked of the
+        DESCRIPTOR, which is a fact about what was opened rather than a prediction
+        about what a later open would find:
+
+        * not a REGULAR file -- a directory, a device, a FIFO -- is refused.
+        * ``st_nlink > 1`` is refused. A hardlink is invisible to every
+          path-based guard because it shares its target's inode while carrying its
+          own name, so a sensitive file hardlinked into a tree the caller believes
+          it owns would otherwise be read out through it. This is the same refusal
+          the other hardened readers here make.
+        """
+        fd = self.open_file(name)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+                raise OSError(
+                    errno.EINVAL,
+                    "not a private regular file",
+                    os.path.join(self._path, name),
+                )
+            chunks: list[bytes] = []
+            while True:
+                block = os.read(fd, 1 << 16)
+                if not block:
+                    return b"".join(chunks)
+                chunks.append(block)
+        finally:
+            os.close(fd)
+
+    def read_text(self, name: str, encoding: str = "utf-8") -> str:
+        """The text of the regular file *name*, read through this pin.
+
+        Newlines are translated exactly as ``Path.read_text`` translates them. That
+        is not cosmetic: a caller swapping a by-path ``read_text`` for this must not
+        begin serving ``\\r\\n`` to its own consumers on Windows, where the bytes on
+        disk carry it and the old read silently normalised it away.
+        """
+        text = self.read_bytes(name).decode(encoding)
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def pinned_directory(path: str | os.PathLike) -> PinnedDirectory:
+    """Open *path* as a :class:`PinnedDirectory`. Refuses a link at the name."""
+    target = os.fspath(path)
+    return PinnedDirectory(pin_directory(target), target)
+
+
 def _win_open_without_following(path: str | os.PathLike) -> int:
     """``CreateFileW`` *path* for reading, opening a reparse point INSTEAD of following it.
 

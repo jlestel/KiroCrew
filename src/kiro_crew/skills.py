@@ -46,8 +46,10 @@ from kiro_crew.hooks import (
 from kiro_crew.memory_recall import recall_terms
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform_compat import (
+    PinnedDirectory,
     ensure_owner_rwx_dirs,
     is_link_or_junction,
+    pinned_directory,
     rmtree_force,
 )
 from kiro_crew.project_scope import project_scope_satisfied
@@ -5293,6 +5295,102 @@ class SkillsLoader:
 
     _ALLOWED_CANDIDATE_TOP = frozenset({"SKILL.md", ".meta.json", "scripts"})
 
+    def _collect_scripts_pinned(
+        self,
+        pinned: PinnedDirectory,
+        rel: tuple[str, ...],
+        out: list[dict],
+    ) -> bool:
+        """Collect ``{filename, content}`` under *pinned*, refusing a link anywhere.
+
+        Returns False when the tree is not readable as plain files and directories,
+        which the caller turns into a refusal of the whole candidate. Relative
+        filenames carry the platform separator, because they are served through the
+        API.
+        """
+        for name in sorted(pinned.names()):
+            if pinned.is_link(name):
+                return False
+            if pinned.is_dir(name):
+                try:
+                    sub = pinned.child(name)
+                except OSError:
+                    # The open refusing IS the protection: what is at the name is not
+                    # the real directory it screened as. Refuse the candidate.
+                    return False
+                with sub:
+                    if not self._collect_scripts_pinned(sub, (*rel, name), out):
+                        return False
+                continue
+            try:
+                text = pinned.read_text(name)
+            except (OSError, UnicodeDecodeError):
+                # ONE refusal policy, so nothing here reasons about error classes.
+                # An entry that cannot be read as text is not shown to the reviewer,
+                # and this API exists for INFORMED approval -- silently omitting it
+                # would let a clean-looking detail stand for a candidate that approve
+                # then refuses, or worse, promotes unreviewed. A hardlink and a
+                # non-regular entry arrive here too, refused by the read itself.
+                return False
+            out.append(
+                {
+                    "filename": os.path.join(*rel, name) if rel else name,
+                    "content": text,
+                }
+            )
+        return True
+
+    def _read_candidate_pinned(self, pdir: Path) -> tuple[str, dict, list[dict]] | None:
+        """Read a candidate's ``SKILL.md``, ``.meta.json`` and scripts through ONE pin chain.
+
+        The traversal both judges and reads. The screen-then-read shape this replaces
+        refused a link that was PRESENT at the check, so a candidate tree the LLM can
+        write needed only to have the link absent at the screen and present by the
+        ``read_text`` a few statements later, and the contents of a file of its
+        choosing were served -- the redaction passes cover credential and exfil-URL
+        shapes only, so anything else came back intact. Here every open refuses a link
+        at the name itself, so there is no gap between the judgement and the read.
+
+        Returns None when the candidate cannot be read as a plain tree: a link
+        anywhere, a non-regular entry, or a directory replaced underneath.
+        """
+        try:
+            pinned = pinned_directory(pdir)
+        except OSError:
+            return None
+        with pinned:
+            try:
+                body = pinned.read_text("SKILL.md")
+            except (OSError, UnicodeDecodeError):
+                return None
+            names = set(pinned.names())
+            meta: dict = {}
+            if ".meta.json" in names:
+                try:
+                    parsed = json.loads(pinned.read_text(".meta.json"))
+                except (OSError, UnicodeDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    # Recursively redact secrets from LLM-produced metadata before it
+                    # can surface via the pending detail API: the crystallize skill
+                    # writes ``.meta.json`` directly, bypassing the consolidation
+                    # redaction path, so a credential in ANY nested value is scrubbed.
+                    scrubbed = self._redact_deep(parsed)
+                    meta = scrubbed if isinstance(scrubbed, dict) else {}
+            scripts: list[dict] = []
+            if "scripts" in names:
+                if pinned.is_link("scripts"):
+                    return None
+                if pinned.is_dir("scripts"):
+                    try:
+                        sub = pinned.child("scripts")
+                    except OSError:
+                        return None
+                    with sub:
+                        if not self._collect_scripts_pinned(sub, (), scripts):
+                            return None
+            return body, meta, scripts
+
     def _candidate_layout_findings_at(self, root_fd: int) -> list[str]:
         """Top-level layout check mirroring ``_candidate_layout_ok``.
 
@@ -5602,17 +5700,21 @@ class SkillsLoader:
         if not self._is_pending_slug_safe(slug):
             return None
         pdir = self._pending_root() / slug
-        skill_file = pdir / "SKILL.md"
-        if not skill_file.exists():
+        if not (pdir / "SKILL.md").exists():
+            # The ordinary "no such candidate" answer. Not a security check -- the
+            # pinned read below is -- so probing by name here costs nothing.
             return None
-        # Reject any symlink in the candidate on the read path too (approval
-        # already rejects them) so the detail API can't be tricked into reading
-        # a sensitive file a candidate symlinked SKILL.md / a nested file to.
-        if self._candidate_has_symlink(pdir):
-            logger.warning("Refusing to read pending %s: candidate contains a symlink", slug)
+        # ONE descriptor-pinned traversal both validates and reads: the body, the
+        # metadata and every script come back from opens that refuse a link AT THE
+        # NAME, so there is no screen-then-read gap for a candidate to flip a name
+        # through and no way to point the detail API at a file outside the candidate.
+        read = self._read_candidate_pinned(pdir)
+        if read is None:
+            logger.warning(
+                "Refusing to read pending %s: candidate is not a plain tree of files", slug
+            )
             return None
-        meta = self._read_pending_meta(slug)
-        scripts = self._collect_scripts(pdir / "scripts")
+        body, meta, scripts = read
         # Same hardened verdict as the pending LIST (descriptor-pinned walk,
         # fail-closed on unreadable/oversized entries) — deriving it from the
         # display collection instead would let a silently omitted unreadable
@@ -5631,7 +5733,7 @@ class SkillsLoader:
             "kind": meta.get("kind", "new"),
             "target": meta.get("target"),
             "base_version": meta.get("base_version"),
-            "content": self._redact_text(skill_file.read_text(encoding="utf-8")),
+            "content": self._redact_text(body),
             "scripts": scripts,
         }
         if verdict is not None:
