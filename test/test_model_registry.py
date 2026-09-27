@@ -191,6 +191,13 @@ class TestModelRegistry:
         # unknown -> None
         assert mr.supports_effort("nonexistent") is None
 
+    def test_released_at_resolves_ids_and_is_none_when_undated(self):
+        assert mr.released_at("opus-4.8-1m") == "2026-05-28"
+        # acp-first fold: kiro's distinct Opus 4.6 keeps its own date.
+        assert mr.released_at("claude-opus-4.6") == "2026-02-05"
+        assert mr.released_at("auto") is None
+        assert mr.released_at("nonexistent") is None
+
     def test_kiro_dotted_aliases_resolve(self):
         # AIM-managed agents ship kiro dotted ids; they must map deterministically
         # (NOT fall back to the flagship), preserving e.g. agent-lite on sonnet.

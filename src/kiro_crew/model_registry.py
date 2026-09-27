@@ -1257,6 +1257,13 @@ def supports_effort(canonical_or_id: str) -> bool | None:
     return bool(val) if val is not None else None
 
 
+def released_at(name: str) -> str | None:
+    """Registry-declared ISO release date (``YYYY-MM-DD``) for a model, or None."""
+    key = canonical_key(name)
+    val = _REGISTRY[key].get("released_at") if key is not None else None
+    return str(val) if val else None
+
+
 def display_list(provider: str) -> list[dict[str, str]]:
     """Dropdown rows ``{model_name(canonical), display_name, description}``.
 
