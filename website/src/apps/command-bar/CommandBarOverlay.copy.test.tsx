@@ -236,6 +236,13 @@ describe('command bar — copy the selected row', () => {
     // anybody. Silence would read as a copy that worked.
     mount()
     type('artifact')
+    // Named rather than assumed to rank first, for the reason `selectSettingsRow`
+    // gives above: the top hit for "artifact" is the Artifact Deploy setting, whose
+    // title the query is a prefix of, so copying whatever happened to be selected
+    // would test the ranking instead of the copy layer. Hovering is how a reader
+    // moves the selection onto a row without activating it.
+    await waitFor(() => expect(hasRow('Search Artifacts')).toBe(true))
+    fireEvent.mouseEnter(rowByText('Search Artifacts'))
     await waitFor(() => expect(selectedRow().textContent).toContain('Search Artifacts'))
     pressCopy()
     await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Nothing here to copy.'))

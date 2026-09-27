@@ -95,6 +95,63 @@ describe('rankRootRows', () => {
     expect(rankRootRows(near, 'search s', usage, now)[0].id).toBe('used')
   })
 
+  it('ranks a query by score across groups, so the best match is not held under its group', () => {
+    // The bug this pins: group order is the IDLE page's filing order, and applying it
+    // to a query result too makes the group the first sort key. Typing `dev fle` put
+    // a contributed command that matched only through its subtitle above the app the
+    // reader was spelling out, because `commands` files before `apps`.
+    const rows = [
+      row({
+        id: 'approve',
+        title: 'Approve and merge all PRs',
+        subtitle: 'Merge every ready pull request behind a link, approving first where allowed',
+        group: 'commands',
+      }),
+      row({ id: 'fleet', title: 'Dev Fleet', group: 'apps' }),
+    ]
+    const ranked = rankRootRows(rows, 'dev fle', {}, 0)
+    // Both rows match — the command only via its subtitle — and the app scores higher.
+    expect(ranked.map(r => r.id)).toEqual(['fleet', 'approve'])
+    const [app, command] = ranked
+    expect(app.score).toBeGreaterThan(command.score)
+    expect(command.matchField).toBe('subtitle')
+  })
+
+  it('still files the SAME rows into group blocks on an empty query', () => {
+    // The other half of the split, and the guard on it. Frecency is what makes the
+    // regroup load-bearing here: the app is used daily so it OUTSCORES the command,
+    // and score order alone would open the launcher on it. What a launcher opens on
+    // is the product decision the block order carries, so the idle page keeps it.
+    const now = 10 * DAY
+    const rows = [
+      row({
+        id: 'approve',
+        title: 'Approve and merge all PRs',
+        subtitle: 'Merge every ready pull request behind a link, approving first where allowed',
+        group: 'commands',
+      }),
+      row({ id: 'fleet', title: 'Dev Fleet', group: 'apps' }),
+    ]
+    const usage: UsageMap = { fleet: { count: 9, last: now } }
+    const idle = rankRootRows(rows, '', usage, now)
+    expect(idle.map(r => r.id)).toEqual(['approve', 'fleet'])
+    // Not a tie broken by group: the app genuinely scores higher and is still second.
+    expect(idle[1].score).toBeGreaterThan(idle[0].score)
+  })
+
+  it('lets frecency lift a row over an earlier group once a query ranks them', () => {
+    // Habit and group order used to be unable to disagree under a query: the regroup
+    // ran last, so a boost could only move a row inside its own block. A used app row
+    // now outranks a cold command row on the strength of the boost alone.
+    const now = 10 * DAY
+    const rows = [
+      row({ id: 'cmd', title: 'Deploy notes', group: 'commands' }),
+      row({ id: 'app', title: 'Deploy notes', group: 'apps' }),
+    ]
+    const usage: UsageMap = { app: { count: 6, last: now } }
+    expect(rankRootRows(rows, 'deploy', usage, now).map(r => r.id)).toEqual(['app', 'cmd'])
+  })
+
   it('caps each group so one group cannot crowd out the others', () => {
     const many: RootRow[] = []
     for (let i = 0; i < 20; i++) many.push(row({ id: `app${i}`, title: `App ${i}`, group: 'apps' }))

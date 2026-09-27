@@ -1681,3 +1681,133 @@ describe('CommandBarOverlay contributed commands', () => {
     expect(navigate).not.toHaveBeenCalledWith('/chat?autoSend=1')
   })
 })
+
+/**
+ * What the root list looks like once the reader has typed.
+ *
+ * Group order is the idle page's filing order — the product decision about what a
+ * launcher OPENS on. A query is a different question, so these pin the two halves:
+ * a typed query is one list ranked by match, and the section headers that name the
+ * blocks go with the blocks.
+ */
+describe('CommandBarOverlay root ordering under a query', () => {
+  beforeEach(() => {
+    dispatch.mockReset()
+    navigate.mockReset()
+    sessionSearch.mockReset()
+    sessionSearch.mockResolvedValue([])
+    recentsSearch.mockReset()
+    recentsSearch.mockResolvedValue([])
+    enterInsertOrNewSession.mockReset()
+    newSessionWithToken.mockReset()
+    storeState.dashboard = { slots: [], unreadSlots: [] }
+    storeState.chat = { slotStatusDetail: {}, activeSlot: null }
+    window.localStorage.clear()
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  /** The app the reader is typing toward, as the apps API returns it. */
+  const DEV_FLEET = {
+    name: 'dev-fleet',
+    displayName: 'Dev Fleet',
+    enabled: true,
+    origin: 'registry',
+    manifest: { ui: { pages: [{ label: 'Dev Fleet', route: '/apps/dev-fleet' }] } },
+  }
+
+  /** A DIFFERENT app, contributing the command that used to outrank it. */
+  const PR_BULK_OPS = {
+    name: 'pr-bulk-ops',
+    displayName: 'PR Bulk Ops',
+    enabled: true,
+    origin: 'registry',
+    manifest: {
+      contributes: {
+        commands: [
+          {
+            id: 'approve-merge-all',
+            title: 'Approve and merge all PRs',
+            subtitle:
+              'Merge every ready pull request behind a link, approving first where allowed',
+            prompt: 'Approve and merge every ready pull request.',
+          },
+        ],
+      },
+    },
+  }
+
+  function mountWith(apps: unknown[]) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], apps)
+    render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={vi.fn()} />
+      </QueryClientProvider>,
+    )
+  }
+
+  /** The section headers the list is rendering, top to bottom. */
+  const renderedHeaders = () =>
+    Array.from(document.querySelectorAll('div.uppercase.tracking-wide.text-muted')).map(
+      el => el.textContent ?? '',
+    )
+
+  const rowIndex = (re: RegExp) =>
+    screen.getAllByRole('option').findIndex(el => re.test(el.textContent ?? ''))
+
+  it('puts the app the reader is spelling out above a command that only matched its subtitle', () => {
+    // The reported bug. `dev fle` scores the Dev Fleet app 216 and this contributed
+    // command 60 — the command's own title does not match at all, only its subtitle —
+    // and the command was still shown first, because `commands` files before `apps`.
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dev fle' } })
+    const app = rowIndex(/Dev Fleet/)
+    const command = rowIndex(/Approve and merge all PRs/)
+    // Both rows are on screen: the command still matches, it just ranks below.
+    expect(app).toBeGreaterThanOrEqual(0)
+    expect(command).toBeGreaterThan(app)
+  })
+
+  it('names a recent session in its own column once the headers are gone', () => {
+    // The headers are what named a recent row, and `kindLabel` deliberately returns
+    // nothing for one (its column belongs to live state). An IDLE session has no live
+    // state either, so under a query the row would be a glyph and a title while every
+    // row beside it still showed its word. The group's own name stands in there.
+    storeState.dashboard = {
+      slots: [{ key: 'chat-7', title: 'Fleet notes', messages: 4, running: false }],
+      unreadSlots: [],
+    }
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    // Idle page: the header above the row says it, so the column stays empty.
+    const idleRow = screen.getAllByRole('option').find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(idleRow).toBeTruthy()
+    expect(renderedHeaders()).toContain('Recent sessions')
+    expect(idleRow?.textContent).not.toContain('Recent sessions')
+    // Under a query the header is gone and the row carries the name instead.
+    fireEvent.change(input, { target: { value: 'fleet' } })
+    expect(renderedHeaders()).toEqual([])
+    const queriedRow = screen
+      .getAllByRole('option')
+      .find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(queriedRow).toBeTruthy()
+    expect(queriedRow?.textContent).toContain('Recent sessions')
+  })
+
+  it('drops the group headers while a query ranks the list, and restores them when it clears', () => {
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    expect(renderedHeaders()).toContain('Commands')
+    fireEvent.change(input, { target: { value: 'dev fle' } })
+    // One ranked list: a group can now appear, be left and appear again, so a header
+    // per transition would print the same word twice over rows it does not describe.
+    expect(renderedHeaders()).toEqual([])
+    // The headers belong to the idle page, so clearing the query brings them back.
+    fireEvent.change(input, { target: { value: '' } })
+    expect(renderedHeaders()).toContain('Commands')
+  })
+})

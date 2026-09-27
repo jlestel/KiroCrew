@@ -105,10 +105,18 @@ that.
 `website/src/apps/command-bar/rootIndex.ts` owns the row model.
 
 - `ROOT_GROUPS = ['attention', 'recent', 'commands', 'apps', 'settings']`, rendered in that
-  order. `attention` is normally absent and contains only live sessions whose status is a pill —
-  an approval or answer the user owes, not merely running or unread work. `rankRootRows` ends
-  with a sort on `groupOrder`, so groups are always contiguous blocks under their own header —
-  they never interleave by score.
+  order while the query is EMPTY. `attention` is normally absent and contains only live sessions
+  whose status is a pill — an approval or answer the user owes, not merely running or unread
+  work. On an empty query `rankRootRows` ends with a sort on `groupOrder`, so groups are
+  contiguous blocks under their own header. A NON-EMPTY query skips that regroup and comes back
+  in score order across every group, because the reader has said what they want and the best
+  match is the answer; group order is the decision about what the launcher OPENS on, and
+  applying it to a query too made the group the first sort key, so a command matching only
+  through its subtitle outranked the app being spelled out. Groups therefore interleave under a
+  query, and the section headers are suppressed there — a header per group change would print
+  the same word twice over rows it does not describe. Each row names its own kind in its
+  right-hand column instead, and the two groups with no kind word (`attention` carries a status
+  pill, `recent` its group name) keep one for that reason.
 - `recent` follows `attention`: at most `RECENT_SESSION_ROWS = 3` live sessions the reader was
   last in, so "get me back to what I was doing" is a row to press rather than a search to run.
   It is built by the overlay from the same live slot store `attention` reads, so it costs the
@@ -125,10 +133,16 @@ that.
 - App rows are derived from the installed-app list, so a newly installed app appears as a
   destination with no per-app work.
 - Ordinary rows render a right-aligned kind — Command, App, Setting or View. A contributed
-  command prefixes that kind with its app label. An `attention` or `recent` row renders no kind
-  label — `attention` shows its live status pill instead and `recent` its running dot, because
-  the session's state is more useful than a static "Session" label. `view` is named separately
-  from its group because it opens a surface instead of acting and closing.
+  command prefixes that kind with its app label. While the query is EMPTY an `attention` or
+  `recent` row renders no kind label — `attention` shows its live status pill instead and
+  `recent` its running dot, because the session's state is more useful than a static "Session"
+  label, and the group header above the row already names it. Under a query there is no header
+  (see the group bullet above), so a `recent` row whose session is idle — no pill, no dot, no
+  kind word — would carry no naming at all; it renders its group's own name,
+  `group_recent_sessions`, in that otherwise empty column. An `attention` row needs no such
+  substitution: it reaches that group only because its status is a pill, so the column is never
+  empty. `view` is named separately from its group because it opens a surface instead of acting
+  and closing.
 - `PER_GROUP_LIMIT = 6` caps each group so one group cannot push the others off the page;
   settings use the tighter `SETTINGS_IDLE_LIMIT = 2` while the query is empty, and `recent` is
   capped ahead of ranking by the overlay at `RECENT_SESSION_ROWS = 3` rather than by this limit.

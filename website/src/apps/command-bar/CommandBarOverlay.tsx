@@ -161,12 +161,25 @@ function groupLabel(group: RootGroup): string {
  * section exists — and a "Session" kind was considered for this surface once
  * before and dropped.
  */
-function kindLabel(row: { kind: RootRowKind; group: RootGroup; appLabel?: string }): string | null {
+function kindLabel(
+  row: { kind: RootRowKind; group: RootGroup; appLabel?: string },
+  queryActive = false,
+): string | null {
+  // An attention row's column carries its LIVE STATE, which is both more useful than
+  // a kind word and the reason that section exists. It is never empty: a row reaches
+  // this group only because its status is a pill, so the renderer always has one to
+  // show and never falls through to this label.
   if (row.group === 'attention') return null
   // A recent row is named by its own group header and its session glyph, and its
   // right-hand column belongs to whatever the session is DOING. Labelling it
   // "Command" would be both wrong and the widest thing on the row.
-  if (row.group === 'recent') return null
+  //
+  // Under a QUERY there is no header (the list is one ranked block, so it carries
+  // none), and an idle session has no live state either — which left the row as a
+  // glyph and a title while every row beside it still showed its word. So the group's
+  // own name stands in, in the column that is empty anyway. The idle page is
+  // unchanged: the header above the row says this there.
+  if (row.group === 'recent') return queryActive ? groupLabel('recent') : null
   if (row.kind === 'view') return i18nT('apps.commandBar.kind.view')
   if (row.group === 'apps') return i18nT('apps.commandBar.kind.app')
   if (row.group === 'settings') return i18nT('apps.commandBar.kind.setting')
@@ -378,9 +391,18 @@ function actionLabel(slot: Slot): string {
  * them by (the recents listing separates live sessions from history). The synthetic
  * slots — fallback, recovery, retry — head on nothing: they are one-offs at the
  * bottom of the list, and a header over a single row is noise.
+ *
+ * `queryActive` turns the root's headers OFF, because under a query the root is one
+ * list ranked by match, not blocks filed by group — so a group can appear, be left,
+ * and appear again, and a header per transition would print "Commands" twice with an
+ * app between them and describe nothing. Each row still names its own kind in its
+ * right-hand column, which is where a ranked list carries that fact. View slots keep
+ * their headers either way: an engine's grouping is a fact about its results, not a
+ * filing order the query just replaced.
  */
-function headerOf(slot: Slot, prev?: Slot): string | null {
+function headerOf(slot: Slot, prev?: Slot, queryActive = false): string | null {
   if (slot.tag === 'root') {
+    if (queryActive) return null
     if (prev?.tag === 'root' && prev.row.group === slot.row.group) return null
     return groupLabel(slot.row.group)
   }
@@ -1835,7 +1857,9 @@ export default function CommandBarOverlay({
               {row.status ? (
                 statusAccessory(row.status)
               ) : (
-                <span className="shrink-0 text-[11px] text-muted">{kindLabel(row)}</span>
+                <span className="shrink-0 text-[11px] text-muted">
+                  {kindLabel(row, query.trim().length > 0)}
+                </span>
               )}
             </>
           ),
@@ -2354,7 +2378,7 @@ export default function CommandBarOverlay({
             )
           ) : (
             slots.map((slot, i) => {
-              const header = headerOf(slot, slots[i - 1])
+              const header = headerOf(slot, slots[i - 1], query.trim().length > 0)
               return (
                 <div key={slot.key}>
                   {header && (
