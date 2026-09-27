@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import uuid
 from pathlib import Path
@@ -17,8 +18,13 @@ from kiro_crew.dashboard.handlers._shared import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, bind_session_execution
-from kiro_crew.hooks import FileTooLargeError
-from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.hooks import FileTooLargeError, validate_file_path
+from kiro_crew.security import (
+    is_sensitive_path,
+    is_sensitive_resolved_path,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.task_planner import plan_to_yaml
 from kiro_crew.taskrunner import WorkflowInitializing
 from kiro_crew.workflow_memory import capture_admission_execution
@@ -197,13 +203,33 @@ def _validate_spec_path(raw: str) -> tuple[str | None, str]:
     Returns ``(resolved_path, "")`` on success, or ``(None, code)`` where
     ``code`` is the machine-readable failure identifier the handler maps to
     its error response (``invalid_spec_path`` or ``access_denied``).
+
+    Canonicalization goes through :func:`hooks.validate_file_path`, the same
+    gate the dashboard's file I/O uses: it screens a Windows UNC path AND a
+    local reparse point whose target is a UNC share (a link that launders the
+    probe past a lexical UNC check) BEFORE any ``realpath``/``stat`` follows it,
+    so a caller-supplied spec can never make the gateway authenticate outbound
+    to an attacker-named SMB host.
+
+    ``validate_file_path`` folds every rejection -- unrepresentable, UNC/link
+    laundered, and sensitive -- into ``None``.  A sensitive credential path must
+    keep answering ``access_denied`` (403) rather than ``invalid_spec_path``
+    (400), so a rejection is re-classified against a LINK-FREE lexical
+    sensitivity check on the anchored spelling: it never resolves a link, so it
+    cannot itself open the SMB connection the screen just refused, and a
+    non-sensitive rejection (the laundered/UNC case) stays ``invalid_spec_path``.
     """
-    resolved = Path(raw).resolve()
-    if ".." in Path(raw).parts or not resolved.is_file():
+    canonical = validate_file_path(raw)
+    if canonical is None:
+        anchored = os.path.abspath(os.path.expanduser(raw))
+        if is_sensitive_resolved_path(anchored):
+            return None, "access_denied"
         return None, "invalid_spec_path"
-    if is_sensitive_path(str(resolved)):
+    if ".." in Path(raw).parts or not Path(canonical).is_file():
+        return None, "invalid_spec_path"
+    if is_sensitive_path(canonical):
         return None, "access_denied"
-    return str(resolved), ""
+    return canonical, ""
 
 
 def _write_inline_spec(work_dir: str | Path, content: str) -> Path:
@@ -411,7 +437,8 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         # persistence hop), so ownership has transferred to the run.
         # ``BaseException`` (mirroring the from_chat rollback below) so a
         # request cancelled during ``start_background`` also cleans up — the
-        # spec-write hop is shielded, but the very next await used to leak.
+        # spec-write hop is shielded, so the very next await is the one that
+        # can leak, and this cleanup covers it.
         # Cleanup is best-effort — its failure must not replace the startup
         # error the client is about to receive.
         if created_spec is not None and not _spec_retained_by_run(state, created_spec):
@@ -429,6 +456,8 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
                 )
         if not isinstance(exc, Exception):
             raise  # CancelledError and friends: propagate after cleanup.
+        if isinstance(exc, WorkflowInitializing):
+            return web.json_response({"error": str(exc), "code": exc.code}, status=503)
         return web.json_response({"error": str(exc)}, status=400)
     return web.json_response({"ok": True, "spec": spec_path, "task_id": task_id})
 
@@ -821,16 +850,16 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
     agent = body.get("agent", "")
     workspace_dir = body.get("workspace_dir", "")
     if source == "file":
-        resolved = Path(spec_path).resolve()
-        if ".." in Path(spec_path).parts or not resolved.is_file():
+        validated, failure = await asyncio.to_thread(_validate_spec_path, spec_path)
+        if validated is None:
+            if failure == "access_denied":
+                return web.json_response(
+                    {"error": "access denied", "code": "access_denied"}, status=403
+                )
             return web.json_response(
                 {"error": "invalid spec path", "code": "invalid_spec_path"}, status=400
             )
-        if is_sensitive_path(str(resolved)):
-            return web.json_response(
-                {"error": "access denied", "code": "access_denied"}, status=403
-            )
-        spec_path = str(resolved)
+        spec_path = validated
     try:
         plan_coro = state.task_runner.plan(
             input_text=input_text,

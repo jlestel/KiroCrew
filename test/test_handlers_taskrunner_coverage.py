@@ -13,6 +13,7 @@ Everything is driven through ``make_mocked_request`` against a fake
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 from pathlib import Path
@@ -28,6 +29,7 @@ from body_stream_helpers import BodyStreamPayload
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK, AcpEvent
 from kiro_crew.dashboard.handlers.taskrunner import (
     _run_refine,
+    _validate_spec_path,
     api_taskrunner_cancel,
     api_taskrunner_delete,
     api_taskrunner_execute_plan,
@@ -284,6 +286,29 @@ class TestStart:
             )
         assert resp.status == 403
         assert _body(resp)["error"] == "access denied"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unc_spec",
+        [r"\\server\share\x.md", "//server/share/x.md", r"\\?\UNC\server\share\x.md"],
+    )
+    async def test_unc_path_rejected_by_screen(self, tmp_path: Path, unc_spec: str) -> None:
+        # A UNC / link-laundered spec is rejected by validate_file_path's
+        # pre-resolve screen, so the handler returns 400 and never stats a
+        # followed target that could open an SMB connection.
+        with (
+            patch(
+                "kiro_crew.dashboard.handlers.taskrunner.validate_file_path", return_value=None
+            ) as screen,
+            patch("pathlib.Path.is_file") as is_file,
+        ):
+            resp = await api_taskrunner_start(
+                _request(_state(_runner(tmp_path)), json_body={"spec": unc_spec, "source": "file"})
+            )
+        assert resp.status == 400
+        assert _body(resp)["error"] == "invalid spec path"
+        screen.assert_called_once_with(unc_spec)
+        is_file.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_real_file_spec_forwards_resolved_path(self, tmp_path: Path) -> None:
@@ -901,6 +926,88 @@ class TestPlan:
         assert resp.status == 400
         assert _body(resp)["error"] == str(exc)
         assert _body(resp)["error"] == str(exc)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unc_spec",
+        [r"\\server\share\x.md", "//server/share/x.md", r"\\?\UNC\server\share\x.md"],
+    )
+    async def test_unc_file_spec_rejected(self, tmp_path: Path, unc_spec: str) -> None:
+        # The file-source branch shares the same validate_file_path screen.
+        with (
+            patch(
+                "kiro_crew.dashboard.handlers.taskrunner.validate_file_path", return_value=None
+            ) as screen,
+            patch("pathlib.Path.is_file") as is_file,
+        ):
+            resp = await api_taskrunner_plan(
+                _request(_state(_runner(tmp_path)), json_body={"source": "file", "spec": unc_spec})
+            )
+        assert resp.status == 400
+        assert _body(resp)["error"] == "invalid spec path"
+        screen.assert_called_once_with(unc_spec)
+        is_file.assert_not_called()
+
+
+class TestValidateSpecPath:
+    """Unit tests for the shared _validate_spec_path screen."""
+
+    @pytest.mark.parametrize(
+        "unc_spec",
+        [r"\\server\share\x.md", "//server/share/x.md", r"\\?\UNC\server\share\x.md"],
+    )
+    def test_screen_rejection_maps_to_invalid_without_stat(self, unc_spec: str) -> None:
+        # validate_file_path screens a UNC / link-laundered path before any
+        # resolve/stat; when it rejects, _validate_spec_path never stats a
+        # followed target and returns the invalid_spec_path code.
+        with (
+            patch(
+                "kiro_crew.dashboard.handlers.taskrunner.validate_file_path", return_value=None
+            ) as screen,
+            patch("pathlib.Path.is_file") as is_file,
+        ):
+            resolved, code = _validate_spec_path(unc_spec)
+        assert (resolved, code) == (None, "invalid_spec_path")
+        screen.assert_called_once_with(unc_spec)
+        is_file.assert_not_called()
+
+    def test_normal_relative_path_passes_the_screen(self, tmp_path: Path) -> None:
+        spec = tmp_path / "sub" / "plan.md"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("# t", encoding="utf-8")
+        resolved, code = _validate_spec_path(str(spec))
+        assert code == ""
+        assert resolved == str(spec.resolve())
+
+    def test_sensitive_canonical_path_maps_to_access_denied(self, tmp_path: Path) -> None:
+        spec = tmp_path / "creds.md"
+        spec.write_text("# t", encoding="utf-8")
+        with (
+            patch(
+                "kiro_crew.dashboard.handlers.taskrunner.validate_file_path",
+                return_value=str(spec),
+            ),
+            patch("kiro_crew.dashboard.handlers.taskrunner.is_sensitive_path", return_value=True),
+        ):
+            resolved, code = _validate_spec_path(str(spec))
+        assert (resolved, code) == (None, "access_denied")
+
+    def test_screened_out_sensitive_path_still_maps_to_access_denied(self) -> None:
+        # validate_file_path fences a sensitive path itself and returns None; the
+        # link-free lexical check must still map it to access_denied, not the
+        # generic invalid_spec_path, so the 403 contract survives.
+        with (
+            patch("kiro_crew.dashboard.handlers.taskrunner.validate_file_path", return_value=None),
+            patch(
+                "kiro_crew.dashboard.handlers.taskrunner.is_sensitive_resolved_path",
+                return_value=True,
+            ) as sens,
+            patch("pathlib.Path.is_file") as is_file,
+        ):
+            resolved, code = _validate_spec_path("/home/x/.aws/credentials")
+        assert (resolved, code) == (None, "access_denied")
+        sens.assert_called_once()
+        is_file.assert_not_called()
 
 
 class TestPlanCancel:
@@ -1702,14 +1809,22 @@ class TestSpecIoRunsOffTheEventLoop:
                 _request(_state(runner), json_body={"spec": "__inline__:# cancel"})
             )
         )
-        assert await asyncio.to_thread(started.wait, 30)
-        request_task.cancel()
-        release.set()
+        try:
+            assert await asyncio.to_thread(started.wait, 30)
+            request_task.cancel()
+            release.set()
 
-        with pytest.raises(asyncio.CancelledError):
-            await request_task
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
 
-        assert list(runner._work_dir.glob("TASK_*.md")) == []
+            assert list(runner._work_dir.glob("TASK_*.md")) == []
+        finally:
+            # Always unblock the worker thread and drain the task, so a handshake
+            # timeout cannot leave a blocked worker outliving test teardown.
+            release.set()
+            request_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await request_task
 
     @pytest.mark.asyncio
     async def test_cancelled_start_backgrounding_does_not_orphan_spec(self, tmp_path: Path) -> None:
@@ -1800,12 +1915,20 @@ class TestSpecIoRunsOffTheEventLoop:
                 _request(_state(runner), json_body={"steps": [{"title": "first"}]})
             )
         )
-        assert await asyncio.to_thread(started.wait, 30)
-        request_task.cancel()
-        release.set()
+        try:
+            assert await asyncio.to_thread(started.wait, 30)
+            request_task.cancel()
+            release.set()
 
-        with pytest.raises(asyncio.CancelledError):
-            await request_task
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
 
-        assert runner._runs == {}
-        assert list(runner._work_dir.glob("plan_*")) == []
+            assert runner._runs == {}
+            assert list(runner._work_dir.glob("plan_*")) == []
+        finally:
+            # Always unblock the worker thread and drain the task, so a handshake
+            # timeout cannot leave a blocked worker outliving test teardown.
+            release.set()
+            request_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await request_task
